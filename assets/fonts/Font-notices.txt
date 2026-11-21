@@ -1,0 +1,43 @@
+Fonts distributed with Havu
+
+Studio Sans is Lato Regular. See Lato-LICENSE.txt for Lato.
+Studio Serif is Noto Serif Regular. See Noto-LICENSE.txt for Noto Serif and Noto Sans.
+STIX Two Text, Cantarell, Adwaita Sans, Adwaita Mono, and Vazirmatn are distributed
+under the SIL Open Font License. See their accompanying license files.
+
+Open Sans digitized data copyright © 2010–2011 Google Corporation.
+Special Elite copyright © 2010 Brian J. Bonislawsky DBA Astigmatic (AOETI).
+Both are distributed under Apache License 2.0. See Apache-2-LICENSE.txt.
+
+Font files retain the original copyright and license notices in their metadata.
+
+Additional typefaces are distributed under the SIL Open Font License 1.1.
+Each family’s accompanying -OFL.txt file contains its original notice and license.
+
+anton: https://github.com/google/fonts/tree/main/ofl/anton
+archivoblack: https://github.com/google/fonts/tree/main/ofl/archivoblack
+archivonarrow: https://github.com/google/fonts/tree/main/ofl/archivonarrow
+barlowcondensed: https://github.com/google/fonts/tree/main/ofl/barlowcondensed
+bebasneue: https://github.com/google/fonts/tree/main/ofl/bebasneue
+bodonimoda: https://github.com/google/fonts/tree/main/ofl/bodonimoda
+bricolagegrotesque: https://github.com/google/fonts/tree/main/ofl/bricolagegrotesque
+caveat: https://github.com/google/fonts/tree/main/ofl/caveat
+cinzel: https://github.com/google/fonts/tree/main/ofl/cinzel
+cormorantgaramond: https://github.com/google/fonts/tree/main/ofl/cormorantgaramond
+dancingscript: https://github.com/google/fonts/tree/main/ofl/dancingscript
+dmsans: https://github.com/google/fonts/tree/main/ofl/dmsans
+dmserifdisplay: https://github.com/google/fonts/tree/main/ofl/dmserifdisplay
+fraunces: https://github.com/google/fonts/tree/main/ofl/fraunces
+fredoka: https://github.com/google/fonts/tree/main/ofl/fredoka
+ibmplexmono: https://github.com/google/fonts/tree/main/ofl/ibmplexmono
+librebaskerville: https://github.com/google/fonts/tree/main/ofl/librebaskerville
+lobster: https://github.com/google/fonts/tree/main/ofl/lobster
+lora: https://github.com/google/fonts/tree/main/ofl/lora
+oswald: https://github.com/google/fonts/tree/main/ofl/oswald
+pacifico: https://github.com/google/fonts/tree/main/ofl/pacifico
+playfairdisplay: https://github.com/google/fonts/tree/main/ofl/playfairdisplay
+rubikmonoone: https://github.com/google/fonts/tree/main/ofl/rubikmonoone
+spacemono: https://github.com/google/fonts/tree/main/ofl/spacemono
+worksans: https://github.com/google/fonts/tree/main/ofl/worksans
+youngserif: https://github.com/google/fonts/tree/main/ofl/youngserif
+spectral: https://github.com/google/fonts/tree/main/ofl/spectral

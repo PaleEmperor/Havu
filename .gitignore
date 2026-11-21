@@ -1,0 +1,20 @@
+.godot/
+.local-state/
+.toolchain/
+builds/*
+!builds/.gitkeep
+*.tmp
+*.havu
+*.havubrush
+export_credentials.cfg
+
+# Local credentials and generated files
+.agents/
+.codex/
+.aws/
+.env
+.env.*
+*.keystore
+*.jks
+__pycache__/
+*.pyc
