@@ -226,6 +226,23 @@ func run() -> void:
 	app.new_dialog.confirmed.emit()
 	check(not app.project_home.visible and app.document.width == 720 and app.document.height == 960
 		and not app.document.paper_visible, "creating a project uses the typed dimensions and transparency")
+	var tour: Control = app.get_started_tour
+	await process_frame
+	check(tour.visible and tour.step_index == 0 and tour.target == app.zoom_button
+		and tour.spotlight.has_area(), "the first blank illustration opens the workspace tour on the zoom control")
+	tap_window_control(root, tour.skip_button)
+	var saved_onboarding := ConfigFile.new()
+	check(not tour.visible and saved_onboarding.load("user://preferences.cfg") == OK
+		and saved_onboarding.get_value("onboarding", "tour_shown", false),
+		"skipping the tour closes it and saves the one-time preference")
+	app.workspace_menu.id_pressed.emit(13)
+	check(tour.visible and tour.step_index == 0, "the three-dot menu reopens the tour at the beginning")
+	tour.next_button.pressed.emit()
+	check(tour.step_index == 1 and tour.target == app.brush_library_button, "Next takes the tour to the actual Brush library")
+	tour.back_button.pressed.emit()
+	check(tour.step_index == 0, "Back returns to the previous tour step")
+	for _index in tour.steps.size(): tour.next_button.pressed.emit()
+	check(not tour.visible, "Done closes the tour from the final step")
 	check(app.document.layers[0].type == "vector", "new illustrations open with an editable vector layer")
 	check(app.tool_buttons.fill.self_modulate.a < 0.5 and app.tool_buttons.nodes.self_modulate.a == 1.0,
 		"an empty vector layer dims Fill and leaves Nodes available")
@@ -762,6 +779,8 @@ func run() -> void:
 	root.push_input(mouse_release.duplicate(), true)
 
 	app.create_document(false)
+	check(not app.get_started_tour or not app.get_started_tour.visible,
+		"creating another illustration after a restart keeps the tour closed")
 	var context_doc = app.document
 	var context_canvas = app.canvas
 	context_doc.add({"kind": "rect", "pos": [100, 100], "extent": [100, 100], "color": "#226451", "opacity": 1.0})

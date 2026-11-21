@@ -2,7 +2,7 @@
 
 **An illustration studio I made for my wife, Sini.**
 
-[**Download Havu for Android**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.51/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
+[**Download Havu for Android**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.52/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
 
 I started making Havu because I wanted Sini to have somewhere of her own to draw.
 A little studio on her tablet, with brushes she could make her own, illustrations
@@ -47,6 +47,9 @@ Havu starts on Projects. Create a blank canvas, open an existing file, choose a
 recent project, or open the editable café example. Use **Resume last session**
 to pick up the most recent workspace. The **havu** button in the editor returns
 to Projects.
+
+Your first blank illustration opens the short **Getting started** tour.
+Skip it any time, or replay it from **⋯ → Getting started** in the editor.
 
 The icon rail uses familiar drawing tools. The curved stroke in the top bar opens
 the brush library; each preview is drawn by the same geometry engine as the canvas.

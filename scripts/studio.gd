@@ -14,6 +14,7 @@ const BrushPreview = preload("res://scripts/brush_preview.gd")
 const BrushLibrary = preload("res://scripts/brush_library.gd")
 const Sample = preload("res://scripts/sample.gd")
 const ProjectHome = preload("res://scripts/project_home.gd")
+const GetStartedTour = preload("res://scripts/get_started_tour.gd")
 const PanelRevealTabs = preload("res://scripts/panel_reveal_tabs.gd")
 const LayerThumbnail = preload("res://scripts/layer_thumbnail.gd")
 const UIScaleSlider = preload("res://scripts/ui_scale_slider.gd")
@@ -95,6 +96,8 @@ var page_dimensions: Label
 var footer_metrics: HBoxContainer
 var brand_button: Button
 var brush_library_button: Button
+var header_layers_button: Button
+var get_started_tour: GetStartedTour
 var previous_workspace_size := Vector2.ZERO
 var metrics_elapsed := 0.0
 var input_settings_dialog: AcceptDialog
@@ -3407,6 +3410,8 @@ func create_document(sample_doc: bool) -> void:
 		document.blank(float(dimensions.x), float(dimensions.y), not new_transparent.button_pressed)
 	file_path = ""
 	enter_project()
+	if not sample_doc and not settings.get_value("onboarding", "tour_shown", false):
+		show_get_started_tour()
 
 func enter_project() -> void:
 	session_active = true
@@ -4005,6 +4010,36 @@ func save_input_preference(key: String, value: Variant) -> void:
 	if settings.save("user://preferences.cfg") != OK:
 		notify("Could not save input settings for the next launch.")
 
+func show_get_started_tour() -> void:
+	if not session_active or project_home.visible: return
+	if not get_started_tour:
+		var tour_layer := CanvasLayer.new()
+		tour_layer.layer = 8
+		add_child(tour_layer)
+		get_started_tour = GetStartedTour.new()
+		get_started_tour.theme = theme
+		tour_layer.add_child(get_started_tour)
+	if get_started_tour.visible: return
+	if not settings.get_value("onboarding", "tour_shown", false):
+		settings.set_value("onboarding", "tour_shown", true)
+		if settings.save("user://preferences.cfg") != OK:
+			notify("Could not save your tour preference.")
+	var navigation := "One finger pans by default. Pinch with two fingers to zoom. Tap the zoom percentage and choose Fit page to see the whole illustration."
+	if show_shortcut_hints:
+		navigation = "Pinch to zoom on a touchscreen. With a mouse, scroll to zoom or hold Space and drag to pan. Choose Fit page from the zoom menu to see the whole illustration."
+	var steps: Array[Dictionary] = [
+		{"target": zoom_button, "title": "Move around the canvas", "text": navigation},
+		{"target": brush_library_button, "title": "Find your brush", "text":
+			"Tap the stroke preview to browse brushes. Switch to Settings to tune a brush, or tap the color swatch to choose a color."},
+		{"target": header_layers_button, "title": "Work in layers", "text":
+			"Open Layers to organize your drawing. Vectors stay sharp when you resize them. Add a paint layer when you want to work with pixels."},
+		{"target": header_panels_button, "title": "Edit and arrange", "text":
+			"Use Select to move or resize objects, and Nodes to reshape their points. Open Panels to bring back a hidden tool rail. Drag a panel’s heading to move it."},
+		{"target": header_tools.get_node("QuickSave"), "title": "Save your work", "text":
+			"Tap the save icon to keep an editable Havu project. Open File to export SVG or PNG. You can replay this tour from the three-dot menu."},
+	]
+	get_started_tour.start(steps)
+
 func show_help() -> void:
 	var dialog = AcceptDialog.new()
 	dialog.title = "Welcome to Havu"
@@ -4056,6 +4091,7 @@ func _process(delta: float) -> void:
 
 func _unhandled_key_input(event: InputEvent) -> void:
 	if not event is InputEventKey or not event.pressed or event.echo: return
+	if is_instance_valid(get_started_tour) and get_started_tour.visible: return
 	if project_home.visible:
 		if event.ctrl_pressed or event.meta_pressed:
 			if event.keycode == KEY_N: show_new_canvas()
@@ -4233,13 +4269,16 @@ func build_header() -> void:
 	top_color.name = "ColorPanelButton"
 	top_color.custom_minimum_size = Vector2(40, 40)
 	row.add_child(top_color)
-	row.add_child(icon_button("M3 8L13 3L23 8L13 13ZM3 13L13 18L23 13M3 18L13 23L23 18", func(): panels.Layers.visible = not panels.Layers.visible, "Layers"))
+	header_layers_button = icon_button("M3 8L13 3L23 8L13 13ZM3 13L13 18L23 13M3 18L13 23L23 18",
+		func(): panels.Layers.visible = not panels.Layers.visible, "Layers")
+	row.add_child(header_layers_button)
 	header_brush_settings = icon_button("M5 6H21M5 13H21M5 20H21M10 3V9M17 10V16M9 17V23", func(): toggle_brush_panel(BRUSH_SETTINGS_PANEL), "Brush settings")
 	row.add_child(header_brush_settings)
 	workspace_menu = PopupMenu.new()
 	workspace_menu.add_item("Color panel", 0)
 	workspace_menu.add_item("Typography", 1)
 	workspace_menu.add_item("Reset workspace", 2)
+	workspace_menu.add_item("Getting started…", 13)
 	workspace_menu.add_item("Help & shortcuts" if show_shortcut_hints else "Help", 3)
 	workspace_menu.add_item("Developer monitor", 4)
 	workspace_menu.add_item("Free brush resources", 5)
@@ -4264,6 +4303,7 @@ func build_header() -> void:
 			10: open_shape_style()
 			11: change_artwork_group(false)
 			12: change_artwork_group(true)
+			13: show_get_started_tour()
 	)
 	add_child(workspace_menu)
 	var more = icon_button("M5 13h1M12 13h1M19 13h1", func(): pass, "Workspace options")

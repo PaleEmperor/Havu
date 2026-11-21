@@ -1,7 +1,7 @@
 # Android build and tablet testing
 
 To install the beta on an ARM64 tablet, open the APK on the device and follow
-Android's installation prompts. [Download the APK](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.51/havu-beta.apk)
+Android's installation prompts. [Download the APK](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.52/havu-beta.apk)
 
 Havu’s Android beta uses Godot’s ARM64 debug APK export. Build with
 `tools/android.py` to compile the native keyboard and S Pen support into the APK.
