@@ -2,7 +2,7 @@
 
 **A little illustration studio for Android tablets.**
 
-[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.52/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
+[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.53/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
 
 I wanted my wife to have somewhere of her own to draw. A little studio on her
 tablet, with brushes she could make her own, artwork she could scale into shop
@@ -28,7 +28,9 @@ I’d love for you to use it, share it, or make it your own.
 
 - **Brushes and color.** Tap the stroke preview to browse brushes or tune a
   preset. Tap the swatch to pick a color. Supported styluses can vary stroke
-  width and opacity with pressure.
+  width and opacity with pressure. Use **+** in the brush library to import
+  `.havubrush` or `.myb` files into **My brushes**. Imported `.myb` settings are
+  adapted to Havu’s brush engine.
 - **Vector and paint layers.** Use editable vectors for shapes, lettering, and
   artwork you want to resize. Add a paint layer when you want to work with pixels.
 - **Panels.** Drag a panel by its heading to move or dock it. Open **Panels** to

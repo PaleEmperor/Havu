@@ -2536,6 +2536,38 @@ func run() -> void:
 	delete_brush_prompt.confirmed.emit()
 	check(app.presets.size() == prior_preset_count + 1
 		and app.presets[-1].name == "Sini's test blender", "deleting an imported copy keeps the original personal preset")
+	var brush_fixture := {
+		"version": 3, "settings": {
+			"radius_logarithmic": {"base_value": 2.0, "inputs": {"pressure": [[0.0, -0.6], [1.0, 0.4]]}},
+			"opaque": {"base_value": 0.65, "inputs": {}},
+			"opaque_multiply": {"base_value": 0.0, "inputs": {"pressure": [[0.0, 0.2], [1.0, 1.0]]}},
+			"elliptical_dab_ratio": {"base_value": 2.0, "inputs": {}},
+			"elliptical_dab_angle": {"base_value": 35.0, "inputs": {}},
+			"smudge": {"base_value": 0.8, "inputs": {}},
+		}}
+	var mypaint_path := "user://test_wash.myb"
+	var source_brush := FileAccess.open(mypaint_path, FileAccess.WRITE)
+	source_brush.store_string(JSON.stringify(brush_fixture))
+	source_brush.close()
+	app.import_brush()
+	var mypaint_dialog: FileDialog = app.get_child(-1)
+	mypaint_dialog.hide()
+	mypaint_dialog.files_selected.emit(PackedStringArray([mypaint_path, "user://missing.myb"]))
+	var adapted: Dictionary = app.active_brush
+	check(app.presets.size() == prior_preset_count + 2 and adapted.name == "test wash" and adapted.brush == "mix"
+		and is_equal_approx(adapted.size, 2.0 * exp(2.4)) and is_equal_approx(adapted.tip_ratio, 0.5)
+		and adapted.pressure_curve > 1.0 and adapted.opacity_pressure > 0.0
+		and app.brush_category.selected == app.brush_category.item_count - 1
+		and app.toast_label.text.contains("1 skipped"), "a MyPaint file becomes an editable pressure-sensitive preset in My brushes")
+	var imported_preferences := ConfigFile.new()
+	imported_preferences.load("user://preferences.cfg")
+	check(imported_preferences.get_value("brushes", "presets", [])[-1].tip_angle == 35.0,
+		"adapted brush parameters are persisted")
+	app.delete_saved_brush()
+	var delete_mypaint_prompt: ConfirmationDialog = app.get_child(-1)
+	delete_mypaint_prompt.hide()
+	delete_mypaint_prompt.confirmed.emit()
+
 	app.apply_brush(app.presets[-1])
 	app.brush_favorite_button.pressed.emit()
 	var favorite_personal_key: String = app.brush_key(app.active_brush)

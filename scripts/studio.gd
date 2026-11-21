@@ -12,6 +12,8 @@ const GroupGrip = preload("res://scripts/panel_group_grip.gd")
 const FloatingPanel = preload("res://scripts/floating_panel.gd")
 const BrushPreview = preload("res://scripts/brush_preview.gd")
 const BrushLibrary = preload("res://scripts/brush_library.gd")
+const MyPaintBrush = preload("res://scripts/mypaint_brush.gd")
+const MAX_BRUSH_FILE_BYTES := 256 * 1024
 const Sample = preload("res://scripts/sample.gd")
 const ProjectHome = preload("res://scripts/project_home.gd")
 const GetStartedTour = preload("res://scripts/get_started_tour.gd")
@@ -855,7 +857,7 @@ func build_brush_library(box: VBoxContainer) -> void:
 	brush_scroll.add_child(brush_rows)
 	brush_rows.sort_children.connect(queue_brush_preview_refresh)
 	var files = HBoxContainer.new()
-	files.add_child(button("+", import_brush, "Import Havu brush"))
+	files.add_child(button("+", import_brush, "Import brushes"))
 	files.add_child(button("↗", export_brush, "Share selected custom brush"))
 	files.add_child(button("↓", show_brush_resources, "Free brush resources and compatibility"))
 	box.add_child(files)
@@ -3685,23 +3687,64 @@ func show_custom_brush(preset: Dictionary, keep_draft := true) -> void:
 		break
 
 func import_brush() -> void:
-	var dialog = FileDialog.new()
-	dialog.title = "Import Havu brush"
+	var dialog := FileDialog.new()
+	dialog.title = "Import brushes"
 	dialog.access = FileDialog.ACCESS_FILESYSTEM
-	dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
-	dialog.filters = PackedStringArray(["*.havubrush ; Havu brush preset"])
+	dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILES
+	dialog.filters = PackedStringArray(["*.havubrush,*.myb ; Brush presets", "* ; All files"])
 	dialog.use_native_dialog = true
 	add_child(dialog)
-	dialog.file_selected.connect(func(path):
-		if FileAccess.get_file_as_bytes(path).size() > 65536: notify("Brush file is too large."); dialog.queue_free(); return
-		var preset = JSON.parse_string(FileAccess.get_file_as_string(path))
-		if not valid_preset(preset): notify("Not a supported Havu brush file."); dialog.queue_free(); return
-		if store_brush(preset):
-			show_custom_brush(preset)
-			notify("Brush imported.")
+	dialog.files_selected.connect(func(paths: PackedStringArray):
+		import_brush_files(paths)
 		dialog.queue_free())
-	dialog.canceled.connect(func(): dialog.queue_free())
+	dialog.file_selected.connect(func(path: String):
+		import_brush_files(PackedStringArray([path]))
+		dialog.queue_free())
+	dialog.canceled.connect(dialog.queue_free)
 	dialog.popup_centered_ratio(0.75)
+
+func import_brush_files(paths: PackedStringArray) -> void:
+	var next_presets := presets.duplicate()
+	var first: Dictionary = {}
+	var first_error := ""
+	var added := 0
+	var adapted := 0
+	for path in paths:
+		var result := read_brush_file(path)
+		if result.has("error"):
+			if first_error.is_empty(): first_error = result.error
+			continue
+		var preset: Dictionary = result.preset
+		preset.local_id = validated_brush_id()
+		next_presets.append(preset)
+		if first.is_empty(): first = preset
+		added += 1
+		if result.get("adapted", false): adapted += 1
+	if added == 0:
+		if not first_error.is_empty(): notify(first_error)
+		return
+	if not persist_brushes(next_presets): return
+	show_custom_brush(first)
+	var message := "Brush imported." if added == 1 else "%d brushes imported." % added
+	if adapted > 0: message += " MyPaint settings were adapted for Havu."
+	if added < paths.size(): message += " %d skipped." % (paths.size() - added)
+	notify(message)
+
+func read_brush_file(path: String) -> Dictionary:
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null: return {"error": "Could not open the brush file."}
+	var bytes := file.get_buffer(MAX_BRUSH_FILE_BYTES + 1)
+	file.close()
+	if bytes.size() > MAX_BRUSH_FILE_BYTES: return {"error": "Brush file is too large."}
+	var parser := JSON.new()
+	if parser.parse(bytes.get_string_from_utf8().trim_prefix("\uFEFF")) != OK:
+		return {"error": "Choose a Havu .havubrush or a MyPaint .myb brush."}
+	var parsed = parser.data
+	if valid_preset(parsed): return {"preset": parsed}
+	if parsed is Dictionary and (parsed.has("settings") or path.uri_decode().get_extension().to_lower() == "myb"):
+		var result := MyPaintBrush.convert(parsed, path)
+		if result.has("error") or valid_preset(result.preset): return result
+	return {"error": "Choose a Havu .havubrush or a MyPaint .myb brush."}
 
 func valid_preset(value) -> bool:
 	if not value is Dictionary or value.get("format") != "havu-brush" or value.get("version") != 1 or not value.get("name") is String: return false
@@ -4627,9 +4670,14 @@ func show_brush_resources() -> void:
 	dialog.title = "Free brushes"
 	var box = VBoxContainer.new()
 	box.custom_minimum_size.x = 430
-	box.add_child(label("All %d Havu brushes are included, free to use.\nSave, edit and share your own .havubrush presets." % builtin_brushes.size(), 15))
-	var detail = label("The MyPaint and SenlinOS presets are adapted from\nCC0 brush settings. Havu renders them as vectors.\nProcreate, Clip Studio and .myb files use other formats.", 13, MUTED)
+	var detail := label("All %d Havu brushes are included. Download individual .myb files from the collections below, then import them in Brushes. Imported settings use Havu’s brush engine." % builtin_brushes.size(), 15)
+	detail.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	detail.custom_minimum_size.x = 360
 	box.add_child(detail)
+	box.add_child(button("Import brushes…", func():
+		dialog.hide()
+		dialog.queue_free()
+		import_brush()))
 	for collection in BrushLibrary.AdaptedBrushes.SOURCES:
 		var url: String = BrushLibrary.AdaptedBrushes.SOURCES[collection]
 		box.add_child(button(collection + " · CC0 brush settings", func(): OS.shell_open(url)))
