@@ -25,10 +25,11 @@ static func find_region(objects: Array, seed: Vector2) -> Dictionary:
 			samples += outline.size()
 			if samples > MAX_SAMPLES: return {}
 			polygons = [outline]
-		var transform := Transform2D(0.0, Vector2.ONE * float(object.scale), 0.0, Art.v(object.pos))
+		var transform := Art.object_transform(object)
 		for polygon: PackedVector2Array in polygons:
 			if polygon.size() < 3: continue
 			var outline := transform * polygon
+			if object.get("mirrored", false): outline.reverse()
 			var bounds := Art.polygon_bounds(outline)
 			if bounds.has_point(seed) and Art.shape_point_inside(object, outline, seed): return {}
 			footprints.append({"outline": outline, "bounds": bounds, "index": index})

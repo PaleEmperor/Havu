@@ -37,6 +37,10 @@ I’d love for you to use it, share it, or make it your own.
   Selection starts on the active layer. Turn on **Select across visible layers**
   from the Select menu for artwork spread across layers. Use **Union** to join
   matching solid fills or solid ink on one layer, including separated shapes.
+- **Transform and arrange.** Drag the round selection handle to rotate. Open
+  **Transform** for flips, quarter turns, and snapping to the canvas or 15°
+  angles. **Align & arrange** aligns objects, spaces them evenly, and changes
+  their drawing order within a vector layer.
 - **Panels.** Drag a panel by its heading to move or dock it. Open **Panels** to
   bring it back, or change **UI scale** under **⋯ → Workspace settings** to make
   controls easier to reach.
@@ -51,8 +55,9 @@ you left off. Under **File → Resize canvas**, **Preserve composition** moves t
 illustration together and shrinks it only when needed to fit. Paint stays on
 editable paint layers.
 
-Projects containing a union with disconnected parts require beta 54 or newer.
-Other projects still save in the original Havu format.
+Projects containing rotated or mirrored objects require beta 55 or newer.
+A union with disconnected parts requires beta 54 or newer. Projects using
+earlier features still save in their existing format.
 
 Havu is in beta and works offline. Drawing requires no account or subscription,
 and Havu has no AI features.

@@ -58,10 +58,9 @@ func make_entry(object: Dictionary) -> Dictionary:
 	return entry
 
 func index_entry(entry: Dictionary, object: Dictionary, layer_index: int, opacity: float, groups: Array, order: int) -> void:
-	var position := Art.v(object.pos)
-	if not entry.has("bounds") or entry.position != position or entry.scale != object.scale:
-		entry.position = position
-		entry.scale = object.scale
+	var pose := Art.object_transform(object)
+	if not entry.has("bounds") or entry.pose != pose:
+		entry.pose = pose
 		entry.bounds = Art.coverage_bounds(object)
 	entry.order = order
 	entry.layer = layer_index

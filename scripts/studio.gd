@@ -55,6 +55,10 @@ var save_label: Label
 var status_label: Label
 var selection_actions: BoxContainer
 var union_button: Button
+var transform_button: Button
+var transform_menu: PopupMenu
+var arrange_menu: PopupMenu
+var arrange_to_canvas := false
 var paint_actions: HBoxContainer
 var paint_inside_button: Button
 var node_actions: BoxContainer
@@ -307,6 +311,8 @@ func _ready() -> void:
 	build_developer_panel()
 	document.changed.connect(on_document_changed)
 	canvas.document = document
+	canvas.snap_rotation = settings.get_value("input", "snap_rotation", false) == true
+	canvas.snap_to_canvas = settings.get_value("input", "snap_to_canvas", false) == true
 	document.blank()
 	title_edit.text = document.title
 	rebuild_layers()
@@ -2206,7 +2212,7 @@ func activate_tool(next: String) -> void:
 		status_label.text = "Drag to erase on a paint layer. Tap to remove a vector object."
 	elif status_label and next in Canvas.AREA_TOOLS:
 		status_label.text = "Draw around whole objects to select them. Two fingers pan and zoom."
-	elif status_label: status_label.text = {"brush": "Light pressure blends. Firm pressure adds color.", "select": "Select and drag to move. Drag the corner to resize.", "nodes": "Select a stroke or path, then drag its points.", "fill": "Tap inside a shape or where the lines enclose an area.", "text": "Type your text, then tap the canvas to place it.", "hand": "Drag to pan. Pinch or scroll to zoom.", "path": "Tap to add points. Tap the first point to close the path."}.get(next, "Drag on the canvas to create a shape.")
+	elif status_label: status_label.text = {"brush": "Light pressure blends. Firm pressure adds color.", "select": "Drag to move. Use the square to resize or the round handle to rotate.", "nodes": "Select a stroke or path, then drag its points.", "fill": "Tap inside a shape or where the lines enclose an area.", "text": "Type your text, then tap the canvas to place it.", "hand": "Drag to pan. Pinch or scroll to zoom.", "path": "Tap to add points. Tap the first point to close the path."}.get(next, "Drag on the canvas to create a shape.")
 	update_selection_actions()
 	canvas.refresh_selection()
 
@@ -2374,6 +2380,11 @@ func build_selection_tray() -> void:
 	union_button = button("Union", union_artwork, "Join overlapping shapes or solid ink of the same color")
 	union_button.custom_minimum_size.y = 44
 	selection_actions.add_child(union_button)
+	build_transform_menus()
+	transform_button = button("Transform", show_transform_menu, "Rotate, mirror, align, space, or reorder the selection")
+	transform_button.custom_minimum_size.y = 44
+	selection_actions.add_child(transform_button)
+	PopupTouch.watch_launcher(transform_button)
 	selected_shape_style = button("Style", open_shape_style, "Edit the selected shape’s fill, outline, and opacity")
 	selection_actions.add_child(selected_shape_style)
 	paint_inside_button = button("Paint inside", func(): set_paint_limit(true), "Limit brushwork to this selection")
@@ -2463,6 +2474,97 @@ func change_artwork_group(ungroup: bool) -> void:
 	else:
 		notify("Select grouped artwork first." if ungroup else "Select at least two separate vector objects or groups.")
 
+func build_transform_menus() -> void:
+	transform_menu = PopupMenu.new()
+	transform_menu.name = "TransformMenu"
+	for entry in [["Rotate 90° clockwise", 0], ["Rotate 90° counterclockwise", 1],
+		["Flip horizontally", 2], ["Flip vertically", 3]]:
+		transform_menu.add_item(entry[0], entry[1])
+	transform_menu.add_separator()
+	transform_menu.add_check_item("Snap rotation to 15°", 4)
+	transform_menu.add_check_item("Snap moves to canvas", 6)
+	transform_menu.add_item("Align & arrange…", 5)
+	transform_menu.add_theme_constant_override("v_separation", 16)
+	transform_menu.id_pressed.connect(transform_action)
+	add_child(transform_menu)
+
+	arrange_menu = PopupMenu.new()
+	arrange_menu.name = "ArrangeMenu"
+	arrange_menu.add_theme_constant_override("v_separation", 16)
+	arrange_menu.add_check_item("Align to canvas", 10)
+	arrange_menu.add_separator()
+	var labels := ["Align left", "Center horizontally", "Align right", "Align top",
+		"Center vertically", "Align bottom", "Space horizontally", "Space vertically"]
+	for index in labels.size(): arrange_menu.add_item(labels[index], index)
+	arrange_menu.add_separator()
+	for entry in [["Bring to front", 20], ["Send to back", 21], ["Bring forward", 22], ["Send backward", 23]]:
+		arrange_menu.add_item(entry[0], entry[1])
+	arrange_menu.hide_on_checkable_item_selection = false
+	arrange_menu.id_pressed.connect(arrange_action)
+	add_child(arrange_menu)
+
+func show_transform_menu() -> void:
+	if canvas.transformable_items().is_empty(): return
+	transform_menu.set_item_checked(transform_menu.get_item_index(4), canvas.snap_rotation)
+	transform_menu.set_item_checked(transform_menu.get_item_index(6), canvas.snap_to_canvas)
+	show_edit_popup(transform_menu)
+
+func show_edit_popup(menu: PopupMenu) -> void:
+	menu.reset_size()
+	var anchor := transform_button.get_screen_position() if transform_button.is_visible_in_tree() else get_screen_position() + Vector2(20, 75)
+	if transform_button.is_visible_in_tree():
+		anchor += Vector2(0.0, transform_button.size.y + 4) if tools_horizontal else Vector2(transform_button.size.x + 4, 0.0)
+	menu.position = Vector2i(anchor)
+	menu.popup()
+
+func transform_action(id: int) -> void:
+	canvas.finish()
+	match id:
+		0: canvas.turn_selection(PI / 2.0)
+		1: canvas.turn_selection(-PI / 2.0)
+		2: canvas.turn_selection(0.0, 1)
+		3: canvas.turn_selection(0.0, 2)
+		4:
+			canvas.snap_rotation = not canvas.snap_rotation
+			save_input_preference("snap_rotation", canvas.snap_rotation)
+		5: show_arrange_menu.call_deferred()
+		6:
+			canvas.snap_to_canvas = not canvas.snap_to_canvas
+			save_input_preference("snap_to_canvas", canvas.snap_to_canvas)
+
+func update_arrange_actions() -> void:
+	var units := {}
+	for item in canvas.transformable_items(): units[document.layout_unit(item.object)] = true
+	arrange_menu.set_item_checked(arrange_menu.get_item_index(10), arrange_to_canvas)
+	for id in range(8):
+		var minimum := 3 if id >= 6 else (1 if arrange_to_canvas else 2)
+		arrange_menu.set_item_disabled(arrange_menu.get_item_index(id), units.size() < minimum)
+
+func show_arrange_menu() -> void:
+	update_arrange_actions()
+	show_edit_popup(arrange_menu)
+
+func arrange_action(id: int) -> void:
+	if id == 10:
+		arrange_to_canvas = not arrange_to_canvas
+		update_arrange_actions()
+		return
+	canvas.finish()
+	var items: Array[Dictionary] = canvas.transformable_items()
+	var changed := false
+	if id < 6:
+		changed = document.align_items(items, id, arrange_to_canvas)
+		if not changed: notify("The selection is already aligned.")
+	elif id < 8:
+		changed = document.distribute_items(items, id - 6)
+		if not changed: notify("The selection already has even spacing.")
+	else:
+		changed = document.stack_items(items, id - 20)
+		if not changed: notify("No change to drawing order. Stack commands work on ordinary vector layers.")
+	if changed:
+		canvas.selected_area.clear()
+		canvas.refresh_selection()
+
 func union_artwork() -> void:
 	canvas.finish()
 	var reason := document.union_selected()
@@ -2479,7 +2581,7 @@ func update_selection_actions() -> void:
 	if selection_tool: items = document.selected_items()
 	var can_act := not items.is_empty()
 	var grouping: Dictionary = document.grouping_actions(items)
-	for id in [8, 9, 11, 12]:
+	for id in [8, 9, 11, 12, 14]:
 		var index := workspace_menu.get_item_index(id)
 		var available: bool = grouping.group if id == 11 else grouping.ungroup if id == 12 else can_act
 		if index >= 0: workspace_menu.set_item_disabled(index, not available)
@@ -2501,6 +2603,7 @@ func update_selection_actions() -> void:
 	deselect_button.visible = selection_tool and (not canvas.selected_area.is_empty() or not document.area_selection.is_empty())
 	selection_actions.get_child(0).disabled = not can_act
 	selection_actions.get_child(1).disabled = not can_act
+	transform_button.visible = can_act
 	var pen_path: bool = canvas.tool == "path"
 	finish_path_button.visible = pen_path
 	close_path_button.visible = pen_path
@@ -4120,7 +4223,7 @@ func set_workspace_option(key: String, enabled: bool) -> void:
 		notify("Could not save workspace settings for the next launch.")
 
 func sync_selection_menu() -> void:
-	for id in [8, 9, 11, 12]:
+	for id in [8, 9, 11, 12, 14]:
 		var index := workspace_menu.get_item_index(id)
 		if index >= 0: workspace_menu.remove_item(index)
 	if not workspace_options.contextual_actions:
@@ -4128,6 +4231,7 @@ func sync_selection_menu() -> void:
 		workspace_menu.add_item("Delete selection", 9)
 		workspace_menu.add_item("Group selection", 11)
 		workspace_menu.add_item("Ungroup selection", 12)
+		workspace_menu.add_item("Transform selection…", 14)
 
 func save_input_preference(key: String, value: Variant) -> void:
 	settings.set_value("input", key, value)
@@ -4428,6 +4532,7 @@ func build_header() -> void:
 			11: change_artwork_group(false)
 			12: change_artwork_group(true)
 			13: show_get_started_tour()
+			14: show_transform_menu.call_deferred()
 	)
 	add_child(workspace_menu)
 	var more = icon_button("M5 13h1M12 13h1M19 13h1", func(): pass, "Workspace options")

@@ -52,7 +52,7 @@ func draw_artwork() -> void:
 	var first := maxi(0, objects.size() - MAX_OBJECTS)
 	for index in range(first, objects.size()):
 		var object: Dictionary = objects[index]
-		var start := origin + Art.v(object.pos) * zoom
+		var pose := Art.view_transform(object, origin, zoom)
 		var scale := float(object.scale) * zoom
 		var color := Color(object.color)
 		color.a *= float(object.opacity) * layer_opacity
@@ -67,28 +67,36 @@ func draw_artwork() -> void:
 					for vertex in range(0, object.vertices.size() - 1, step):
 						miniature.vertices.append(object.vertices[vertex])
 					miniature.vertices.append(object.vertices[-1])
-				artwork.draw_set_transform(start, 0, Vector2.ONE * scale)
+				artwork.draw_set_transform_matrix(pose)
 				Art.draw_shape(artwork, miniature)
 				artwork.draw_set_transform(Vector2.ZERO)
 			"stroke":
-				draw_stroke(object, start, scale, color)
+				draw_stroke(object, pose, scale, color)
 			"text":
 				var font := Art.Fonts.font_for(object.font)
 				var font_size := clampi(roundi(float(object.font_size) * scale), 2, 32)
 				var lines: PackedStringArray = object.text.split("\n", true, 6)
+				var direction := pose
+				direction.x /= scale
+				direction.y /= scale
+				artwork.draw_set_transform_matrix(direction)
 				for line in lines.size():
-					artwork.draw_string(font, start + Vector2(0, line * font_size * 1.35), lines[line].left(45),
+					artwork.draw_string(font, Vector2(0, line * font_size * 1.35), lines[line].left(45),
 						HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, color)
+				artwork.draw_set_transform(Vector2.ZERO)
 			"image":
 				var texture := Raster.texture(object)
-				if texture: artwork.draw_texture_rect(texture, Rect2(start, Art.v(object.extent) * scale), false, color)
+				if texture:
+					artwork.draw_set_transform_matrix(pose)
+					artwork.draw_texture_rect(texture, Rect2(Vector2.ZERO, Art.v(object.extent)), false, color)
+					artwork.draw_set_transform(Vector2.ZERO)
 
-func draw_stroke(object: Dictionary, origin: Vector2, scale: float, color: Color) -> void:
+func draw_stroke(object: Dictionary, pose: Transform2D, scale: float, color: Color) -> void:
 	var points := PackedVector2Array()
 	var count: int = object.points.size()
 	var step := maxi(1, ceili(float(count) / STROKE_SAMPLES))
-	for index in range(0, count, step): points.append(origin + Art.v(object.points[index]) * scale)
-	var end := origin + Art.v(object.points[-1]) * scale
+	for index in range(0, count, step): points.append(pose * Art.v(object.points[index]))
+	var end := pose * Art.v(object.points[-1])
 	if points[-1] != end: points.append(end)
 	var width := maxf(0.65, float(object.size) * scale * 0.55)
 	if points.size() == 1: artwork.draw_circle(end, width * 0.5, color)

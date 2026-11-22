@@ -30,6 +30,7 @@ func run() -> void:
 		root.add_child(app)
 		await process_frame
 		await overhaul_regressions(app)
+		await transform_regressions(app)
 		app.autosave_timer.stop()
 		app.queue_free()
 		await process_frame
@@ -3326,6 +3327,7 @@ func run() -> void:
 	app.new_dialog.hide()
 
 	await overhaul_regressions(app)
+	await transform_regressions(app)
 
 	print("RESULT: %d checks, %d failures" % [checks, failures])
 	app.autosave_timer.stop()
@@ -3491,6 +3493,119 @@ func overhaul_regressions(app) -> void:
 		and limited.preset.import_source.limits.size() >= 3, "import distinguishes close presets from active unsupported effects")
 	format.settings.eraser = {"base_value": 0, "inputs": {"random": [[0, 0], [1, 1]]}}
 	check(MyPaintBrush.convert(format, "erase.myb").has("error"), "unsupported eraser dynamics cannot silently import as paint")
+
+func transform_regressions(app) -> void:
+	var doc: Document = app.document
+	var canvas: Canvas = app.canvas
+	app.project_home.hide()
+	doc.blank(400, 400, false)
+	canvas.fit()
+	app.set_tool("select")
+	var shape := {"kind": "polygon", "pos": [60, 60], "vertices": [[0, 0], [80, 0], [0, 40]],
+		"color": "#226451", "opacity": 1.0}
+	doc.append_with_history(shape)
+	var id: String = shape.id
+	var mark: Node2D = canvas.retained_marks[id].mark
+	var original := doc.snapshot()
+	app.transform_button.pressed.emit()
+	check(app.transform_menu.visible, "the selection tray opens the transform controls")
+	app.transform_menu.hide()
+	app.transform_menu.id_pressed.emit(2)
+	check(Art.bounds(shape).is_equal_approx(Rect2(60, 60, 80, 40)) and Art.contains(shape, Vector2(125, 90))
+		and not Art.contains(shape, Vector2(75, 90)) and mark.transform.determinant() < 0.0,
+		"horizontal flip mirrors an asymmetric object around its own center")
+	check(canvas.hit(Vector2(125, 90), true).id == id and canvas.hit(Vector2(75, 90), true).is_empty(),
+		"selection picks the mirrored geometry")
+	var mirrored := doc.snapshot()
+	doc.undo()
+	check(doc.snapshot() == original and is_same(mark, canvas.retained_marks[id].mark), "undo restores original orientation with retained geometry")
+	doc.redo()
+	check(doc.snapshot() == mirrored, "redo restores a reflection exactly")
+	doc.selection = id
+	app.transform_menu.id_pressed.emit(3)
+	check(Art.contains(shape, Vector2(125, 70)) and not Art.contains(shape, Vector2(75, 70))
+		and mark.transform.determinant() > 0.0, "vertical flip composes with a horizontal flip")
+	doc.undo()
+	doc.selection = id
+	var bounds := Art.bounds(shape)
+	var handle := canvas.rotation_handle(bounds)
+	var center := bounds.get_center()
+	var end := center + (handle - center).rotated(deg_to_rad(87.0))
+	canvas.snap_rotation = true
+	touch_press(canvas, 21, canvas.origin + handle * canvas.zoom)
+	touch_move(canvas, 21, canvas.origin + end * canvas.zoom)
+	touch_release(canvas, 21, canvas.origin + end * canvas.zoom)
+	check(is_equal_approx(float(shape.angle), PI / 2.0) and Art.bounds(shape).is_equal_approx(Rect2(80, 40, 40, 80)),
+		"a finger drags the rotation handle and can snap to 15-degree steps")
+	var pose := Art.object_transform(shape)
+	check(Art.local_point(shape, pose * Vector2(18, 9)).is_equal_approx(Vector2(18, 9))
+		and Art.selection_contours(shape)[0].has(pose * Vector2.ZERO), "transformed selection contours use the same pose as picking")
+	var pigment := PigmentIndex.new()
+	pigment.rebuild(doc)
+	var ink_point := pose * Vector2(12, 10)
+	check(pigment.sample(ink_point).is_equal_approx(Color("#226451")), "the picker index samples the rotated, reflected artwork")
+	canvas.color = Color("#ad5544")
+	canvas.fill_at(ink_point)
+	check(shape.color == "#ad5544" and Art.object_transform(shape).is_equal_approx(pose), "fill recolors a transformed shape without moving it")
+	var reopened := Document.new()
+	check(doc.save_to("user://transformed.havu") == OK and reopened.load_from("user://transformed.havu").is_empty()
+		and Art.object_transform(reopened.find_object(id)).is_equal_approx(pose), "rotated and reflected objects reopen from disk")
+	var raw = JSON.parse_string(FileAccess.get_file_as_string("user://transformed.havu"))
+	check(raw.version == Document.ORIENTED_OBJECT_VERSION, "orientation uses an explicit file version")
+	var svg := Image.new()
+	check(svg.load_svg_from_string(Art.svg(reopened, false)) == OK and svg.get_pixelv(Vector2i(ink_point)).a > 0.99
+		and svg.get_pixel(82, 42).a < 0.01, "SVG exports the same transformed footprint")
+	if DisplayServer.get_name() != "headless":
+		await app.export_png("user://transformed.png")
+		var png := Image.load_from_file("user://transformed.png")
+		check(png != null and png.get_pixelv(Vector2i(ink_point * 2.0)).is_equal_approx(svg.get_pixelv(Vector2i(ink_point)))
+			and png.get_pixel(164, 84).a < 0.01, "PNG and SVG agree on the rotated, reflected polygon")
+	app.set_tool("nodes")
+	var node_start := pose * Art.v(shape.vertices[0])
+	canvas.path_node_spread = 0.0
+	canvas.begin(canvas.origin + node_start * canvas.zoom, 0.8)
+	canvas.update_stroke(canvas.origin + (node_start + Vector2(9, 10)) * canvas.zoom, 0.8)
+	canvas.finish()
+	check((pose * Art.v(shape.vertices[0])).is_equal_approx(node_start + Vector2(9, 10)), "dragging a rotated, mirrored node follows the pen")
+
+	doc.blank(400, 400, false)
+	var left := test_rect(doc, 25, 35, 20, 10)
+	var member := test_rect(doc, 35, 47, 10, 15)
+	var middle := test_rect(doc, 90, 68, 30, 15)
+	var right := test_rect(doc, 230, 50, 55, 25)
+	var ids: Array[String] = [left.id, member.id]
+	doc.select_objects(ids)
+	doc.group_selected()
+	ids.append_array([middle.id, right.id])
+	doc.select_objects(ids)
+	check(doc.align_items(doc.selected_items(), Document.Alignment.TOP, false)
+		and middle.pos[1] == 35.0 and right.pos[1] == 35.0 and member.pos[1] == 47.0, "align treats grouped objects as one unit")
+	check(doc.distribute_items(doc.selected_items(), 0) and is_equal_approx(float(middle.pos[0]) - 45.0, 230.0 - Art.bounds(middle).end.x),
+		"spacing uses equal gaps between differently sized objects")
+	doc.selection = right.id
+	check(doc.align_items(doc.selected_items(), Document.Alignment.CENTER_X, true)
+		and is_equal_approx(Art.bounds(right).get_center().x, 200.0), "one object can be centered on the canvas")
+	var previous: Array = doc.layers[0].objects.map(func(object): return object.id)
+	doc.select_objects([left.id, member.id])
+	check(doc.stack_items(doc.selected_items(), Document.Stacking.FRONT) and doc.layers[0].objects[-2].id == left.id
+		and doc.layers[0].objects[-1].id == member.id, "Bring to front preserves the internal order of the selection")
+	doc.undo()
+	check(doc.layers[0].objects.map(func(object): return object.id) == previous, "undo restores exact layer stacking")
+	doc.redo()
+	check(doc.layers[0].objects[-1].id == member.id, "redo restores the stacking command")
+	doc.selection = right.id
+	var arranged_bounds := Art.bounds(right)
+	var drag_start := arranged_bounds.get_center()
+	canvas.start = drag_start
+	canvas.snap_to_canvas = true
+	var offset := Vector2(-arranged_bounds.position.x + 2.0, 0)
+	check(canvas.begin_selection_move(drag_start), "a selected object can start a canvas-snapped drag")
+	canvas.update_selection_move(drag_start + offset)
+	check(is_zero_approx(Art.bounds(right).position.x) and canvas.drag_guides.x == 0.0,
+		"canvas snapping pulls a nearby edge into place and exposes its guide")
+	canvas.finish()
+	canvas.snap_to_canvas = false
+	check(not is_finite(canvas.drag_guides.x), "release clears the temporary alignment guide")
 
 func tap_window_control(window: Window, control: Control) -> void:
 	var touch := InputEventScreenTouch.new()

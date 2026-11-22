@@ -106,7 +106,7 @@ static func union_objects(objects: Array[Dictionary]) -> Dictionary:
 static func join_near_tips(stroke: Dictionary, stroke_outline: PackedVector2Array,
 		outline: PackedVector2Array, other: PackedVector2Array, gap: float, compound: bool) -> PackedVector2Array:
 	var points: Array = stroke.points
-	var transform := Transform2D(0.0, Vector2.ONE * float(stroke.get("scale", 1.0)), 0.0, Art.v(stroke.get("pos", [0.0, 0.0])))
+	var transform := Art.object_transform(stroke)
 	var taper := Art.stroke_taper(stroke)
 	var edges := Compound.bridge_edges(other) if compound else {}
 	var patched := outline
@@ -158,5 +158,7 @@ static func mergeable_outline(object: Dictionary) -> PackedVector2Array:
 	var points := Art.stroke_polygon(object) if object.kind == "stroke" else Art.polygon(object)
 	if points.size() < 3: return PackedVector2Array()
 	if not object.get("compound_disjoint", false) and Geometry2D.triangulate_polygon(points).is_empty(): return PackedVector2Array()
-	var scale := Vector2.ONE * float(object.get("scale", 1.0))
-	return Transform2D(0.0, scale, 0.0, Art.v(object.get("pos", [0.0, 0.0]))) * points
+	var world := Art.object_transform(object) * points
+	# A reflection reverses outer and inner winding together.
+	if object.get("mirrored", false): world.reverse()
+	return world

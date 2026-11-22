@@ -10,6 +10,9 @@ const AreaSelection = preload("res://scripts/area_selection.gd")
 const AREA_TOOLS := AreaSelection.TOOLS
 const SELECTION_PADDING := 5.0
 const RESIZE_HIT_RADIUS := 16.0
+const ROTATION_HANDLE_GAP := 26.0
+const ROTATION_HANDLE_RADIUS := 14.0
+const SNAP_DISTANCE := 8.0
 const PAINT_CACHE_THRESHOLD := 1200
 const WET_PIGMENT_SPACING := 0.26
 const ANDROID_POINTER_IDLE := 0.18
@@ -46,6 +49,11 @@ var moving_selection: Array[Dictionary] = []
 var transform_cache: IsolatedOpacity
 var select_across_layers := false
 var selection_move_bounds := Rect2()
+var selection_rotating := false
+var selection_rotation_delta := 0.0
+var snap_rotation := false
+var snap_to_canvas := false
+var drag_guides := Vector2.INF
 var selection_preview_bounds := Rect2()
 var selection_scale_min := 0.02
 var selection_scale_max := 1000.0
@@ -259,6 +267,10 @@ func draw_selection() -> void:
 			selection_overlay.draw_polyline(border, Color("#a4f0d2"), 1.4, true)
 		return
 	if tool != "select" and tool != "nodes" and tool not in AREA_TOOLS: return
+	if selection_rotating and edit_started:
+		draw_rotation_preview()
+		return
+	if moving and edit_started: draw_drag_guides()
 	if not document.area_selection.is_empty() and tool != "nodes":
 		var bounds := items_bounds(document.selected_items()) if moving_selection.is_empty() else selection_preview_bounds
 		if bounds.has_area(): draw_multi_selection_bounds(bounds)
@@ -275,11 +287,13 @@ func draw_selection() -> void:
 	selection_overlay.draw_rect(box.grow(SELECTION_PADDING), Color("#67d6b0"), false, 1.2)
 	if tool != "nodes":
 		selection_overlay.draw_rect(Rect2(box.end - Vector2(5, 5), Vector2(10, 10)), Color("#a1f2d4"))
+		draw_rotation_handle(bounds)
 	elif object.kind in ["stroke", "polygon", "path"]:
 		var points: Array = node_points(object)
 		var added: Array = object.get("node_anchors", [])
+		var pose := Art.object_transform(object)
 		for index in editable_nodes(object):
-			var point = origin + (Art.v(points[index]) * float(object.scale) + Art.v(object.pos)) * zoom
+			var point = origin + (pose * Art.v(points[index])) * zoom
 			var highlighted: bool = index == node_index or index in added
 			var fill := Color("#a1f2d4") if highlighted else Color("#172a21")
 			if node_index >= 0 and not highlighted:
@@ -296,6 +310,56 @@ func draw_multi_selection_bounds(bounds: Rect2) -> void:
 		selection_overlay.draw_circle(corner, 3, Color("#a4f0d2"), true, -1, true)
 	var handle: Vector2 = origin + bounds.end * zoom
 	selection_overlay.draw_rect(Rect2(handle - Vector2(5, 5), Vector2(10, 10)), Color("#a1f2d4"))
+	draw_rotation_handle(bounds)
+
+func rotation_handle(bounds: Rect2) -> Vector2:
+	var handle := Vector2(bounds.get_center().x, bounds.position.y - ROTATION_HANDLE_GAP / zoom)
+	if origin.y + handle.y * zoom < ROTATION_HANDLE_RADIUS:
+		handle.y = bounds.end.y + ROTATION_HANDLE_GAP / zoom
+	return handle
+
+func draw_rotation_handle(bounds: Rect2, radians := 0.0) -> void:
+	var center := bounds.get_center()
+	var handle := rotation_handle(bounds)
+	var edge := Vector2(center.x, bounds.position.y if handle.y < center.y else bounds.end.y)
+	var grip: Vector2 = origin + (center + (handle - center).rotated(radians)) * zoom
+	var stem: Vector2 = origin + (center + (edge - center).rotated(radians)) * zoom
+	selection_overlay.draw_line(stem, grip, Color("#67d6b0"), 1.4, true)
+	selection_overlay.draw_circle(grip, 6.0, Color("#172a21"), true, -1.0, true)
+	selection_overlay.draw_circle(grip, 6.0, Color("#a1f2d4"), false, 1.5, true)
+
+func draw_rotation_preview() -> void:
+	var center := selection_move_bounds.get_center()
+	var corners := PackedVector2Array()
+	for point in AreaSelection.corners(selection_move_bounds):
+		corners.append(origin + (center + (point - center).rotated(selection_rotation_delta)) * zoom)
+	selection_overlay.draw_polyline(Art.close_points(corners), Color("#a1f2d4"), 1.4, true)
+	draw_rotation_handle(selection_move_bounds, selection_rotation_delta)
+
+func draw_drag_guides() -> void:
+	var ink := Color("#56beb4")
+	if is_finite(drag_guides.x):
+		var top: Vector2 = origin + Vector2(drag_guides.x * zoom, 0.0)
+		selection_overlay.draw_line(top, top + Vector2(0, document.height * zoom), ink, 1.0, true)
+	if is_finite(drag_guides.y):
+		var left: Vector2 = origin + Vector2(0.0, drag_guides.y * zoom)
+		selection_overlay.draw_line(left, left + Vector2(document.width * zoom, 0), ink, 1.0, true)
+
+func snap_canvas_move(offset: Vector2) -> Vector2:
+	drag_guides = Vector2.INF
+	var correction := Vector2.ZERO
+	var box := Rect2(selection_move_bounds.position + offset, selection_move_bounds.size)
+	var page := Vector2(document.width, document.height)
+	for axis in 2:
+		var closest: float = SNAP_DISTANCE / zoom
+		for target in [0.0, page[axis] * 0.5, page[axis]]:
+			for edge in [box.position[axis], box.get_center()[axis], box.end[axis]]:
+				var gap: float = target - edge
+				if absf(gap) >= closest: continue
+				closest = absf(gap)
+				correction[axis] = gap
+				drag_guides[axis] = target
+	return offset + correction
 
 func items_bounds(items: Array[Dictionary]) -> Rect2:
 	var bounds := Rect2()
@@ -357,7 +421,34 @@ func selection_resize_hit(bounds: Rect2, point: Vector2) -> bool:
 
 func selection_box_hit(bounds: Rect2, point: Vector2) -> bool:
 	return bounds.has_area() and (bounds.grow((SELECTION_PADDING + 1.0) / zoom).has_point(point)
-		or selection_resize_hit(bounds, point))
+		or selection_resize_hit(bounds, point) or selection_rotation_hit(bounds, point))
+
+func selection_rotation_hit(bounds: Rect2, point: Vector2) -> bool:
+	return rotation_handle(bounds).distance_to(point) <= ROTATION_HANDLE_RADIUS / zoom
+
+func transformable_items() -> Array[Dictionary]:
+	var picked: Array[Dictionary] = []
+	for item in document.selected_items():
+		if layer_is_visible(item.layer) and not item.object.get("paint_tile", false): picked.append(item)
+	return picked
+
+func turn_selection(radians: float, flip := 0) -> bool:
+	var items := transformable_items()
+	if items.is_empty(): return false
+	var center := exact_selection_bounds(items).get_center()
+	var changes: Array[Dictionary] = []
+	for item in items:
+		var captured := Document.capture_transform_item(item)
+		Document.turn_object(captured, center, radians, flip)
+		changes.append(captured)
+	selected_area.clear()
+	document.record_transform(changes)
+	return true
+
+func exact_selection_bounds(items: Array[Dictionary]) -> Rect2:
+	var bounds := Art.bounds(items[0].object)
+	for index in range(1, items.size()): bounds = bounds.merge(Art.bounds(items[index].object))
+	return bounds
 
 func editable_selected_object() -> Dictionary:
 	for item in document.selected_items():
@@ -368,15 +459,13 @@ func begin_selection_transform(point: Vector2) -> bool:
 	return begin_selection_move(point)
 
 func prepare_position_edit(item: Dictionary) -> void:
-	var object: Dictionary = item.object
-	moving_selection.append({"object": object, "layer_id": item.layer.id,
-		"position": Art.v(object.pos), "original_pos": object.pos, "preview_pos": object.pos.duplicate(),
-		"scale": object.scale})
+	var captured := Document.capture_transform_item(item)
+	captured.preview_pos = item.object.pos.duplicate()
+	moving_selection.append(captured)
 
 func begin_selection_move(point: Vector2) -> bool:
-	var items: Array[Dictionary] = document.selected_items()
+	var items := transformable_items()
 	if items.is_empty(): return false
-	if items.size() == 1 and not layer_is_visible(items[0].layer): return false
 	var bounds := Art.bounds(items[0].object) if items.size() == 1 else items_bounds(items)
 	if not selection_box_hit(bounds, point): return false
 	selection_scale_min = 0.0
@@ -390,7 +479,9 @@ func begin_selection_move(point: Vector2) -> bool:
 	selection_move_bounds = bounds
 	selection_preview_bounds = bounds
 	edit_started = false
-	resizing = selection_resize_hit(bounds, point)
+	selection_rotating = selection_rotation_hit(bounds, point)
+	selection_rotation_delta = 0.0
+	resizing = not selection_rotating and selection_resize_hit(bounds, point)
 	moving = not resizing
 	return true
 
@@ -405,6 +496,16 @@ func update_selection_move(point: Vector2) -> void:
 			# on every pointer sample is more expensive than drawing its retained items.
 			transform_cache = paint_cache
 			transform_cache.show_live_marks()
+	if selection_rotating:
+		var center := selection_move_bounds.get_center()
+		var delta := (start - center).angle_to(point - center)
+		if snap_rotation: delta = snappedf(delta, PI / 12.0)
+		selection_rotation_delta = delta
+		for item in moving_selection:
+			Document.turn_object(item, center, delta, 0)
+			update_mark_pose(item.object)
+		refresh_selection()
+		return
 	var ratio := 1.0
 	var pivot := selection_move_bounds.position
 	if resizing:
@@ -416,6 +517,8 @@ func update_selection_move(point: Vector2) -> void:
 			ratio = 1.0 + offset.dot(diagonal) / diagonal.length_squared()
 		ratio = clampf(ratio, selection_scale_min, selection_scale_max)
 		offset = Vector2.ZERO
+	elif snap_to_canvas:
+		offset = snap_canvas_move(offset)
 	selection_preview_bounds = Rect2(pivot + (selection_move_bounds.position - pivot) * ratio + offset,
 		selection_move_bounds.size * ratio)
 	for item in moving_selection:
@@ -539,8 +642,7 @@ func mount_mark(holder: Node2D, object: Dictionary) -> Dictionary:
 	if object.kind == "image": mark.texture_filter = CanvasItem.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
 	Art.use_screen_edges(mark, object)
 	mark.draw.connect(Art.draw_object.bind(mark, object, Vector2.ZERO, 1.0, true))
-	mark.position = Art.v(object.pos)
-	mark.scale = Vector2.ONE * float(object.scale)
+	mark.transform = Art.object_transform(object)
 	holder.add_child(mark)
 	return {"mark": mark, "object": object, "appearance": object.duplicate()}
 
@@ -548,16 +650,18 @@ func update_mark_pose(object: Dictionary) -> Node2D:
 	var entry: Dictionary = retained_marks.get(object.id, {})
 	if entry.is_empty(): return null
 	var mark: Node2D = entry.mark
-	mark.position = Art.v(object.pos)
-	mark.scale = Vector2.ONE * float(object.scale)
+	mark.transform = Art.object_transform(object)
 	entry.appearance.pos = object.pos
 	entry.appearance.scale = object.scale
+	Document.set_orientation(entry.appearance, object.get("angle"), object.get("mirrored"))
 	entry.erase("bounds")
 	return mark
 
 func pick_bounds(object: Dictionary) -> Rect2:
 	var entry: Dictionary = retained_marks.get(object.id, {})
-	if not entry.is_empty() and is_same(entry.object, object) and entry.appearance.pos == object.pos and entry.appearance.scale == object.scale:
+	if not entry.is_empty() and is_same(entry.object, object) and entry.appearance.pos == object.pos \
+			and entry.appearance.scale == object.scale and entry.appearance.get("angle") == object.get("angle") \
+			and entry.appearance.get("mirrored") == object.get("mirrored"):
 		if not entry.has("bounds"): entry.bounds = Art.coverage_bounds(object)
 		return entry.bounds
 	return Art.coverage_bounds(object)
@@ -962,8 +1066,9 @@ func nearest_editable_node(object: Dictionary, point: Vector2) -> int:
 	var points := node_points(object)
 	var best := -1
 	var distance := 12.0 / float(zoom)
+	var pose := Art.object_transform(object)
 	for index in editable_nodes(object):
-		var node_point := Art.v(points[index]) * float(object.scale) + Art.v(object.pos)
+		var node_point := pose * Art.v(points[index])
 		var next := node_point.distance_to(point)
 		if next >= distance: continue
 		best = index
@@ -1015,7 +1120,7 @@ func node_influence_radius(object: Dictionary, length: float) -> float:
 
 func deform_node(object: Dictionary, point: Vector2) -> void:
 	var points := node_points(object)
-	var delta: Vector2 = (point - start) / float(object.scale)
+	var delta := Art.local_point(object, point) - Art.local_point(object, start)
 	var center := node_arc[node_index]
 	# The range is set by Spread and the original curve, independent of drag distance.
 	var span := maxf(node_reach, 0.0001)
@@ -1157,13 +1262,14 @@ func outline_fill(layer: Dictionary, index: int, outline: PackedVector2Array) ->
 	# Recolor an existing fill immediately below this outline.
 	if index > 0:
 		var below: Dictionary = layer.objects[index - 1]
-		if below.kind == "polygon" and below.pos == stroke.pos and below.scale == stroke.scale \
+		if below.kind == "polygon" and Art.object_transform(below) == Art.object_transform(stroke) \
 				and Art.outline_vertices(below.vertices) == outline and below.get("clip", []) == stroke.get("clip", []) \
 				and below.get("opacity_groups", []) == stroke.get("opacity_groups", []):
 			return below
 	var fill := {"kind": "polygon", "vertices": vertices, "opacity": 1.0, "pos": stroke.pos.duplicate(), "scale": stroke.scale}
 	for property in ["clip", "opacity_groups"]:
 		if stroke.has(property): fill[property] = stroke[property].duplicate(true)
+	Document.set_orientation(fill, stroke.get("angle"), stroke.get("mirrored"))
 	return fill
 
 func _gui_input(event: InputEvent) -> void:
@@ -1647,6 +1753,8 @@ func finish() -> void:
 	drawing = false
 	moving = false
 	moving_selection.clear()
+	selection_rotating = false
+	drag_guides = Vector2.INF
 	resizing = false
 	node_index = -1
 	node_arc.clear()
@@ -1663,6 +1771,7 @@ func cancel() -> void:
 			for item in moving_selection:
 				item.object.pos = item.original_pos
 				item.object.scale = item.scale
+				Document.set_orientation(item.object, item.angle, item.mirrored)
 				update_mark_pose(item.object)
 		else:
 			if not document.history.is_empty(): document.restore(document.history.pop_back())
@@ -1675,6 +1784,8 @@ func cancel() -> void:
 	drawing = false
 	moving = false
 	moving_selection.clear()
+	selection_rotating = false
+	drag_guides = Vector2.INF
 	resizing = false
 	node_index = -1
 	node_arc.clear()

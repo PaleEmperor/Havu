@@ -22,8 +22,22 @@ static var grain_tip: ArrayMesh
 static func v(pair_value) -> Vector2:
 	return Vector2(pair_value[0], pair_value[1])
 
+static func object_transform(object: Dictionary) -> Transform2D:
+	var magnitude := float(object.get("scale", 1.0))
+	var axis := Vector2.from_angle(float(object.angle)) * magnitude if object.has("angle") else Vector2(magnitude, 0.0)
+	return Transform2D(-axis if object.get("mirrored", false) else axis,
+		Vector2(-axis.y, axis.x), v(object.pos) if object.has("pos") else Vector2.ZERO)
+
+static func has_orientation(object: Dictionary) -> bool:
+	return object.has("angle") or object.has("mirrored")
+
+static func view_transform(object: Dictionary, origin: Vector2, zoom: float) -> Transform2D:
+	var local := object_transform(object)
+	return Transform2D(local.x * zoom, local.y * zoom, origin + local.origin * zoom)
+
 static func local_point(object: Dictionary, point: Vector2) -> Vector2:
-	return (point - v(object.pos)) / float(object.scale)
+	if not has_orientation(object): return (point - v(object.pos)) / float(object.scale)
+	return object_transform(object).affine_inverse() * point
 
 static func polygon(object: Dictionary) -> PackedVector2Array:
 	var result = PackedVector2Array()
@@ -157,8 +171,8 @@ static func stroke_direction(points: Array, index: int) -> Vector2:
 	var direction := (after - before).normalized()
 	return Vector2.RIGHT if direction.is_zero_approx() else direction
 
-static func bounds(object: Dictionary) -> Rect2:
-	var result = Rect2()
+static func outline_bounds(object: Dictionary) -> Rect2:
+	var result := Rect2()
 	if object.kind == "image":
 		result = Rect2(Vector2.ZERO, v(object.extent))
 	elif object.kind == "text":
@@ -170,19 +184,34 @@ static func bounds(object: Dictionary) -> Rect2:
 	else:
 		var points = stroke_polygon(object) if object.kind == "stroke" else polygon(object)
 		if not points.is_empty():
-			result = Rect2(points[0], Vector2.ZERO)
-			for point in points: result = result.expand(point)
+			result = polygon_bounds(points)
 			if object.kind == "path" and object.get("arrow", false):
 				for point in arrow_head(points, outline_width(object)): result = result.expand(point)
 			if object.kind in SHAPES and outline_width(object) > 0: result = result.grow(outline_width(object) * 0.5)
-	result.position = result.position * float(object.scale) + v(object.pos)
-	result.size *= float(object.scale)
 	return result
+
+static func bounds(object: Dictionary) -> Rect2:
+	if not has_orientation(object):
+		var local := outline_bounds(object)
+		return Rect2(local.position * float(object.scale) + v(object.pos), local.size * float(object.scale))
+	var pose := object_transform(object)
+	if object.kind in ["text", "image"]: return pose * outline_bounds(object)
+	var points := stroke_polygon(object) if object.kind == "stroke" else polygon(object)
+	if points.is_empty(): return Rect2(pose.origin, Vector2.ZERO)
+	var box := polygon_bounds(pose * points)
+	if object.kind == "path" and object.get("arrow", false):
+		for point in arrow_head(points, outline_width(object)): box = box.expand(pose * point)
+	return box.grow(outline_width(object) * float(object.scale) * 0.5) if object.kind in SHAPES else box
 
 static func coverage_bounds(object: Dictionary) -> Rect2:
 	if object.kind != "stroke": return bounds(object).grow(0.01)
 	# The sampler uses distance to the centerline, including round caps.
 	var points: Array = object.points
+	if has_orientation(object):
+		var pose := object_transform(object)
+		var box := Rect2(pose * v(points[0]), Vector2.ZERO)
+		for point in points: box = box.expand(pose * v(point))
+		return box.grow((float(object.size) * 0.5 + 0.01) * float(object.scale))
 	var result := Rect2(v(points[0]), Vector2.ZERO)
 	for point in points: result = result.expand(v(point))
 	result = result.grow(float(object.size) * 0.5 + 0.01)
@@ -191,7 +220,7 @@ static func coverage_bounds(object: Dictionary) -> Rect2:
 static func contains(object: Dictionary, point: Vector2, tolerance = 0.0) -> bool:
 	var local = local_point(object, point)
 	if not point_inside_clip(object, local): return false
-	if object.kind in ["text", "image"]: return bounds(object).grow(tolerance).has_point(point)
+	if object.kind in ["text", "image"]: return outline_bounds(object).grow(tolerance / float(object.scale)).has_point(local)
 	if object.kind == "stroke":
 		var points = object.points
 		var curve: float = object.get("pressure_curve", 1.0)
@@ -286,18 +315,18 @@ static func selection_contours(object: Dictionary) -> Array[PackedVector2Array]:
 					Geometry2D.JOIN_ROUND, Geometry2D.END_BUTT))
 				if not arrow.is_empty(): contours.append(arrow)
 		"text", "image":
-			return [AreaSelection.corners(bounds(object))]
+			return [object_transform(object) * AreaSelection.corners(outline_bounds(object))]
 		_:
 			contours.assign(shape_fill_components(object, polygon(object)))
 	var selection: Array[PackedVector2Array] = []
 	var mask := prepare_paint_mask(object)
-	var position := v(object.pos)
+	var pose := object_transform(object)
 	for outline in contours:
 		if outline.size() < 3: continue
 		for piece in clipped_polygon(object, outline, mask):
 			if Geometry2D.triangulate_polygon(piece).is_empty(): continue
-			var transformed := PackedVector2Array()
-			for point in piece: transformed.append(point * float(object.scale) + position)
+			var transformed: PackedVector2Array = pose * piece
+			if object.get("mirrored", false): transformed.reverse()
 			selection.append(transformed)
 	return selection
 
@@ -409,9 +438,8 @@ static func vector_paint_mask(layer: Dictionary) -> Array:
 		if not object.get("opacity_groups", []).is_empty(): continue
 		for region in opaque_footprints(object):
 			if regions.size() >= 256 or total + region.size() > 24000: continue
-			var transformed := PackedVector2Array()
-			var position := v(object.pos)
-			for point in region: transformed.append(point * float(object.scale) + position)
+			var transformed: PackedVector2Array = object_transform(object) * region
+			if object.get("mirrored", false): transformed.reverse()
 			var area := polygon_bounds(transformed)
 			var merged := false
 			# Merge touching regions when their union is representable without a hole.
@@ -565,7 +593,7 @@ static func close_points(points: PackedVector2Array) -> PackedVector2Array:
 
 static func draw_object(target: CanvasItem, object: Dictionary, origin = Vector2.ZERO, zoom = 1.0, local_geometry := false) -> void:
 	if not local_geometry:
-		target.draw_set_transform(origin + v(object.pos) * zoom, 0, Vector2.ONE * zoom * float(object.scale))
+		target.draw_set_transform_matrix(view_transform(object, origin, zoom))
 	var color = Color(object.color)
 	color.a *= object.opacity
 	match object.kind:
@@ -949,7 +977,12 @@ static func svg(document, embed_fonts = true) -> String:
 			for depth in range(shared, groups.size()): output.append('<g opacity="%s">' % groups[depth].opacity)
 			scopes = groups
 			counter += 1
-			output.append('<g transform="translate(%s %s) scale(%s)">' % [object.pos[0], object.pos[1], object.scale])
+			if has_orientation(object):
+				var pose := object_transform(object)
+				output.append('<g transform="matrix(%s %s %s %s %s %s)">' % [
+					pose.x.x, pose.x.y, pose.y.x, pose.y.y, pose.origin.x, pose.origin.y])
+			else:
+				output.append('<g transform="translate(%s %s) scale(%s)">' % [object.pos[0], object.pos[1], object.scale])
 			if object.has("clip"):
 				var clip = PackedVector2Array()
 				for p in object.clip: clip.append(v(p))

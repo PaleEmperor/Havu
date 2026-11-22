@@ -9,6 +9,7 @@ const VectorUnion = preload("res://scripts/vector_union.gd")
 const Fonts = preload("res://scripts/font_library.gd")
 const VERSION = 1
 const DISJOINT_COMPOUND_VERSION = 2
+const ORIENTED_OBJECT_VERSION = 3
 const MAX_PROJECT_BYTES := 64 * 1024 * 1024
 const MAX_IMAGE_PAYLOAD := 40 * 1024 * 1024
 const MAX_OBJECTS = 10000
@@ -17,6 +18,8 @@ const HISTORY_ESTIMATED_BYTES := 96 * 1024 * 1024
 const MIN_CANVAS_SIZE := 64
 const MAX_CANVAS_SIZE := 10000
 enum ResizeArtwork { KEEP, FIT, ADAPT, COMPOSITION }
+enum Alignment { LEFT, CENTER_X, RIGHT, TOP, CENTER_Y, BOTTOM }
+enum Stacking { FRONT, BACK, FORWARD, BACKWARD }
 var title = "The little green café"
 var width = 900.0
 var height = 1100.0
@@ -87,9 +90,11 @@ func estimate_history_bytes(entry: Dictionary) -> int:
 	elif entry.has("append"):
 		bytes += estimate_object_bytes(entry.append)
 	elif entry.has("transform"):
-		for objects in entry.transform.values(): bytes += 320 * objects.size()
+		for objects in entry.transform.values(): bytes += 480 * objects.size()
 	elif entry.has("paint"):
 		for tile in entry.before + entry.after: bytes += estimate_object_bytes(tile.tile)
+	elif entry.has("object_order"):
+		for orders in entry.object_order.values(): bytes += 64 * orders[0].size()
 	elif entry.has("span"):
 		for object in entry.before + entry.after: bytes += estimate_object_bytes(object)
 	return bytes
@@ -223,15 +228,161 @@ func append_vector_object(object: Dictionary, ink_gap := VectorUnion.TIP_GAP) ->
 	commit()
 	return true
 
+static func capture_transform_item(item: Dictionary) -> Dictionary:
+	var object: Dictionary = item.object
+	return {"object": object, "layer_id": item.layer.id,
+		"position": Art.v(object.pos), "original_pos": object.pos,
+		"scale": object.scale, "angle": object.get("angle"), "mirrored": object.get("mirrored")}
+
+static func set_orientation(object: Dictionary, angle, mirrored) -> void:
+	if angle == null: object.erase("angle")
+	else: object.angle = angle
+	if mirrored == null: object.erase("mirrored")
+	else: object.mirrored = mirrored
+
+static func turn_object(item: Dictionary, pivot: Vector2, radians: float, flip: int) -> void:
+	var object: Dictionary = item.object
+	if flip == 0 and is_zero_approx(radians):
+		object.pos = item.original_pos
+		set_orientation(object, item.angle, item.mirrored)
+		return
+	var angle := float(item.angle) if item.angle != null else 0.0
+	var mirrored: bool = item.mirrored == true
+	var offset: Vector2 = item.position - pivot
+	if flip == 1:
+		offset.x = -offset.x
+		angle = -angle
+		mirrored = not mirrored
+	elif flip == 2:
+		offset.y = -offset.y
+		angle = PI - angle
+		mirrored = not mirrored
+	else:
+		offset = offset.rotated(radians)
+		angle += radians
+	var center := pivot + offset
+	object.pos = [center.x, center.y]
+	angle = wrapf(angle, -PI, PI)
+	set_orientation(object, null if is_zero_approx(angle) else angle, true if mirrored else null)
+
+func arrange_units(items: Array[Dictionary]) -> Array[Dictionary]:
+	var units: Array[Dictionary] = []
+	var indices := {}
+	for item in items:
+		var object: Dictionary = item.object
+		if object.get("paint_tile", false): continue
+		var key := layout_unit(object)
+		var box := Art.bounds(object)
+		if not indices.has(key):
+			indices[key] = units.size()
+			units.append({"position": units.size(), "bounds": box, "items": [item]})
+			continue
+		var unit := units[int(indices[key])]
+		unit.bounds = unit.bounds.merge(box)
+		unit.items.append(item)
+	return units
+
+func translate_unit(unit: Dictionary, shift: Vector2, changes: Array[Dictionary]) -> void:
+	if shift.is_zero_approx(): return
+	for item in unit.items:
+		var captured := capture_transform_item(item)
+		var moved: Vector2 = captured.position + shift
+		item.object.pos = [moved.x, moved.y]
+		changes.append(captured)
+
+func align_items(items: Array[Dictionary], alignment: Alignment, to_canvas: bool) -> bool:
+	var units := arrange_units(items)
+	if units.size() < (1 if to_canvas else 2): return false
+	var guide := Rect2(Vector2.ZERO, Vector2(width, height)) if to_canvas else units[0].bounds as Rect2
+	if not to_canvas:
+		for unit in units: guide = guide.merge(unit.bounds)
+	var axis := int(alignment) / 3
+	var anchor := float(int(alignment) % 3) * 0.5
+	var changes: Array[Dictionary] = []
+	for unit in units:
+		var box: Rect2 = unit.bounds
+		var shift := Vector2.ZERO
+		shift[axis] = guide.position[axis] + guide.size[axis] * anchor - box.position[axis] - box.size[axis] * anchor
+		translate_unit(unit, shift, changes)
+	record_transform(changes)
+	return not changes.is_empty()
+
+func distribute_items(items: Array[Dictionary], axis: int) -> bool:
+	var units := arrange_units(items)
+	if units.size() < 3: return false
+	units.sort_custom(func(a, b):
+		var left: float = a.bounds.position[axis]
+		var right: float = b.bounds.position[axis]
+		return a.position < b.position if left == right else left < right)
+	var extent := 0.0
+	for unit in units: extent += unit.bounds.size[axis]
+	var start: float = units[0].bounds.position[axis]
+	var end: float = units[-1].bounds.end[axis]
+	for unit in units: end = maxf(end, float(unit.bounds.end[axis]))
+	var gap := (end - start - extent) / (units.size() - 1)
+	var changes: Array[Dictionary] = []
+	for unit in units:
+		var shift := Vector2.ZERO
+		shift[axis] = start - unit.bounds.position[axis]
+		translate_unit(unit, shift, changes)
+		start += unit.bounds.size[axis] + gap
+	record_transform(changes)
+	return not changes.is_empty()
+
+func stack_items(items: Array[Dictionary], order: Stacking) -> bool:
+	var by_layer := {}
+	for item in items:
+		if not by_layer.has(item.layer.id): by_layer[item.layer.id] = {}
+		by_layer[item.layer.id][item.object.id] = true
+	var change := {}
+	for layer_id in by_layer:
+		var layer: Dictionary = layers[layer_index(layer_id)]
+		# Keep flattened opacity scopes and fixed pixel tiles in their existing layer stack.
+		if layer.get("type", "vector") != "vector" or layer.objects.any(func(object): return object.has("opacity_groups")):
+			return false
+		var previous: Array = layer.objects.map(func(object): return object.id)
+		var next := stacked_ids(previous, by_layer[layer_id], order)
+		if next != previous: change[layer_id] = [previous, next]
+	if change.is_empty(): return false
+	push_history({"object_order": change})
+	future.clear()
+	apply_object_order(change, true)
+	return true
+
+static func stacked_ids(previous: Array, ids: Dictionary, order: Stacking) -> Array:
+	if order == Stacking.FRONT or order == Stacking.BACK:
+		var selected_ids := previous.filter(func(id): return ids.has(id))
+		var others := previous.filter(func(id): return not ids.has(id))
+		return others + selected_ids if order == Stacking.FRONT else selected_ids + others
+	var next := previous.duplicate()
+	var step := 1 if order == Stacking.FORWARD else -1
+	var indices := range(next.size() - 2, -1, -1) if step > 0 else range(1, next.size())
+	for index in indices:
+		if not ids.has(next[index]) or ids.has(next[index + step]): continue
+		var id = next[index]
+		next[index] = next[index + step]
+		next[index + step] = id
+	return next
+
+func apply_object_order(change: Dictionary, forward: bool) -> void:
+	for layer_id in change:
+		var layer: Dictionary = layers[layer_index(layer_id)]
+		var objects := {}
+		for object in layer.objects: objects[object.id] = object
+		layer.objects = change[layer_id][int(forward)].map(func(id): return objects[id])
+	commit()
+
 func record_transform(items: Array[Dictionary]) -> void:
 	var by_layer := {}
 	var changed_objects: Array[Dictionary] = []
 	for item in items:
 		var object: Dictionary = item.object
-		if Art.v(object.pos) == item.position and object.scale == item.scale: continue
+		if Art.v(object.pos) == item.position and object.scale == item.scale \
+				and object.get("angle") == item.angle and object.get("mirrored") == item.mirrored: continue
 		if not by_layer.has(item.layer_id): by_layer[item.layer_id] = {}
 		by_layer[item.layer_id][object.id] = [
-			item.original_pos.duplicate(), item.scale, object.pos.duplicate(), object.scale]
+			[item.original_pos.duplicate(), item.scale, item.angle, item.mirrored],
+			[object.pos.duplicate(), object.scale, object.get("angle"), object.get("mirrored")]]
 		changed_objects.append(object)
 	if by_layer.is_empty(): return
 	push_history({"transform": by_layer})
@@ -240,7 +391,7 @@ func record_transform(items: Array[Dictionary]) -> void:
 
 func restore_transform(change: Dictionary, forward: bool) -> void:
 	var changed_objects: Array[Dictionary] = []
-	var slot := 2 if forward else 0
+	var slot := int(forward)
 	for layer_id in change.transform:
 		var index := layer_index(layer_id)
 		if index == -1: continue
@@ -249,8 +400,10 @@ func restore_transform(change: Dictionary, forward: bool) -> void:
 		for object in layers[index].objects:
 			var pose: Array = entries.get(object.id, [])
 			if pose.is_empty(): continue
-			object.pos = pose[slot].duplicate()
-			object.scale = pose[slot + 1]
+			var state: Array = pose[slot]
+			object.pos = state[0].duplicate()
+			object.scale = state[1]
+			set_orientation(object, state[2], state[3])
 			changed_objects.append(object)
 			remaining -= 1
 			if remaining == 0: break
@@ -263,6 +416,10 @@ func undo() -> void:
 	if change.has("transform"):
 		append_history_entry(future, change)
 		restore_transform(change, false)
+		return
+	if change.has("object_order"):
+		append_history_entry(future, change)
+		apply_object_order(change.object_order, false)
 		return
 	if change.has("paint"):
 		append_history_entry(future, change)
@@ -298,6 +455,10 @@ func redo() -> void:
 	if change.has("transform"):
 		push_history(change)
 		restore_transform(change, true)
+		return
+	if change.has("object_order"):
+		push_history(change)
+		apply_object_order(change.object_order, true)
 		return
 	if change.has("paint"):
 		push_history(change)
@@ -877,6 +1038,10 @@ func save_to(path: String) -> Error:
 		if not layer.objects.any(func(object): return object.get("compound_disjoint", false)): continue
 		save_state.version = DISJOINT_COMPOUND_VERSION
 		break
+	for layer in layers:
+		if not layer.objects.any(Art.has_orientation): continue
+		save_state.version = ORIENTED_OBJECT_VERSION
+		break
 	var encoded := JSON.stringify(save_state)
 	if encoded.to_utf8_buffer().size() > MAX_PROJECT_BYTES: return ERR_OUT_OF_MEMORY
 	# Android's Storage Access Framework returns opaque content URIs.
@@ -926,7 +1091,7 @@ func load_from(path: String) -> String:
 	return ""
 
 static func validate(data) -> String:
-	if not data is Dictionary or data.get("format") != "havu" or (data.get("version") != VERSION and data.get("version") != DISJOINT_COMPOUND_VERSION):
+	if not data is Dictionary or data.get("format") != "havu" or (data.get("version") != VERSION and data.get("version") != DISJOINT_COMPOUND_VERSION and data.get("version") != ORIENTED_OBJECT_VERSION):
 		return "Unsupported project format."
 	if not data.get("title") is String or data.title.length() > 300: return "Invalid title."
 	for key in ["width", "height"]:
@@ -966,6 +1131,10 @@ static func validate(data) -> String:
 			if layer.get("type", "vector") == "paint" and (object.kind != "image" or not object.get("paint_tile", false)):
 				return "A paint layer contains an invalid mark."
 			if not pair(object.get("pos")) or not numeric(object.get("scale")) or object.scale <= 0 or object.scale > 1000: return "Invalid object transform."
+			if object.has("angle") and (not numeric(object.angle) or absf(object.angle) > PI + 0.000001):
+				return "Invalid rotation angle."
+			if object.has("mirrored") and not object.mirrored is bool: return "Invalid reflected orientation."
+			if object.get("paint_tile", false) and Art.has_orientation(object): return "Invalid paint tile orientation."
 			if not valid_color(object.get("color")): return "Invalid object color."
 			if not numeric(object.get("opacity")) or object.opacity < 0 or object.opacity > 1: return "Invalid opacity."
 			if object.has("opacity_groups") and not valid_opacity_groups(object.opacity_groups): return "Invalid opacity groups."
