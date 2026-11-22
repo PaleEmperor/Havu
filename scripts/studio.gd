@@ -73,8 +73,11 @@ var shape_actions: BoxContainer
 var selected_shape_style: Button
 var finish_path_button: Button
 var close_path_button: Button
-var shape_menu: PopupMenu
-var selection_menu: PopupMenu
+var shape_menu: PopupPanel
+var selection_menu: PopupPanel
+var shape_icons: Array[Button] = []
+var selection_icons: Array[Button] = []
+var select_across_toggle: CheckButton
 var deselect_button: Button
 var shape_style_dialog: ConfirmationDialog
 var shape_fill_switch: CheckBox
@@ -85,11 +88,27 @@ var shape_line_width: SpinBox
 var shape_style_opacity: HSlider
 var shape_edit_id := ""
 var shape_style_open_path := false
-const SHAPE_OPTIONS := [["rect", "Rectangle"], ["square", "Square"], ["rounded_rect", "Rounded rectangle"],
-	["ellipse", "Ellipse"], ["circle", "Circle"], ["triangle", "Triangle"], ["diamond", "Diamond"],
-	["star", "Star"], ["line", "Line"], ["arrow", "Arrow"], ["path", "Pen path"]]
-const SELECTION_OPTIONS := [["select", "Object"], ["select_rect", "Rectangle"],
-	["select_ellipse", "Ellipse"], ["select_lasso", "Freehand"], ["select_square", "Square"], ["select_circle", "Circle"]]
+const SHAPE_OPTIONS := [
+	["rect", "Rectangle", "M3 7H23V19H3Z"],
+	["square", "Square", "M5 5H21V21H5Z"],
+	["rounded_rect", "Rounded rectangle", "M7 6H19Q23 6 23 10V16Q23 20 19 20H7Q3 20 3 16V10Q3 6 7 6Z"],
+	["ellipse", "Ellipse", "M3 13a10 6.5 0 1 0 20 0a10 6.5 0 1 0-20 0"],
+	["circle", "Circle", "M5 13a8 8 0 1 0 16 0a8 8 0 1 0-16 0"],
+	["triangle", "Triangle", "M13 4L23 21H3Z"],
+	["diamond", "Diamond", "M13 3L22 13L13 23L4 13Z"],
+	["star", "Star", "M13 3l2.7 6.5 7 .6-5.3 4.6 1.6 6.8-6-3.6-6 3.6 1.6-6.8-5.3-4.6 7-.6Z"],
+	["line", "Line", "M5 21L21 5"],
+	["arrow", "Arrow", "M5 21L21 5M13 5H21V13"],
+	["path", "Pen path", "M5 19L12 6L21 14M3 17H7V21H3ZM10 4H14V8H10ZM19 12H23V16H19Z"],
+]
+const SELECTION_OPTIONS := [
+	["select", "Select object", "M5 4L21 15L14 16L11 22Z"],
+	["select_rect", "Rectangle selection", "M3 11V7H7M11 7H15M19 7H23V11M23 15V19H19M15 19H11M7 19H3V15"],
+	["select_ellipse", "Ellipse selection", "M3 12Q4 9 8 8M11 7H15M18 8Q22 9 23 12M23 14Q22 17 18 18M15 19H11M8 18Q4 17 3 14"],
+	["select_lasso", "Freehand selection", "M5 17C1 14 4 7 9 6M12 5C16 4 21 6 22 9M23 12C22 17 17 20 12 20M9 20C5 20 3 17 4 16C6 13 11 16 8 22"],
+	["select_square", "Square selection", "M5 9V5H9M12 5H14M17 5H21V9M21 12V14M21 17V21H17M14 21H12M9 21H5V17M5 14V12"],
+	["select_circle", "Circle selection", "M5 11Q6 6 11 5M15 5Q20 6 21 11M21 15Q20 20 15 21M11 21Q6 20 5 15"],
+]
 var tool_grid: GridContainer
 var tools_horizontal := false
 const FOOTER_HEIGHT := 40.0
@@ -2217,50 +2236,69 @@ func activate_tool(next: String) -> void:
 	canvas.refresh_selection()
 
 func build_selection_menu() -> void:
-	selection_menu = PopupMenu.new()
+	selection_menu = PopupPanel.new()
 	selection_menu.name = "SelectionMenu"
-	for index in SELECTION_OPTIONS.size(): selection_menu.add_radio_check_item(SELECTION_OPTIONS[index][1], index)
-	selection_menu.add_separator()
-	selection_menu.add_check_item("Select across visible layers", SELECTION_OPTIONS.size())
-	selection_menu.id_pressed.connect(func(id):
-		if id == SELECTION_OPTIONS.size():
-			canvas.select_across_layers = not canvas.select_across_layers
-			canvas.clear_selection()
-		else: set_tool(SELECTION_OPTIONS[id][0]))
 	add_child(selection_menu)
+	var content := build_tool_picker(selection_menu, SELECTION_OPTIONS, selection_icons, 3)
+	select_across_toggle = CheckButton.new()
+	select_across_toggle.text = "Select across visible layers"
+	select_across_toggle.custom_minimum_size.y = 44
+	select_across_toggle.toggled.connect(func(enabled):
+		canvas.select_across_layers = enabled
+		canvas.clear_selection())
+	content.add_child(select_across_toggle)
 	PopupTouch.watch_launcher(tool_buttons.select)
 
 func show_selection_menu() -> void:
 	tool_buttons.select.set_pressed_no_signal(canvas.tool == "select" or canvas.tool in Canvas.AREA_TOOLS)
-	for index in SELECTION_OPTIONS.size():
-		selection_menu.set_item_checked(index, SELECTION_OPTIONS[index][0] == canvas.tool)
-	selection_menu.set_item_checked(selection_menu.get_item_index(SELECTION_OPTIONS.size()), canvas.select_across_layers)
-	var anchor: Button = tool_buttons.select
-	selection_menu.reset_size()
-	selection_menu.position = Vector2i(anchor.get_screen_position() + Vector2(anchor.size.x + 6, 0))
-	selection_menu.popup()
+	select_across_toggle.set_pressed_no_signal(canvas.select_across_layers)
+	show_tool_picker(selection_menu, tool_buttons.select, selection_icons)
 
 func build_shape_menu() -> void:
-	shape_menu = PopupMenu.new()
+	shape_menu = PopupPanel.new()
 	shape_menu.name = "ShapesMenu"
-	for index in SHAPE_OPTIONS.size():
-		shape_menu.add_radio_check_item(SHAPE_OPTIONS[index][1], index)
-	shape_menu.add_separator()
-	shape_menu.add_item("Shape style…", SHAPE_OPTIONS.size())
-	shape_menu.id_pressed.connect(func(id):
-		if id == SHAPE_OPTIONS.size(): open_shape_style()
-		else: set_tool(SHAPE_OPTIONS[id][0]))
 	add_child(shape_menu)
+	var content := build_tool_picker(shape_menu, SHAPE_OPTIONS, shape_icons, 4)
+	content.add_child(button("Shape style…", func():
+		shape_menu.hide()
+		open_shape_style()))
 	PopupTouch.watch_launcher(tool_buttons.shapes)
 
 func show_shape_menu() -> void:
 	tool_buttons.shapes.set_pressed_no_signal(canvas.tool in Canvas.SHAPE_TOOLS)
-	for index in SHAPE_OPTIONS.size():
-		shape_menu.set_item_checked(index, SHAPE_OPTIONS[index][0] == canvas.tool)
-	var anchor: Button = tool_buttons.shapes
-	shape_menu.reset_size()
-	shape_menu.position = Vector2i(anchor.get_screen_position() + Vector2(anchor.size.x + 6, 0))
-	shape_menu.popup()
+	show_tool_picker(shape_menu, tool_buttons.shapes, shape_icons)
+
+func build_tool_picker(menu: PopupPanel, options: Array, icons: Array[Button], columns: int) -> VBoxContainer:
+	menu.theme = theme
+	menu.add_theme_stylebox_override("panel", style(Color("#1b1b1b"), 10, Color("#343434"), 0))
+	var content := margin(menu, 8)
+	var grid := GridContainer.new()
+	grid.columns = columns
+	grid.add_theme_constant_override("h_separation", 5)
+	grid.add_theme_constant_override("v_separation", 5)
+	content.add_child(grid)
+	for entry in options:
+		var mode: String = entry[0]
+		var choice := icon_button(entry[2], func():
+			menu.hide()
+			set_tool(mode), entry[1])
+		choice.set_meta("tool", mode)
+		choice.accessibility_name = entry[1]
+		choice.toggle_mode = true
+		choice.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		choice.custom_minimum_size = Vector2(52, 48)
+		choice.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		grid.add_child(choice)
+		icons.append(choice)
+	content.add_child(HSeparator.new())
+	return content
+
+func show_tool_picker(menu: PopupPanel, anchor: Button, icons: Array[Button]) -> void:
+	for choice in icons: choice.set_pressed_no_signal(choice.get_meta("tool") == canvas.tool)
+	menu.reset_size()
+	var offset := Vector2(0, anchor.size.y + 6) if tools_horizontal else Vector2(anchor.size.x + 6, 0)
+	menu.position = Vector2i(anchor.get_screen_position() + offset)
+	menu.popup()
 
 func build_shape_style() -> void:
 	shape_style_dialog = ConfirmationDialog.new()

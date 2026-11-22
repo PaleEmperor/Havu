@@ -2027,10 +2027,12 @@ func run() -> void:
 	app.set_workspace_option("contextual_actions", true)
 	vector_canvas.fit()
 	app.tool_buttons.shapes.pressed.emit()
-	check(app.shape_menu.visible and app.shape_menu.get_item_text(8) == "Line"
-		and app.shape_menu.get_item_text(10) == "Pen path", "the Shapes tool opens a menu with lines and custom paths")
-	app.shape_menu.hide()
-	app.shape_menu.id_pressed.emit(2)
+	check(app.shape_menu.visible and app.shape_icons[8].accessibility_name == "Line"
+		and app.shape_icons[10].tooltip_text == "Pen path"
+		and app.shape_icons.all(func(choice): return choice.text.is_empty() and choice.icon != null),
+		"the Shapes tool shows an icon grid with accessible labels")
+	await process_frame
+	tap_window_control(app.shape_menu, app.shape_icons[2])
 	check(vector_canvas.tool == "rounded_rect" and app.shape_actions.is_visible_in_tree(), "choosing a shape shows its contextual Style control")
 	app.shape_actions.get_child(0).pressed.emit()
 	app.shape_fill_switch.button_pressed = false
@@ -2800,10 +2802,13 @@ func run() -> void:
 	selection_doc.layers[2].locked = true
 	selection_doc.commit()
 	app.tool_buttons.select.pressed.emit()
-	check(app.selection_menu.visible and app.selection_menu.get_item_text(3) == "Freehand", "Select opens the object and area mode menu")
-	app.selection_menu.hide()
-	app.selection_menu.id_pressed.emit(app.SELECTION_OPTIONS.size())
-	app.selection_menu.id_pressed.emit(1)
+	check(app.selection_menu.visible and app.selection_icons[3].tooltip_text == "Freehand selection"
+		and app.selection_icons.all(func(choice): return choice.text.is_empty() and choice.icon != null),
+		"Select opens an icon grid for object and area modes")
+	await process_frame
+	tap_window_control(app.selection_menu, app.select_across_toggle)
+	await process_frame
+	tap_window_control(app.selection_menu, app.selection_icons[1])
 	var local := func(point: Vector2) -> Vector2: return selection_canvas.origin + point * selection_canvas.zoom
 	touch_press(selection_canvas, 16, local.call(Vector2(125, 125)))
 	touch_move(selection_canvas, 16, local.call(Vector2(315, 260)))
