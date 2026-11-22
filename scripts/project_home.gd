@@ -61,10 +61,10 @@ func _ready() -> void:
 	heading_stack.add_child(brand)
 
 	var title_row := HBoxContainer.new()
-	title_row.add_theme_constant_override("separation", 12)
+	title_row.add_theme_constant_override("separation", 19)
 	heading_stack.add_child(title_row)
 	heading = make_label("Projects", 52, Color("#f2f2f2"))
-	heading.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	heading.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
 	heading.add_theme_font_override("font", Art.SERIF)
 	title_row.add_child(heading)
 
@@ -73,7 +73,9 @@ func _ready() -> void:
 	projects_mark.texture = PROJECTS_MARK
 	projects_mark.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	projects_mark.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	projects_mark.texture_filter = Control.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
 	projects_mark.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	projects_mark.size_flags_vertical = Control.SIZE_SHRINK_END
 	title_row.add_child(projects_mark)
 
 	resized.connect(layout_projects_header)
@@ -118,7 +120,8 @@ func layout_projects_header() -> void:
 	content.custom_minimum_size.x = width
 	var compact := width < 360.0
 	heading.add_theme_font_size_override("font_size", 40 if compact else 52)
-	projects_mark.custom_minimum_size.x = 80.0 if compact else 108.0
+	projects_mark.custom_minimum_size = Vector2(86, 40) if width < 300.0 else (
+		Vector2(112, 52) if compact else Vector2(144, 64))
 
 func update_projects(recent: Array, recovered: Array, session_title: String, session_available: bool) -> void:
 	resume_button.visible = session_available
