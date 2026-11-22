@@ -2,12 +2,11 @@
 
 **A little illustration studio for Android tablets.**
 
-[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.53/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
+[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.58/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
 
 I wanted my wife to have somewhere of her own to draw. A little studio on her
 tablet, with brushes she could make her own, artwork she could scale into shop
-menus and posters, and just enough pine green. The duck and bear on the Projects
-screen are the two of us.
+menus and posters, and just enough pine green.
 
 Havu is a love letter to her. If it makes your drawing time a little nicer too,
 I’d love for you to use it, share it, or make it your own.
