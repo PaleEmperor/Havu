@@ -54,9 +54,10 @@ var text_entry: TouchTextEntry
 var save_label: Label
 var status_label: Label
 var selection_actions: BoxContainer
+var union_button: Button
 var paint_actions: HBoxContainer
 var paint_inside_button: Button
-var node_actions: HBoxContainer
+var node_actions: BoxContainer
 var add_node_button: Button
 var node_spread_slider: TouchSlider
 var node_spread_readout: Label
@@ -64,7 +65,7 @@ var node_spread_dragging := false
 var selection_tray: PanelContainer
 var group_artwork_button: Button
 var ungroup_artwork_button: Button
-var shape_actions: HBoxContainer
+var shape_actions: BoxContainer
 var selected_shape_style: Button
 var finish_path_button: Button
 var close_path_button: Button
@@ -1107,6 +1108,8 @@ func draft_brush(name_text: String) -> Dictionary:
 	var preset := BrushLibrary.preset(name_text, canvas.brush, canvas.brush_size,
 		canvas.opacity, canvas.blending, canvas.smoothing)
 	preset.merge(canvas.brush_profile)
+	if active_brush.has("import_source"):
+		preset.import_source = active_brush.import_source.duplicate(true)
 	return preset
 
 func brush_draft_changed(draft: Dictionary) -> bool:
@@ -2211,7 +2214,13 @@ func build_selection_menu() -> void:
 	selection_menu = PopupMenu.new()
 	selection_menu.name = "SelectionMenu"
 	for index in SELECTION_OPTIONS.size(): selection_menu.add_radio_check_item(SELECTION_OPTIONS[index][1], index)
-	selection_menu.id_pressed.connect(func(id): set_tool(SELECTION_OPTIONS[id][0]))
+	selection_menu.add_separator()
+	selection_menu.add_check_item("Select across visible layers", SELECTION_OPTIONS.size())
+	selection_menu.id_pressed.connect(func(id):
+		if id == SELECTION_OPTIONS.size():
+			canvas.select_across_layers = not canvas.select_across_layers
+			canvas.clear_selection()
+		else: set_tool(SELECTION_OPTIONS[id][0]))
 	add_child(selection_menu)
 	PopupTouch.watch_launcher(tool_buttons.select)
 
@@ -2219,6 +2228,7 @@ func show_selection_menu() -> void:
 	tool_buttons.select.set_pressed_no_signal(canvas.tool == "select" or canvas.tool in Canvas.AREA_TOOLS)
 	for index in SELECTION_OPTIONS.size():
 		selection_menu.set_item_checked(index, SELECTION_OPTIONS[index][0] == canvas.tool)
+	selection_menu.set_item_checked(selection_menu.get_item_index(SELECTION_OPTIONS.size()), canvas.select_across_layers)
 	var anchor: Button = tool_buttons.select
 	selection_menu.reset_size()
 	selection_menu.position = Vector2i(anchor.get_screen_position() + Vector2(anchor.size.x + 6, 0))
@@ -2361,6 +2371,9 @@ func build_selection_tray() -> void:
 	ungroup_artwork_button = button("Ungroup", change_artwork_group.bind(true), shortcut_hint("Ungroup selected vectors", "Ctrl+Shift+G"))
 	selection_actions.add_child(group_artwork_button)
 	selection_actions.add_child(ungroup_artwork_button)
+	union_button = button("Union", union_artwork, "Join overlapping shapes or solid ink of the same color")
+	union_button.custom_minimum_size.y = 44
+	selection_actions.add_child(union_button)
 	selected_shape_style = button("Style", open_shape_style, "Edit the selected shape’s fill, outline, and opacity")
 	selection_actions.add_child(selected_shape_style)
 	paint_inside_button = button("Paint inside", func(): set_paint_limit(true), "Limit brushwork to this selection")
@@ -2368,7 +2381,8 @@ func build_selection_tray() -> void:
 	deselect_button = icon_button("M4 9V4H9M17 4H22V9M22 17V22H17M9 22H4V17M9 9L17 17M17 9L9 17",
 		canvas.clear_selection, "Deselect")
 	selection_actions.add_child(deselect_button)
-	shape_actions = HBoxContainer.new()
+	shape_actions = BoxContainer.new()
+	shape_actions.vertical = not tools_horizontal
 	selection_tray.add_child(shape_actions)
 	shape_actions.add_child(button("Style", open_shape_style, "Set fill, outline, and opacity for new shapes"))
 	finish_path_button = button("Finish", func(): canvas.commit_path(false), shortcut_hint("Finish an open path", "Enter"))
@@ -2378,7 +2392,8 @@ func build_selection_tray() -> void:
 	paint_actions = HBoxContainer.new()
 	selection_tray.add_child(paint_actions)
 	paint_actions.add_child(button("Paint freely", func(): set_paint_limit(false), "Turn off the selection’s paint limit"))
-	node_actions = HBoxContainer.new()
+	node_actions = BoxContainer.new()
+	node_actions.vertical = not tools_horizontal
 	selection_tray.add_child(node_actions)
 	add_node_button = button("Add node", toggle_add_node, "Tap an edge to add a node")
 	add_node_button.toggle_mode = true
@@ -2448,6 +2463,16 @@ func change_artwork_group(ungroup: bool) -> void:
 	else:
 		notify("Select grouped artwork first." if ungroup else "Select at least two separate vector objects or groups.")
 
+func union_artwork() -> void:
+	canvas.finish()
+	var reason := document.union_selected()
+	if not reason.is_empty():
+		notify(reason)
+		return
+	canvas.selected_area.clear()
+	canvas.refresh_selection()
+	notify("Joined into one vector shape.")
+
 func update_selection_actions() -> void:
 	var selection_tool: bool = canvas.tool == "select" or canvas.tool in Canvas.AREA_TOOLS
 	var items: Array[Dictionary] = []
@@ -2464,6 +2489,7 @@ func update_selection_actions() -> void:
 	selection_actions.visible = is_select
 	group_artwork_button.visible = grouping.group
 	ungroup_artwork_button.visible = grouping.ungroup
+	union_button.visible = items.size() > 1 and document.union_selection_reason(items).is_empty()
 	shape_actions.visible = is_shape
 	paint_actions.visible = is_paint
 	node_actions.visible = canvas.tool == "nodes" and panels.Tools.visible
@@ -2519,6 +2545,8 @@ func set_tool_orientation(horizontal: bool) -> void:
 	tools_horizontal = horizontal
 	tool_grid.columns = tool_grid.get_child_count() if tools_horizontal else 1
 	selection_actions.vertical = not horizontal
+	shape_actions.vertical = not horizontal
+	node_actions.vertical = not horizontal
 	selection_tray.reset_size()
 	panels.Tools.preferred_size = Vector2.ZERO
 	panels.Tools.apply_preferred_size.call_deferred()
@@ -2584,12 +2612,15 @@ func on_document_changed() -> void:
 	canvas.refresh_selection()
 	page_dimensions.text = "%d × %d" % [roundi(document.width), roundi(document.height)]
 	title_edit.text = document.title
-	rebuild_layers()
+	var previews: Array = document.content_on_commit.get("layers", [])
+	if document.content_on_commit.has("layer"): previews = [document.content_on_commit.layer]
+	if not document.appended_on_commit.is_empty(): previews = [document.layers[document.active].id]
+	rebuild_layers(previews)
 	undo_button.disabled = document.history.is_empty()
 	redo_button.disabled = document.future.is_empty()
 	save_label.text = "Unsaved changes" if document.dirty else "Saved locally"
 
-func rebuild_layers() -> void:
+func rebuild_layers(previews: Array = []) -> void:
 	if not layer_list: return
 	canvas.validate_solo_layer()
 	if not canvas.solo_layer_id.is_empty():
@@ -2605,11 +2636,12 @@ func rebuild_layers() -> void:
 	for index in range(document.layers.size() - 1, -1, -1):
 		var layer: Dictionary = document.layers[index]
 		var row: PanelContainer = layer_rows.get(layer.id)
+		var refresh_preview: bool = not row or previews.is_empty() or layer.id in previews
 		if not row: row = create_layer_row(layer.id)
 		current_rows[layer.id] = row
 		var position_in_list: int = document.layers.size() - 1 - index
 		if row.get_index() != position_in_list: layer_list.move_child(row, position_in_list)
-		update_layer_row(row, layer, index == document.active)
+		update_layer_row(row, layer, index == document.active, refresh_preview)
 	for layer_id in layer_rows:
 		if current_rows.has(layer_id): continue
 		layer_list.remove_child(layer_rows[layer_id])
@@ -2753,7 +2785,7 @@ func layer_icon_button(action: Callable, width: float) -> Button:
 	control.add_theme_stylebox_override("focus", style(Color.TRANSPARENT, 5, ACCENT, 0))
 	return control
 
-func update_layer_row(row: PanelContainer, layer: Dictionary, active: bool) -> void:
+func update_layer_row(row: PanelContainer, layer: Dictionary, active: bool, refresh_preview: bool) -> void:
 	row.set_meta("locked", layer.locked)
 	var row_style := layer_row_styles[int(active)]
 	if row.get_theme_stylebox("panel") != row_style:
@@ -2777,7 +2809,7 @@ func update_layer_row(row: PanelContainer, layer: Dictionary, active: bool) -> v
 	detail.modulate.a = title.modulate.a
 	select.tooltip_text = "%s · %s" % [layer.name, detail_text]
 	thumb.modulate.a = 1.0 if shown else 0.45
-	thumb.update_content(layer, Vector2(document.width, document.height))
+	if refresh_preview: thumb.update_content(layer, Vector2(document.width, document.height))
 	var eye: Button = row.get_node("Content/Visibility")
 	eye.icon = layer_icons.eye if layer.visible else layer_icons.hidden
 	eye.tooltip_text = ("Hide " if layer.visible else "Show ") + layer.name
@@ -3226,6 +3258,7 @@ func build_new_dialog() -> void:
 	canvas_artwork_mode.add_item("Keep artwork in place", Document.ResizeArtwork.KEEP)
 	canvas_artwork_mode.add_item("Scale artwork to fit", Document.ResizeArtwork.FIT)
 	canvas_artwork_mode.add_item("Adapt vector layout", Document.ResizeArtwork.ADAPT)
+	canvas_artwork_mode.add_item("Preserve composition", Document.ResizeArtwork.COMPOSITION)
 	canvas_artwork_mode.hide()
 	canvas_artwork_mode.item_selected.connect(func(_value): refresh_canvas_dimensions())
 	box.add_child(canvas_artwork_mode)
@@ -3376,9 +3409,13 @@ func refresh_canvas_dimensions() -> void:
 				hint = "Artwork scales proportionally and is centered."
 			Document.ResizeArtwork.ADAPT:
 				hint = "Vectors follow the new edges and keep their proportions."
+			Document.ResizeArtwork.COMPOSITION:
+				hint = "Move the illustration together and shrink only if it needs to fit."
 			_:
 				hint = "New bounds start at the top-left."
-		if document.has_pixel_paint(): hint += " Paint keeps its pixel scale and is cropped at the edges."
+		if document.has_pixel_paint():
+			hint += " Paint resamples if it shrinks." if canvas_artwork_mode.get_selected_id() == Document.ResizeArtwork.COMPOSITION \
+				else " Paint keeps its pixel scale and is cropped at the edges."
 	new_dimensions_note.text = hint if valid else (
 		"Enter a whole number from %d to %d in both fields." % [Document.MIN_CANVAS_SIZE, Document.MAX_CANVAS_SIZE])
 	new_dimensions_note.visible = not new_dimensions_note.text.is_empty()
@@ -3704,30 +3741,69 @@ func import_brush() -> void:
 	dialog.popup_centered_ratio(0.75)
 
 func import_brush_files(paths: PackedStringArray) -> void:
-	var next_presets := presets.duplicate()
-	var first: Dictionary = {}
+	var candidates: Array[Dictionary] = []
 	var first_error := ""
-	var added := 0
-	var adapted := 0
-	for path in paths:
-		var result := read_brush_file(path)
+	for index in mini(paths.size(), 32):
+		var result := read_brush_file(paths[index])
 		if result.has("error"):
 			if first_error.is_empty(): first_error = result.error
 			continue
-		var preset: Dictionary = result.preset
-		preset.local_id = validated_brush_id()
-		next_presets.append(preset)
-		if first.is_empty(): first = preset
-		added += 1
-		if result.get("adapted", false): adapted += 1
-	if added == 0:
+		candidates.append(result)
+	if candidates.is_empty():
 		if not first_error.is_empty(): notify(first_error)
 		return
+	var external := candidates.filter(func(candidate): return candidate.get("adapted", false))
+	var skipped := paths.size() - candidates.size()
+	if external.is_empty():
+		finish_brush_import(candidates, skipped)
+		return
+	review_brush_import(candidates, external, skipped)
+
+func review_brush_import(candidates: Array[Dictionary], external: Array, skipped: int) -> void:
+	var dialog := ConfirmationDialog.new()
+	dialog.title = "Review brush import"
+	dialog.ok_button_text = "Import approximation" if candidates.size() == 1 else "Import brushes"
+	var content := VBoxContainer.new()
+	content.custom_minimum_size.x = minf(390.0, maxf(230.0, size.x - 92.0))
+	dialog.add_child(content)
+	var summary := PackedStringArray()
+	var ratings := {"high": "High compatibility", "partial": "Partial compatibility", "limited": "Limited compatibility"}
+	for index in mini(external.size(), 3):
+		var preset: Dictionary = external[index].preset
+		var source: Dictionary = preset.import_source
+		summary.append(preset.name + " · " + ratings[source.compatibility])
+		if not source.limits.is_empty():
+			summary.append("Changes: " + ", ".join(source.limits.slice(0, 4)).to_lower() + ".")
+	if external.size() > 3: summary.append("%d more MyPaint approximations." % (external.size() - 3))
+	summary.append("Havu adapts the brush for editable vectors or paint layers. Both use Havu’s brush engine.")
+	if skipped > 0: summary.append("%d files could not be imported or exceed the 32-file limit." % skipped)
+	var description := label("\n".join(summary), 14, MUTED)
+	description.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	content.add_child(description)
+	var preview := BrushPreview.new()
+	preview.preset = external[0].preset
+	preview.detailed = true
+	preview.custom_minimum_size.y = 64
+	preview.clip_contents = true
+	content.add_child(preview)
+	add_child(dialog)
+	dialog.confirmed.connect(func():
+		finish_brush_import(candidates, skipped)
+		dialog.queue_free())
+	dialog.canceled.connect(dialog.queue_free)
+	dialog.popup_centered()
+
+func finish_brush_import(candidates: Array[Dictionary], skipped: int) -> void:
+	var next_presets := presets.duplicate()
+	for candidate in candidates:
+		var preset: Dictionary = candidate.preset
+		preset.local_id = validated_brush_id()
+		next_presets.append(preset)
 	if not persist_brushes(next_presets): return
-	show_custom_brush(first)
+	show_custom_brush(candidates[0].preset)
+	var added := candidates.size()
 	var message := "Brush imported." if added == 1 else "%d brushes imported." % added
-	if adapted > 0: message += " MyPaint settings were adapted for Havu."
-	if added < paths.size(): message += " %d skipped." % (paths.size() - added)
+	if skipped > 0: message += " %d skipped." % skipped
 	notify(message)
 
 func read_brush_file(path: String) -> Dictionary:
@@ -3740,7 +3816,12 @@ func read_brush_file(path: String) -> Dictionary:
 	if parser.parse(bytes.get_string_from_utf8().trim_prefix("\uFEFF")) != OK:
 		return {"error": "Choose a Havu .havubrush or a MyPaint .myb brush."}
 	var parsed = parser.data
-	if valid_preset(parsed): return {"preset": parsed}
+	if valid_preset(parsed):
+		var source = parsed.get("import_source")
+		if not source is Dictionary or source.get("format") != "MyPaint" or source.get("version") != 3 \
+				or source.get("compatibility") not in ["high", "partial", "limited"]:
+			parsed.erase("import_source")
+		return {"preset": parsed}
 	if parsed is Dictionary and (parsed.has("settings") or path.uri_decode().get_extension().to_lower() == "myb"):
 		var result := MyPaintBrush.convert(parsed, path)
 		if result.has("error") or valid_preset(result.preset): return result

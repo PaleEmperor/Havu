@@ -69,6 +69,40 @@ static func find_union(objects: Array, incoming: Dictionary, ink_gap := TIP_GAP)
 	if incoming.has("id"): result.id = incoming.id
 	return {"object": result, "indices": joined}
 
+static func union_objects(objects: Array[Dictionary]) -> Dictionary:
+	var outline := mergeable_outline(objects[0])
+	if outline.is_empty(): return {}
+	var contours: Array[PackedVector2Array] = []
+	for index in range(1, objects.size()):
+		var edge := mergeable_outline(objects[index])
+		if edge.is_empty(): return {}
+		contours.clear()
+		for contour in Geometry2D.merge_polygons(outline, edge):
+			contours.append_array(Compound.boundary_loops(contour))
+		outline = Compound.joined_outline(contours)
+		if outline.size() < 3 or outline.size() > MAX_VERTICES: return {}
+	var shells := 0
+	for contour in contours:
+		if not Geometry2D.is_polygon_clockwise(contour): shells += 1
+	var disconnected := shells > 1
+	if disconnected:
+		var pieces := Compound.components(outline)
+		if pieces.size() != shells: return {}
+		var expected := 0.0
+		var actual := 0.0
+		for contour in contours: expected += Compound.signed_area(contour)
+		for piece in pieces:
+			if not valid_outline(piece): return {}
+			actual += Compound.signed_area(piece)
+		if absf(absf(expected) - absf(actual)) > maxf(0.001, absf(expected) * 0.00001): return {}
+	elif not Compound.matches_area(outline, contours): return {}
+	var top := objects.back() as Dictionary
+	var result := {"id": top.id, "kind": "polygon", "color": top.color, "opacity": 1.0,
+		"pos": [0.0, 0.0], "scale": 1.0, "vertices": Art.pack_contours([outline])[0]}
+	if contours.size() > 1: result.compound = true
+	if disconnected: result.compound_disjoint = true
+	return result
+
 static func join_near_tips(stroke: Dictionary, stroke_outline: PackedVector2Array,
 		outline: PackedVector2Array, other: PackedVector2Array, gap: float, compound: bool) -> PackedVector2Array:
 	var points: Array = stroke.points
@@ -81,7 +115,7 @@ static func join_near_tips(stroke: Dictionary, stroke_outline: PackedVector2Arra
 		var tip := transform * Art.v(point)
 		var radius := Art.stroke_radius(float(stroke.size) * 0.5 * transform.x.length(), point[2],
 			stroke.get("pressure_curve", 1.0), stroke.get("minimum_width", 0.12)) * Art.taper_factor(taper, index, points.size())
-		if Geometry2D.is_point_in_polygon(tip, other): continue
+		if (Compound.contains(other, tip) if compound else Geometry2D.is_point_in_polygon(tip, other)): continue
 		var nearest := closest_edge(other, tip, edges)
 		if tip.distance_to(nearest) > radius + gap: continue
 		var cap := closest_edge(stroke_outline, nearest)
@@ -122,6 +156,7 @@ static func can_union(object: Dictionary) -> bool:
 static func mergeable_outline(object: Dictionary) -> PackedVector2Array:
 	if not can_union(object): return PackedVector2Array()
 	var points := Art.stroke_polygon(object) if object.kind == "stroke" else Art.polygon(object)
-	if points.size() < 3 or Geometry2D.triangulate_polygon(points).is_empty(): return PackedVector2Array()
+	if points.size() < 3: return PackedVector2Array()
+	if not object.get("compound_disjoint", false) and Geometry2D.triangulate_polygon(points).is_empty(): return PackedVector2Array()
 	var scale := Vector2.ONE * float(object.get("scale", 1.0))
 	return Transform2D(0.0, scale, 0.0, Art.v(object.get("pos", [0.0, 0.0]))) * points

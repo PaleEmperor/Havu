@@ -30,11 +30,11 @@ static func find_region(objects: Array, seed: Vector2) -> Dictionary:
 			if polygon.size() < 3: continue
 			var outline := transform * polygon
 			var bounds := Art.polygon_bounds(outline)
-			if bounds.has_point(seed) and Geometry2D.is_point_in_polygon(seed, outline): return {}
+			if bounds.has_point(seed) and Art.shape_point_inside(object, outline, seed): return {}
 			footprints.append({"outline": outline, "bounds": bounds, "index": index})
 			if footprints.size() > MAX_FOOTPRINTS: return {}
 			if object.get("compound", false) and bounds.has_point(seed):
-				for contour in Geometry2D.merge_polygons(outline, outline):
+				for contour in Art.Compound.boundary_loops(outline):
 					if Geometry2D.is_polygon_clockwise(contour) and Geometry2D.is_point_in_polygon(seed, contour):
 						enclosed.append({"outline": contour, "index": index})
 

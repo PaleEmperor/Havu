@@ -15,6 +15,7 @@ var cache_finished_marks := false
 var overview := false
 var rebuild_pending := false
 var pending_marks: Array[Node2D] = []
+var live_move: Node2D
 
 func _ready() -> void:
 	surface = SubViewport.new()
@@ -69,8 +70,31 @@ static func use_overview(view_size: Vector2, zoom: float, density: float, previo
 	return (zoom * density < (OVERVIEW_EXIT_ZOOM if previous else OVERVIEW_ENTER_ZOOM)
 		and cache_sampling(view_size, density * 2.0) > density * 1.05)
 
+func show_live_marks() -> void:
+	if live_move: return
+	if RenderingServer.frame_post_draw.is_connected(finish_cache_frame):
+		RenderingServer.frame_post_draw.disconnect(finish_cache_frame)
+	pending_marks.clear()
+	rebuild_pending = false
+	surface.render_target_update_mode = SubViewport.UPDATE_DISABLED
+	live_move = Node2D.new()
+	add_child(live_move)
+	for mark in artwork.get_children():
+		mark.reparent(live_move, false)
+		mark.show()
+	display.hide()
+
+func resume_cache() -> void:
+	if not live_move: return
+	for mark in live_move.get_children(): mark.reparent(artwork, false)
+	remove_child(live_move)
+	live_move.queue_free()
+	live_move = null
+	display.show()
+	invalidate_cache()
+
 func invalidate_cache() -> void:
-	if not cache_finished_marks or not surface: return
+	if not cache_finished_marks or not surface or live_move: return
 	if not rebuild_pending:
 		rebuild_pending = true
 		for mark in artwork.get_children(): mark.show()

@@ -30,9 +30,13 @@ I’d love for you to use it, share it, or make it your own.
   preset. Tap the swatch to pick a color. Supported styluses can vary stroke
   width and opacity with pressure. Use **+** in the brush library to import
   `.havubrush` or `.myb` files into **My brushes**. Imported `.myb` settings are
-  adapted to Havu’s brush engine.
+  adapted to Havu’s brush engine. Review the preview and compatibility notes
+  before adding a MyPaint brush.
 - **Vector and paint layers.** Use editable vectors for shapes, lettering, and
   artwork you want to resize. Add a paint layer when you want to work with pixels.
+  Selection starts on the active layer. Turn on **Select across visible layers**
+  from the Select menu for artwork spread across layers. Use **Union** to join
+  matching solid fills or solid ink on one layer, including separated shapes.
 - **Panels.** Drag a panel by its heading to move or dock it. Open **Panels** to
   bring it back, or change **UI scale** under **⋯ → Workspace settings** to make
   controls easier to reach.
@@ -43,7 +47,12 @@ I’d love for you to use it, share it, or make it your own.
 
 Tap **Save** to keep an editable `.havu` project. Use **File** to export SVG or
 PNG, or choose **Resume last session** on the Projects screen to pick up where
-you left off.
+you left off. Under **File → Resize canvas**, **Preserve composition** moves the
+illustration together and shrinks it only when needed to fit. Paint stays on
+editable paint layers.
+
+Projects containing a union with disconnected parts require beta 54 or newer.
+Other projects still save in the original Havu format.
 
 Havu is in beta and works offline. Drawing requires no account or subscription,
 and Havu has no AI features.

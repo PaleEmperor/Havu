@@ -6,6 +6,8 @@ const Art = preload("res://scripts/artwork.gd")
 const BrushLibrary = preload("res://scripts/brush_library.gd")
 const PigmentIndex = preload("res://scripts/pigment_index.gd")
 const Sample = preload("res://scripts/sample.gd")
+const Canvas = preload("res://scripts/canvas.gd")
+const MyPaintBrush = preload("res://scripts/mypaint_brush.gd")
 var checks = 0
 var failures = 0
 
@@ -23,6 +25,17 @@ func stroke(color = "#226451") -> Dictionary:
 	return {"kind": "stroke", "brush": "ink", "size": 20.0, "color": color, "opacity": 1.0, "points": [[10.0, 10.0, 0.1, color], [100.0, 20.0, 1.0, color], [150.0, 100.0, 0.5, color]]}
 
 func run() -> void:
+	if "--overhaul" in OS.get_cmdline_user_args():
+		var app = load("res://main.tscn").instantiate()
+		root.add_child(app)
+		await process_frame
+		await overhaul_regressions(app)
+		app.autosave_timer.stop()
+		app.queue_free()
+		await process_frame
+		print("RESULT: %d checks, %d failures" % [checks, failures])
+		quit(1 if failures else 0)
+		return
 	var doc = Document.new()
 	doc.blank()
 	doc.checkpoint()
@@ -2553,6 +2566,11 @@ func run() -> void:
 	var mypaint_dialog: FileDialog = app.get_child(-1)
 	mypaint_dialog.hide()
 	mypaint_dialog.files_selected.emit(PackedStringArray([mypaint_path, "user://missing.myb"]))
+	var review_brush_prompt: ConfirmationDialog = app.get_child(-1)
+	check(review_brush_prompt.visible and app.presets.size() == prior_preset_count + 1,
+		"MyPaint review previews the adaptation before changing the library")
+	review_brush_prompt.hide()
+	review_brush_prompt.confirmed.emit()
 	var adapted: Dictionary = app.active_brush
 	check(app.presets.size() == prior_preset_count + 2 and adapted.name == "test wash" and adapted.brush == "mix"
 		and is_equal_approx(adapted.size, 2.0 * exp(2.4)) and is_equal_approx(adapted.tip_ratio, 0.5)
@@ -2783,6 +2801,7 @@ func run() -> void:
 	app.tool_buttons.select.pressed.emit()
 	check(app.selection_menu.visible and app.selection_menu.get_item_text(3) == "Freehand", "Select opens the object and area mode menu")
 	app.selection_menu.hide()
+	app.selection_menu.id_pressed.emit(app.SELECTION_OPTIONS.size())
 	app.selection_menu.id_pressed.emit(1)
 	var local := func(point: Vector2) -> Vector2: return selection_canvas.origin + point * selection_canvas.zoom
 	touch_press(selection_canvas, 16, local.call(Vector2(125, 125)))
@@ -3306,11 +3325,172 @@ func run() -> void:
 	app.canvas_number_pad.hide()
 	app.new_dialog.hide()
 
+	await overhaul_regressions(app)
+
 	print("RESULT: %d checks, %d failures" % [checks, failures])
 	app.autosave_timer.stop()
 	app.queue_free()
 	await process_frame
 	quit(1 if failures else 0)
+
+func test_rect(doc: Document, x: int, y: int, w: int, h: int, ink := "#226451") -> Dictionary:
+	var shape := {"kind": "rect", "pos": [x, y], "extent": [w, h], "color": ink, "opacity": 1.0}
+	doc.add(shape)
+	return shape
+
+func overhaul_regressions(app) -> void:
+	app.set_tool_orientation(true)
+	check(not app.node_actions.vertical and not app.shape_actions.vertical and not app.selection_actions.vertical,
+		"anchor and selection context actions follow a horizontal tool rail")
+	app.set_tool_orientation(false)
+	check(app.node_actions.vertical and app.shape_actions.vertical and app.selection_actions.vertical,
+		"anchor and selection context actions follow a vertical tool rail")
+	var doc := Document.new()
+	doc.blank(400, 400, false)
+	var base := test_rect(doc, 30, 40, 45, 45)
+	doc.layers.append(doc.new_layer("Text background"))
+	doc.active = 1
+	var cover := test_rect(doc, 15, 20, 250, 160, "#ffffff")
+	cover.opacity = 0.5
+	doc.active = 0
+	var canvas := Canvas.new()
+	canvas.document = doc
+	canvas.size = Vector2(400, 400)
+	root.add_child(canvas)
+	check(canvas.hit(Vector2(50, 60), true).id == base.id and canvas.hit(Vector2(130, 60), true).is_empty(),
+		"selection is confined to the active layer beneath translucent artwork")
+	canvas.start = Vector2(28, 38)
+	canvas.tool = "select_rect"
+	canvas.marquee_end = Vector2(280, 210)
+	canvas.finish_marquee()
+	check(doc.selection == base.id, "marquee uses the same active-layer policy")
+	canvas.select_across_layers = true
+	check(canvas.hit(Vector2(50, 60), true).id == cover.id, "cross-layer selection deliberately includes translucent upper artwork")
+	doc.layers[1].locked = true
+	check(canvas.hit(Vector2(50, 60), true).id == base.id, "cross-layer selection skips a locked layer")
+	doc.layers[0].visible = false
+	check(canvas.hit(Vector2(50, 60), true).is_empty(), "cross-layer selection skips a hidden layer")
+	doc.blank(1600, 1200, false)
+	var ids: Array[String] = []
+	for index in 320:
+		var box := test_rect(doc, 20 + index % 16 * 43, 20 + index / 16 * 40, 18, 18)
+		if index < 140: ids.append(box.id)
+	doc.commit()
+	doc.select_objects(ids)
+	var original := doc.snapshot()
+	var node: Node2D = canvas.retained_marks[ids[0]].mark
+	canvas.start = Vector2(100, 100)
+	var can_move := canvas.begin_selection_move(canvas.start)
+	for step in 18: canvas.update_selection_move(canvas.start + Vector2(10 + step, 20))
+	canvas.finish()
+	var moved := doc.snapshot()
+	check(can_move and doc.history.size() == 1 and doc.history[-1].has("transform")
+		and node.position == Vector2(47, 40), "140 objects move through retained transforms with one history entry")
+	for step in 8:
+		doc.undo()
+		if doc.snapshot() != original: break
+		doc.redo()
+		if doc.snapshot() != moved: break
+	check(doc.snapshot() == moved and is_same(node, canvas.retained_marks[ids[0]].mark), "repeated undo and redo preserve artwork and retained marks")
+	doc.undo()
+	var future_size := doc.future.size()
+	doc.select_objects(ids)
+	canvas.begin_selection_move(canvas.start)
+	canvas.update_selection_move(canvas.start + Vector2(35, 3))
+	canvas.cancel()
+	check(doc.snapshot() == original and doc.future.size() == future_size and node.position == Vector2(20, 20),
+		"canceling a drag restores its poses and preserves the redo branch")
+
+	doc.blank(400, 400, false)
+	ids.clear()
+	for rect in [Rect2i(30, 30, 150, 20), Rect2i(30, 160, 150, 20), Rect2i(30, 49, 20, 112),
+			Rect2i(160, 49, 20, 112), Rect2i(280, 50, 35, 40)]:
+		ids.append(test_rect(doc, rect.position.x, rect.position.y, rect.size.x, rect.size.y).id)
+	doc.select_objects(ids)
+	check(doc.group_selected() and doc.layers[0].objects.size() == ids.size(),
+		"group keeps each component independently editable")
+	doc.undo()
+	doc.select_objects(ids)
+	var reason := doc.union_selected()
+	check(reason.is_empty() and doc.layers[0].objects.size() == 1, "union makes one vector geometry with a hole and a separate island")
+	if reason.is_empty():
+		var shape: Dictionary = doc.layers[0].objects[0]
+		var vertices: Array = shape.vertices.duplicate(true)
+		check(Art.contains(shape, Vector2(45, 38)) and Art.contains(shape, Vector2(295, 70))
+			and not Art.contains(shape, Vector2(100, 100)) and not Art.contains(shape, Vector2(230, 60)),
+			"compound hit testing distinguishes solid areas, holes and disconnected space")
+		canvas.color = Color("#bb4455")
+		canvas.fill_at(Vector2(42, 38))
+		check(shape.color == "#bb4455" and shape.vertices == vertices and not Art.contains(shape, Vector2(100, 100)),
+			"recoloring a union keeps its vertices and transparent hole")
+		doc.undo()
+		check(shape.color == "#226451" and shape.vertices == vertices, "undo restores only the union fill")
+		doc.redo()
+		check(shape.color == "#bb4455" and shape.vertices == vertices, "redo restores only the union fill")
+		var reopened := Document.new()
+		check(doc.save_to("user://overhaul-union.havu") == OK and reopened.load_from("user://overhaul-union.havu").is_empty()
+			and reopened.snapshot() == doc.snapshot(), "compound island and hole survive a save/load round trip")
+		var disk = JSON.parse_string(FileAccess.get_file_as_string("user://overhaul-union.havu"))
+		check(disk.version == Document.DISJOINT_COMPOUND_VERSION, "disconnected union files advertise their minimum reader version")
+		var svg := Image.new()
+		var svg_status := svg.load_svg_from_string(Art.svg(reopened, false))
+		check(svg_status == OK and svg.get_pixel(42, 38).is_equal_approx(Color("#bb4455"))
+			and svg.get_pixel(295, 70).a > 0.99 and svg.get_pixel(100, 100).a < 0.01
+			and svg.get_pixel(230, 60).a < 0.01, "SVG renders the same ink, open center and island")
+		if DisplayServer.get_name() != "headless":
+			app.document.restore(reopened.snapshot())
+			app.export_layer_id = ""
+			await app.export_png("user://overhaul-union.png")
+			var png := Image.load_from_file("user://overhaul-union.png")
+			check(png != null and png.get_pixel(84, 76).is_equal_approx(svg.get_pixel(42, 38))
+				and png.get_pixel(590, 140).a > 0.99 and png.get_pixel(200, 200).a < 0.01
+				and png.get_pixel(460, 120).a < 0.01, "PNG and SVG preserve matching fill and empty regions")
+		doc.undo()
+		doc.undo()
+		check(doc.layers[0].objects.size() == 5 and doc.layers[0].objects[0].id == ids[0],
+			"undo union restores original objects, order and identities")
+		doc.redo()
+		check(doc.layers[0].objects[0].vertices == vertices, "redo union restores exactly the same geometry")
+	doc.blank(400, 400, false)
+	var differently_styled: Array[String] = [test_rect(doc, 30, 30, 150, 20).id,
+		test_rect(doc, 40, 34, 150, 20, "#ff8800").id]
+	doc.select_objects(differently_styled)
+	check(not doc.union_selected().is_empty() and doc.layers[0].objects.size() == 2 and doc.history.is_empty(),
+		"union refuses different colors without changing artwork or history")
+	canvas.free()
+
+	doc.blank(670, 430, false, "paint")
+	var brush_mark := stroke()
+	brush_mark.pos = [210, 180]
+	brush_mark.scale = 1.0
+	check(doc.commit_paint(brush_mark, false) == OK and doc.history.back().has("paint"), "paint history stores changed tiles only")
+	var before_paint := doc.snapshot()
+	doc.undo()
+	check(doc.layers[0].objects.is_empty(), "tile delta undo removes the painted tiles")
+	doc.redo()
+	check(doc.snapshot() == before_paint, "tile delta redo restores tile pixels and stable ordering")
+	doc.layers.append(doc.new_layer())
+	doc.active = 1
+	var accent := test_rect(doc, 290, 222, 60, 48)
+	var before_resize := doc.snapshot()
+	check(doc.resize_canvas(Vector2i(149, 267), Document.ResizeArtwork.COMPOSITION) == OK
+		and Document.validate(doc.snapshot()).is_empty() and not doc.layers[0].objects.is_empty(),
+		"Preserve composition fits mixed paint and vectors on a non-multiple canvas")
+	var fit_pos := Art.v(doc.find_object(accent.id).pos)
+	check(Rect2(Vector2.ZERO, Vector2(149, 267)).has_point(fit_pos) and doc.find_object(accent.id).scale < 1.0,
+		"Preserve composition moves and scales fitted objects proportionally")
+	doc.undo()
+	check(doc.snapshot() == before_resize, "undo restores exact canvas dimensions, vectors, and paint bytes")
+	var format := {"version": 3, "settings": {"radius_logarithmic": {"base_value": 2.0, "inputs": {}}}}
+	var simple := MyPaintBrush.convert(format, "plain.myb")
+	format.settings.radius_logarithmic.inputs.tilt_declination = [[0, 0], [1, 2]]
+	format.settings.colorize = {"base_value": 1}
+	format.settings.dabs_per_second = {"base_value": 6}
+	var limited := MyPaintBrush.convert(format, "effects.myb")
+	check(simple.preset.import_source.compatibility == "high" and limited.preset.import_source.compatibility == "limited"
+		and limited.preset.import_source.limits.size() >= 3, "import distinguishes close presets from active unsupported effects")
+	format.settings.eraser = {"base_value": 0, "inputs": {"random": [[0, 0], [1, 1]]}}
+	check(MyPaintBrush.convert(format, "erase.myb").has("error"), "unsupported eraser dynamics cannot silently import as paint")
 
 func tap_window_control(window: Window, control: Control) -> void:
 	var touch := InputEventScreenTouch.new()

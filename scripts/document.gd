@@ -8,12 +8,15 @@ const PaintTiles = preload("res://scripts/paint_tiles.gd")
 const VectorUnion = preload("res://scripts/vector_union.gd")
 const Fonts = preload("res://scripts/font_library.gd")
 const VERSION = 1
+const DISJOINT_COMPOUND_VERSION = 2
 const MAX_PROJECT_BYTES := 64 * 1024 * 1024
 const MAX_IMAGE_PAYLOAD := 40 * 1024 * 1024
 const MAX_OBJECTS = 10000
+const HISTORY_ENTRY_LIMIT := 50
+const HISTORY_ESTIMATED_BYTES := 96 * 1024 * 1024
 const MIN_CANVAS_SIZE := 64
 const MAX_CANVAS_SIZE := 10000
-enum ResizeArtwork { KEEP, FIT, ADAPT }
+enum ResizeArtwork { KEEP, FIT, ADAPT, COMPOSITION }
 var title = "The little green café"
 var width = 900.0
 var height = 1100.0
@@ -32,6 +35,8 @@ var serial = 0
 var dirty = false
 var revision := 0
 var appended_on_commit: Dictionary = {}
+var transformed_on_commit: Array[Dictionary] = []
+var content_on_commit: Dictionary = {}
 
 func uid() -> String:
 	serial += 1
@@ -63,14 +68,49 @@ func checkpoint() -> void:
 	future.clear()
 
 func push_history(entry: Dictionary) -> void:
-	history.append(entry)
-	if history.size() > 50: history.pop_front()
+	append_history_entry(history, entry)
 
-func commit(appended: Dictionary = {}) -> void:
+func append_history_entry(stack: Array, entry: Dictionary) -> void:
+	if not entry.has("_cost"): entry._cost = estimate_history_bytes(entry)
+	stack.append(entry)
+	var total: int = entry._cost
+	for index in range(stack.size() - 2, -1, -1): total += stack[index]._cost
+	# Retain at least one action, even if a full-document operation is large.
+	while stack.size() > 1 and (stack.size() > HISTORY_ENTRY_LIMIT or total > HISTORY_ESTIMATED_BYTES):
+		total -= stack.pop_front()._cost
+
+func estimate_history_bytes(entry: Dictionary) -> int:
+	var bytes := 512
+	if entry.has("layers"):
+		for layer in entry.layers:
+			for object in layer.objects: bytes += estimate_object_bytes(object)
+	elif entry.has("append"):
+		bytes += estimate_object_bytes(entry.append)
+	elif entry.has("transform"):
+		for objects in entry.transform.values(): bytes += 320 * objects.size()
+	elif entry.has("paint"):
+		for tile in entry.before + entry.after: bytes += estimate_object_bytes(tile.tile)
+	elif entry.has("span"):
+		for object in entry.before + entry.after: bytes += estimate_object_bytes(object)
+	return bytes
+
+func estimate_object_bytes(object: Dictionary) -> int:
+	var bytes: int = 768 + 128 * object.get("points", []).size() + 80 * object.get("vertices", []).size()
+	bytes += 80 * object.get("clip", []).size() + 48 * object.get("node_anchors", []).size()
+	for contour in object.get("paint_mask", []): bytes += 80 * contour.size()
+	bytes += String(object.get("image_data", "")).length() * 4 + String(object.get("text", "")).length() * 4
+	return bytes
+
+func commit(appended: Dictionary = {}, transformed: Array[Dictionary] = [], content: Dictionary = {}) -> void:
 	appended_on_commit = appended
+	transformed_on_commit = transformed
+	content_on_commit = content
 	dirty = true
 	revision += 1
 	changed.emit()
+	appended_on_commit = {}
+	transformed_on_commit = []
+	content_on_commit = {}
 
 func append_with_history(object: Dictionary) -> void:
 	if not editable(): return
@@ -101,13 +141,61 @@ func record_paint_result(layer: Dictionary, result: Dictionary) -> Error:
 	for tile in previous: bytes -= tile.image_data.length()
 	for tile in result.objects: bytes += tile.image_data.length()
 	if bytes > MAX_IMAGE_PAYLOAD: return ERR_OUT_OF_MEMORY
-	checkpoint()
+	var old_by_id := {}
+	var next_by_id := {}
+	for tile in previous: old_by_id[tile.id] = tile
 	for tile in result.objects:
 		if not tile.has("id"): tile.id = uid()
+		next_by_id[tile.id] = tile
+	var before := paint_changes(previous, next_by_id)
+	var after := paint_changes(result.objects, old_by_id)
+	push_history({"paint": layer.id, "before": before, "after": after})
+	future.clear()
 	layer.objects = result.objects
 	selection = ""
-	commit()
+	commit({}, [], {"layer": layer.id, "remove": paint_ids(before), "add": paint_objects(after)})
 	return OK
+
+func paint_changes(objects: Array, opposite: Dictionary) -> Array[Dictionary]:
+	var entries: Array[Dictionary] = []
+	for index in objects.size():
+		var tile: Dictionary = objects[index]
+		if not is_same(opposite.get(tile.id), tile):
+			entries.append({"index": index, "tile": tile})
+	return entries
+
+func paint_ids(entries: Array) -> Dictionary:
+	var ids := {}
+	for entry in entries: ids[entry.tile.id] = true
+	return ids
+
+func paint_objects(entries: Array) -> Array:
+	var values := []
+	for entry in entries: values.append(entry.tile)
+	return values
+
+func restore_paint(change: Dictionary, forward: bool) -> void:
+	var index := layer_index(change.paint)
+	if index < 0: return
+	var layer: Dictionary = layers[index]
+	var from: Array = change.before if forward else change.after
+	var to: Array = change.after if forward else change.before
+	var remove_ids := paint_ids(from)
+	var restored := []
+	var insert_at := 0
+	for tile in layer.objects:
+		if remove_ids.has(tile.id): continue
+		while insert_at < to.size() and to[insert_at].index == restored.size():
+			restored.append(to[insert_at].tile)
+			insert_at += 1
+		restored.append(tile)
+	while insert_at < to.size():
+		restored.append(to[insert_at].tile)
+		insert_at += 1
+	layer.objects = restored
+	active = index
+	selection = ""
+	commit({}, [], {"layer": layer.id, "remove": remove_ids, "add": paint_objects(to)})
 
 func append_vector_object(object: Dictionary, ink_gap := VectorUnion.TIP_GAP) -> bool:
 	if not editable(): return false
@@ -135,9 +223,59 @@ func append_vector_object(object: Dictionary, ink_gap := VectorUnion.TIP_GAP) ->
 	commit()
 	return true
 
+func record_transform(items: Array[Dictionary]) -> void:
+	var by_layer := {}
+	var changed_objects: Array[Dictionary] = []
+	for item in items:
+		var object: Dictionary = item.object
+		if Art.v(object.pos) == item.position and object.scale == item.scale: continue
+		if not by_layer.has(item.layer_id): by_layer[item.layer_id] = {}
+		by_layer[item.layer_id][object.id] = [
+			item.original_pos.duplicate(), item.scale, object.pos.duplicate(), object.scale]
+		changed_objects.append(object)
+	if by_layer.is_empty(): return
+	push_history({"transform": by_layer})
+	future.clear()
+	commit({}, changed_objects, {"layers": by_layer.keys()})
+
+func restore_transform(change: Dictionary, forward: bool) -> void:
+	var changed_objects: Array[Dictionary] = []
+	var slot := 2 if forward else 0
+	for layer_id in change.transform:
+		var index := layer_index(layer_id)
+		if index == -1: continue
+		var entries: Dictionary = change.transform[layer_id]
+		var remaining := entries.size()
+		for object in layers[index].objects:
+			var pose: Array = entries.get(object.id, [])
+			if pose.is_empty(): continue
+			object.pos = pose[slot].duplicate()
+			object.scale = pose[slot + 1]
+			changed_objects.append(object)
+			remaining -= 1
+			if remaining == 0: break
+	selection = ""
+	commit({}, changed_objects, {"layers": change.transform.keys()})
+
 func undo() -> void:
 	if history.is_empty(): return
 	var change: Dictionary = history.pop_back()
+	if change.has("transform"):
+		append_history_entry(future, change)
+		restore_transform(change, false)
+		return
+	if change.has("paint"):
+		append_history_entry(future, change)
+		restore_paint(change, false)
+		return
+	if change.has("recolor"):
+		append_history_entry(future, change)
+		restore_recolor(change, false)
+		return
+	if change.has("span"):
+		append_history_entry(future, change)
+		restore_layer_span(change, false)
+		return
 	if change.has("append"):
 		var objects: Array = layers[change.layer].objects
 		for index in range(objects.size() - 1, -1, -1):
@@ -146,20 +284,41 @@ func undo() -> void:
 				break
 		active = change.layer
 		selection = ""
-		future.append(change)
+		append_history_entry(future, change)
+		commit({}, [], {"layer": layers[active].id, "remove": {change.append.id: true}, "add": []})
+		return
 	else:
-		future.append(snapshot())
+		append_history_entry(future, snapshot())
 		restore(change)
 	commit()
 
 func redo() -> void:
 	if future.is_empty(): return
 	var change: Dictionary = future.pop_back()
+	if change.has("transform"):
+		push_history(change)
+		restore_transform(change, true)
+		return
+	if change.has("paint"):
+		push_history(change)
+		restore_paint(change, true)
+		return
+	if change.has("recolor"):
+		push_history(change)
+		restore_recolor(change, true)
+		return
+	if change.has("span"):
+		push_history(change)
+		restore_layer_span(change, true)
+		return
 	if change.has("append"):
 		active = change.layer
-		layers[active].objects.append(change.append.duplicate(true))
+		var appended: Dictionary = change.append.duplicate(true)
+		layers[active].objects.append(appended)
 		selection = ""
 		push_history(change)
+		commit(appended)
+		return
 	else:
 		push_history(snapshot())
 		restore(change)
@@ -238,6 +397,104 @@ func ungroup_selected() -> bool:
 	for item in items: item.object.erase("artwork_group")
 	commit()
 	return true
+
+func union_selection_reason(items: Array[Dictionary]) -> String:
+	if items.size() < 2: return "Select at least two vector objects."
+	var first: Dictionary = items[0]
+	var ink := Color(first.object.color)
+	for item in items:
+		if item.layer.id != first.layer.id: return "Move the objects to the same layer first."
+		if not VectorUnion.can_union(item.object):
+			return "Union supports solid fills and solid ink. Ungroup artwork before using Union."
+		if Color(item.object.color) != ink: return "Give the objects the same color before using Union."
+	var layer: Dictionary = first.layer
+	if layer.get("alpha_locked", false): return "Turn off Alpha Lock before using Union."
+	return ""
+
+func union_selected() -> String:
+	var items := selected_items()
+	var reason := union_selection_reason(items)
+	if not reason.is_empty(): return reason
+	var ids := {}
+	var values: Array[Dictionary] = []
+	for item in items:
+		ids[item.object.id] = true
+		values.append(item.object)
+	var united := VectorUnion.union_objects(values)
+	if united.is_empty(): return "These outlines are too complex or could not form a valid union. Try fewer objects."
+	var layer: Dictionary = items[0].layer
+	var objects: Array = layer.objects
+	var first := -1
+	var last := -1
+	for index in objects.size():
+		if not ids.has(objects[index].id): continue
+		if first == -1: first = index
+		last = index
+	var union_bounds := Art.bounds(united)
+	var next := []
+	for index in range(first, last):
+		var object: Dictionary = objects[index]
+		if ids.has(object.id): continue
+		if Art.coverage_bounds(object).intersects(union_bounds, true):
+			return "Move the selected objects next to each other in the drawing order before using Union."
+		next.append(object)
+	next.append(united)
+	var layer_number := layer_index(layer.id)
+	replace_layer_span(layer_number, first, last - first + 1, next, united.id)
+	return ""
+
+func recolor_shape(index: int, object: Dictionary, ink: String) -> void:
+	var change := {"recolor": layers[index].id, "id": object.id, "color": [object.color, ink],
+		"fill": object.get("fill_enabled")}
+	push_history(change)
+	future.clear()
+	active = index
+	selection = object.id
+	object.color = ink
+	object.fill_enabled = true
+	commit({}, [], {"layer": layers[index].id, "redraw": object})
+
+func restore_recolor(change: Dictionary, forward: bool) -> void:
+	var index := layer_index(change.recolor)
+	if index == -1: return
+	for object in layers[index].objects:
+		if object.id != change.id: continue
+		object.color = change.color[int(forward)]
+		if forward: object.fill_enabled = true
+		elif change.fill == null: object.erase("fill_enabled")
+		else: object.fill_enabled = change.fill
+		active = index
+		selection = ""
+		commit({}, [], {"layer": layers[index].id, "redraw": object})
+		return
+
+func replace_layer_span(index: int, start: int, count: int, values: Array, selected_id: String) -> void:
+	var layer: Dictionary = layers[index]
+	var previous: Array = layer.objects.slice(start, start + count)
+	# Artwork data is copied only for the replaced span. Keep history independent
+	# of subsequent edits to the same objects.
+	var change := {"span": layer.id, "start": start, "before": previous.duplicate(true),
+		"after": values.duplicate(true)}
+	push_history(change)
+	future.clear()
+	swap_layer_span(layer, start, count, values)
+	active = index
+	selection = selected_id
+	commit()
+
+func swap_layer_span(layer: Dictionary, start: int, count: int, values: Array) -> void:
+	var objects: Array = layer.objects
+	layer.objects = objects.slice(0, start) + values + objects.slice(start + count)
+
+func restore_layer_span(change: Dictionary, forward: bool) -> void:
+	var index := layer_index(change.span)
+	if index == -1: return
+	var previous: Array = change.before if forward else change.after
+	var values: Array = change.after if forward else change.before
+	swap_layer_span(layers[index], change.start, previous.size(), values.duplicate(true))
+	active = index
+	selection = ""
+	commit()
 
 func selected_items() -> Array[Dictionary]:
 	var result: Array[Dictionary] = []
@@ -500,15 +757,32 @@ func resize_canvas(dimensions: Vector2i, mode: ResizeArtwork = ResizeArtwork.KEE
 	var new_size := Vector2(dimensions)
 	var factor := minf(new_size.x / old_size.x, new_size.y / old_size.y)
 	var center_offset := (new_size - old_size * factor) * 0.5
+	var paint_bounds := {}
+	if mode == ResizeArtwork.COMPOSITION:
+		var composition := composition_bounds(paint_bounds)
+		if composition.has("error"): return composition.error
+		var content: Rect2 = composition.bounds
+		if not content.has_area(): content = Rect2(Vector2.ZERO, old_size)
+		factor = minf(1.0, minf(new_size.x / content.size.x, new_size.y / content.size.y))
+		var location := Vector2(
+			adapted_axis(content.position.x, content.size.x, old_size.x, new_size.x, factor),
+			adapted_axis(content.position.y, content.size.y, old_size.y, new_size.y, factor))
+		center_offset = location.clamp(Vector2.ZERO, (new_size - content.size * factor).max(Vector2.ZERO)) - content.position * factor
+		if factor == 1.0 and has_pixel_paint():
+			# Align to the paint grid while keeping every vector on the same transform.
+			center_offset = center_offset.round()
 	var layout := adapted_layout_offsets(old_size, new_size, factor) if mode == ResizeArtwork.ADAPT else {}
 	var next_layers: Array = []
 	var image_bytes := 0
 	for layer in layers:
 		var next: Dictionary = layer.duplicate()
 		if layer.get("type", "vector") == "paint":
-			var changed_bounds := PaintTiles.resize_bounds(layer, dimensions)
+			var changed_bounds := PaintTiles.new().transform_artwork(layer, dimensions, paint_bounds[layer.id], factor, center_offset) \
+				if mode == ResizeArtwork.COMPOSITION else PaintTiles.resize_bounds(layer, dimensions)
 			if changed_bounds.has("error"): return changed_bounds.error
 			next.objects = changed_bounds.objects
+			for object in next.objects:
+				if not object.has("id"): object.id = uid()
 		elif mode != ResizeArtwork.KEEP:
 			var scaled := []
 			for object in layer.objects:
@@ -536,6 +810,21 @@ func resize_canvas(dimensions: Vector2i, mode: ResizeArtwork = ResizeArtwork.KEE
 	selection = ""
 	commit()
 	return OK
+
+func composition_bounds(paint_bounds: Dictionary) -> Dictionary:
+	var result := Rect2()
+	for layer in layers:
+		if layer.get("type", "vector") == "paint":
+			var paint := PaintTiles.artwork_bounds(layer)
+			if paint.has("error"): return paint
+			paint_bounds[layer.id] = paint.bounds
+			var area := Rect2(paint.bounds)
+			if area.has_area(): result = result.merge(area) if result.has_area() else area
+			continue
+		for object in layer.objects:
+			var area := Art.coverage_bounds(object)
+			if area.has_area(): result = result.merge(area) if result.has_area() else area
+	return {"bounds": result}
 
 func adapted_layout_offsets(old_size: Vector2, new_size: Vector2, factor: float) -> Dictionary:
 	var bounds_by_unit := {}
@@ -570,8 +859,8 @@ static func adapted_axis(start: float, extent: float, old_length: float, new_len
 	return (start + extent * 0.5) / old_length * new_length - extent * factor * 0.5
 
 func blank(w = 900.0, h = 1100.0, background_visible := true, first_layer := "vector") -> void:
-	width = w
-	height = h
+	width = float(w)
+	height = float(h)
 	title = "Untitled illustration"
 	paper_visible = background_visible
 	layers = [new_layer("Paint" if first_layer == "paint" else "Illustration", first_layer)]
@@ -583,7 +872,12 @@ func blank(w = 900.0, h = 1100.0, background_visible := true, first_layer := "ve
 	changed.emit()
 
 func save_to(path: String) -> Error:
-	var encoded := JSON.stringify(snapshot(false))
+	var save_state := snapshot(false)
+	for layer in layers:
+		if not layer.objects.any(func(object): return object.get("compound_disjoint", false)): continue
+		save_state.version = DISJOINT_COMPOUND_VERSION
+		break
+	var encoded := JSON.stringify(save_state)
 	if encoded.to_utf8_buffer().size() > MAX_PROJECT_BYTES: return ERR_OUT_OF_MEMORY
 	# Android's Storage Access Framework returns opaque content URIs.
 	# They cannot be renamed or have extensions appended. Keep an internal
@@ -632,7 +926,7 @@ func load_from(path: String) -> String:
 	return ""
 
 static func validate(data) -> String:
-	if not data is Dictionary or data.get("format") != "havu" or data.get("version") != VERSION:
+	if not data is Dictionary or data.get("format") != "havu" or (data.get("version") != VERSION and data.get("version") != DISJOINT_COMPOUND_VERSION):
 		return "Unsupported project format."
 	if not data.get("title") is String or data.title.length() > 300: return "Invalid title."
 	for key in ["width", "height"]:
@@ -663,6 +957,8 @@ static func validate(data) -> String:
 			if not object.get("paint_tile", false) is bool: return "Invalid paint tile."
 			if object.has("compound") and (object.kind != "polygon" or not object.compound is bool):
 				return "Invalid compound outline."
+			if object.has("compound_disjoint") and (not object.get("compound", false) or object.compound_disjoint != true):
+				return "Invalid disconnected compound outline."
 			if object.has("artwork_group") and (object.kind == "image" or not valid_group_id(object.artwork_group)):
 				return "Invalid artwork group."
 			if object.has("merge_batch") and (object.kind == "image" or not valid_group_id(object.merge_batch)):

@@ -43,6 +43,8 @@ var marquee_end := Vector2.ZERO
 var lasso_points := PackedVector2Array()
 var selected_area := PackedVector2Array()
 var moving_selection: Array[Dictionary] = []
+var transform_cache: IsolatedOpacity
+var select_across_layers := false
 var selection_move_bounds := Rect2()
 var selection_preview_bounds := Rect2()
 var selection_scale_min := 0.02
@@ -268,7 +270,7 @@ func draw_selection() -> void:
 			for point in selected_area: outline.append(origin + point * zoom)
 			selection_overlay.draw_polyline(Art.close_points(outline), Color("#19674f"), 2, true)
 		return
-	var bounds = Art.bounds(object)
+	var bounds = Art.bounds(object) if moving_selection.is_empty() else selection_preview_bounds
 	var box = Rect2(origin + bounds.position * zoom, bounds.size * zoom)
 	selection_overlay.draw_rect(box.grow(SELECTION_PADDING), Color("#67d6b0"), false, 1.2)
 	if tool != "nodes":
@@ -299,7 +301,7 @@ func items_bounds(items: Array[Dictionary]) -> Rect2:
 	var bounds := Rect2()
 	for item in items:
 		if not layer_is_visible(item.layer): continue
-		var box := Art.coverage_bounds(item.object)
+		var box := pick_bounds(item.object)
 		bounds = bounds.merge(box) if bounds.has_area() else box
 	return bounds
 
@@ -329,12 +331,12 @@ func finish_marquee() -> void:
 	var ids: Array[String] = []
 	for layer_index in document.layers.size():
 		var layer: Dictionary = document.layers[layer_index]
-		if not layer_is_visible(layer) or layer.locked: continue
+		if not selectable_layer(layer_index): continue
 		for object in layer.objects:
 			if object.get("paint_tile", false): continue
-			if AreaSelection.encloses(tool, region, bounds, Art.coverage_bounds(object)):
+			if AreaSelection.encloses(tool, region, bounds, pick_bounds(object)):
 				ids.append(object.id)
-				document.active = layer_index
+				if select_across_layers: document.active = layer_index
 	var blocked: bool = document.select_artwork(ids, solo_layer_id)
 	selected.emit({})
 	if blocked and document.selected_items().is_empty(): status.emit("Show and unlock the group’s layers to select it.")
@@ -363,61 +365,72 @@ func editable_selected_object() -> Dictionary:
 	return {}
 
 func begin_selection_transform(point: Vector2) -> bool:
-	if not document.area_selection.is_empty(): return begin_selection_move(point)
-	var object := editable_selected_object()
-	if object.is_empty(): return false
-	var bounds := Art.bounds(object)
-	if not selection_box_hit(bounds, point): return false
-	edit_started = false
-	original = object.duplicate(true)
-	resizing = selection_resize_hit(bounds, point)
-	moving = not resizing
-	return true
+	return begin_selection_move(point)
+
+func prepare_position_edit(item: Dictionary) -> void:
+	var object: Dictionary = item.object
+	moving_selection.append({"object": object, "layer_id": item.layer.id,
+		"position": Art.v(object.pos), "original_pos": object.pos, "preview_pos": object.pos.duplicate(),
+		"scale": object.scale})
 
 func begin_selection_move(point: Vector2) -> bool:
 	var items: Array[Dictionary] = document.selected_items()
 	if items.is_empty(): return false
-	var bounds := items_bounds(items)
+	if items.size() == 1 and not layer_is_visible(items[0].layer): return false
+	var bounds := Art.bounds(items[0].object) if items.size() == 1 else items_bounds(items)
 	if not selection_box_hit(bounds, point): return false
-	var resize_group := selection_resize_hit(bounds, point)
 	selection_scale_min = 0.0
 	selection_scale_max = 1000.0
 	for item in items:
 		if layer_is_visible(item.layer):
 			var scale := float(item.object.scale)
-			moving_selection.append({"object": item.object, "position": Art.v(item.object.pos), "scale": scale})
+			prepare_position_edit(item)
 			selection_scale_min = maxf(selection_scale_min, minf(1.0, 0.02 / scale))
 			selection_scale_max = minf(selection_scale_max, 1000.0 / scale)
 	selection_move_bounds = bounds
 	selection_preview_bounds = bounds
 	edit_started = false
-	resizing = resize_group
-	moving = not resize_group
+	resizing = selection_resize_hit(bounds, point)
+	moving = not resizing
 	return true
 
 func update_selection_move(point: Vector2) -> void:
 	var offset: Vector2 = point - start
 	if not edit_started:
 		if offset.length() < 1.0 / zoom: return
-		edit_future = document.future.duplicate(true)
-		document.checkpoint()
 		selected_area.clear()
 		edit_started = true
+		if paint_cache and moving_selection.any(func(item): return layer_renderers.get(item.layer_id) == paint_cache):
+			# Keep selected marks live until release. Replaying the whole cached layer
+			# on every pointer sample is more expensive than drawing its retained items.
+			transform_cache = paint_cache
+			transform_cache.show_live_marks()
 	var ratio := 1.0
 	var pivot := selection_move_bounds.position
 	if resizing:
-		var diagonal := selection_move_bounds.size
-		ratio = clampf(1.0 + offset.dot(diagonal) / diagonal.length_squared(), selection_scale_min, selection_scale_max)
+		if moving_selection.size() == 1:
+			pivot = moving_selection[0].position
+			ratio = point.distance_to(pivot) / maxf(1.0, selection_move_bounds.end.distance_to(pivot))
+		else:
+			var diagonal := selection_move_bounds.size
+			ratio = 1.0 + offset.dot(diagonal) / diagonal.length_squared()
+		ratio = clampf(ratio, selection_scale_min, selection_scale_max)
 		offset = Vector2.ZERO
-	selection_preview_bounds = Rect2(pivot + offset, selection_move_bounds.size * ratio)
+	selection_preview_bounds = Rect2(pivot + (selection_move_bounds.position - pivot) * ratio + offset,
+		selection_move_bounds.size * ratio)
 	for item in moving_selection:
 		var position: Vector2 = pivot + (item.position - pivot) * ratio + offset
-		item.object.pos = [position.x, position.y]
-		if resizing: item.object.scale = item.scale * ratio
-		var entry: Dictionary = retained_marks.get(item.object.id, {})
-		if not entry.is_empty(): entry.mark.queue_redraw()
-	if paint_cache: paint_cache.invalidate_cache()
+		item.preview_pos[0] = position.x
+		item.preview_pos[1] = position.y
+		item.object.pos = item.original_pos if position == item.position else item.preview_pos
+		if resizing: item.object.scale = item.scale if ratio == 1.0 else item.scale * ratio
+		update_mark_pose(item.object)
 	refresh_selection()
+
+func refresh_transform_cache() -> void:
+	if not is_instance_valid(transform_cache): return
+	transform_cache.resume_cache()
+	transform_cache = null
 
 func redraw_view() -> void:
 	if artwork_root:
@@ -459,7 +472,44 @@ func set_solo_layer(layer_id: String) -> void:
 func layer_is_visible(layer: Dictionary) -> bool:
 	return layer.visible and (solo_layer_id.is_empty() or layer.id == solo_layer_id)
 
+func update_content_marks(change: Dictionary) -> bool:
+	if change.has("redraw"):
+		var object: Dictionary = change.redraw
+		var entry: Dictionary = retained_marks.get(object.id, {})
+		if not entry.is_empty():
+			entry.appearance = object.duplicate()
+			entry.mark.queue_redraw()
+			if paint_cache and entry.mark.get_parent() == paint_cache.artwork:
+				paint_cache.invalidate_cache()
+		return true
+	var holder: Node2D = layer_renderers.get(change.layer)
+	if not holder or (holder is IsolatedOpacity and holder != paint_cache): return false
+	var parent := holder_artwork(holder)
+	for id in change.remove:
+		if not retained_marks.has(id): continue
+		var mark: Node2D = retained_marks[id].mark
+		if mark.get_parent() != parent: return false
+		remove_mark(mark)
+		retained_marks.erase(id)
+	for object in change.add:
+		retained_marks[object.id] = mount_mark(parent, object)
+	if holder == paint_cache: paint_cache.invalidate_cache()
+	return true
+
 func on_artwork_changed() -> void:
+	if not document.transformed_on_commit.is_empty():
+		var invalidate_surface := false
+		for transformed in document.transformed_on_commit:
+			var mark := update_mark_pose(transformed)
+			invalidate_surface = invalidate_surface or (paint_cache != null and mark != null and mark.get_parent() == paint_cache.artwork)
+		if invalidate_surface: paint_cache.invalidate_cache()
+		pigment_dirty = true
+		refresh_selection()
+		return
+	if not document.content_on_commit.is_empty() and update_content_marks(document.content_on_commit):
+		pigment_dirty = true
+		refresh_selection()
+		return
 	var object: Dictionary = document.appended_on_commit
 	var layer: Dictionary = document.layers[document.active] if not document.layers.is_empty() else {}
 	if not object.is_empty() and paint_cache and layer_renderers.get(layer.get("id")) == paint_cache \
@@ -474,18 +524,47 @@ func on_artwork_changed() -> void:
 			pigment_dirty = not pigment.append_latest(layer, document.active, object)
 		refresh_selection()
 		return
+	if not object.is_empty() and not cache_completed_paint and layer_renderers.has(layer.get("id")) \
+			and not object.has("opacity_groups") and not retained_marks.has(object.id) and not layer.objects.is_empty() \
+			and is_same(layer.objects.back(), object):
+		retained_marks[object.id] = mount_mark(holder_artwork(layer_renderers[layer.id]), object)
+		if not pigment_dirty:
+			pigment_dirty = not pigment.append_latest(layer, document.active, object)
+		refresh_selection()
+		return
 	sync_artwork()
 
 func mount_mark(holder: Node2D, object: Dictionary) -> Dictionary:
 	var mark := Node2D.new()
 	if object.kind == "image": mark.texture_filter = CanvasItem.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
 	Art.use_screen_edges(mark, object)
-	mark.draw.connect(Art.draw_object.bind(mark, object))
+	mark.draw.connect(Art.draw_object.bind(mark, object, Vector2.ZERO, 1.0, true))
+	mark.position = Art.v(object.pos)
+	mark.scale = Vector2.ONE * float(object.scale)
 	holder.add_child(mark)
 	return {"mark": mark, "object": object, "appearance": object.duplicate()}
 
+func update_mark_pose(object: Dictionary) -> Node2D:
+	var entry: Dictionary = retained_marks.get(object.id, {})
+	if entry.is_empty(): return null
+	var mark: Node2D = entry.mark
+	mark.position = Art.v(object.pos)
+	mark.scale = Vector2.ONE * float(object.scale)
+	entry.appearance.pos = object.pos
+	entry.appearance.scale = object.scale
+	entry.erase("bounds")
+	return mark
+
+func pick_bounds(object: Dictionary) -> Rect2:
+	var entry: Dictionary = retained_marks.get(object.id, {})
+	if not entry.is_empty() and is_same(entry.object, object) and entry.appearance.pos == object.pos and entry.appearance.scale == object.scale:
+		if not entry.has("bounds"): entry.bounds = Art.coverage_bounds(object)
+		return entry.bounds
+	return Art.coverage_bounds(object)
+
 func sync_artwork() -> void:
 	if not artwork_root or document == null: return
+	refresh_transform_cache()
 	validate_solo_layer()
 	if preview_root and preview_root.get_parent() != self: preview_root.reparent(self, false)
 	var next_layers := {}
@@ -972,14 +1051,21 @@ func deform_node_span(points: Array, low: float, high: float, delta: Vector2) ->
 		points[index][0] = place.x
 		points[index][1] = place.y
 
+func selectable_layer(index: int) -> bool:
+	var layer: Dictionary = document.layers[index]
+	return (select_across_layers or index == document.active) and layer_is_visible(layer) and not layer.locked
+
 func hit(point: Vector2, include_interior: bool) -> Dictionary:
-	for layer_index in range(document.layers.size() - 1, -1, -1):
-		var layer = document.layers[layer_index]
-		if not layer_is_visible(layer) or layer.locked: continue
+	var tolerance: float = 6.0 / zoom
+	var top: int = document.layers.size() - 1 if select_across_layers and include_interior else document.active
+	var bottom: int = -1 if select_across_layers and include_interior else document.active - 1
+	for layer_index in range(top, bottom, -1):
+		if not selectable_layer(layer_index): continue
+		var layer: Dictionary = document.layers[layer_index]
 		for i in range(layer.objects.size() - 1, -1, -1):
 			var object: Dictionary = layer.objects[i]
-			if object.get("paint_tile", false): continue
-			if Art.contains(object, point, 6 / zoom) or (include_interior and contains_selectable_interior(object, point)):
+			if object.get("paint_tile", false) or not pick_bounds(object).grow(tolerance).has_point(point): continue
+			if Art.contains(object, point, tolerance) or (include_interior and contains_selectable_interior(object, point)):
 				document.active = layer_index
 				return object
 	return {}
@@ -1017,7 +1103,7 @@ func fill_at(point: Vector2) -> void:
 	if not layer_is_visible(layer) or layer.get("opacity", 1.0) <= 0.0: return
 	for index in range(layer.objects.size() - 1, -1, -1):
 		var object: Dictionary = layer.objects[index]
-		if object.opacity <= 0.0: continue
+		if object.opacity <= 0.0 or not pick_bounds(object).grow(2.0 / zoom).has_point(point): continue
 		var outline := PackedVector2Array()
 		if object.kind == "stroke":
 			var local := Art.local_point(object, point)
@@ -1050,18 +1136,17 @@ func apply_vector_fill(layer_index: int, index: int, target: Dictionary) -> void
 	var new_fill := not target.has("id")
 	var changed: bool = new_fill or target.color != hex or not Art.has_fill(target)
 	if changed:
-		document.checkpoint()
-		target.color = hex
-		target.fill_enabled = true
 		if new_fill:
 			target.id = document.uid()
-			layer.objects.insert(index, target)
+			target.color = hex
+			target.fill_enabled = true
+			document.replace_layer_span(layer_index, index, 0, [target], target.id)
+		else:
+			document.recolor_shape(layer_index, target, hex)
+		color_used.emit(color)
 	document.active = layer_index
 	document.selection = target.id
 	selected_area.clear()
-	if changed:
-		document.commit()
-		color_used.emit(color)
 	selected.emit(target)
 	refresh_selection()
 
@@ -1321,7 +1406,9 @@ func begin(screen: Vector2, pressure: float, shortcut: String = "") -> void:
 			start_node_drag(object, point)
 		elif action == "select":
 			edit_started = false
-			original = object.duplicate(true)
+			prepare_position_edit({"object": object, "layer": document.layers[document.active]})
+			selection_move_bounds = Art.bounds(object)
+			selection_preview_bounds = selection_move_bounds
 			moving = true
 		return
 	var layer: Dictionary = document.layers[document.active]
@@ -1480,26 +1567,22 @@ func update_stroke(screen: Vector2, pressure: float) -> void:
 	if not moving_selection.is_empty():
 		update_selection_move(point)
 		return
-	if moving or resizing or node_index >= 0:
+	if node_index >= 0:
 		var object = document.find_object(document.selection)
 		if object.is_empty(): return
 		if not edit_started:
 			if point.distance_to(start) < 1.0 / zoom: return
-			edit_future = document.future.duplicate(true)
+			edit_future = document.future.duplicate()
 			document.checkpoint()
-			if moving or resizing: selected_area.clear()
 			edit_started = true
-		if moving:
-			object.pos = [original.pos[0] + point.x - start.x, original.pos[1] + point.y - start.y]
-		elif resizing:
-			var old_distance = Art.bounds(original).end.distance_to(Art.v(original.pos))
-			object.scale = clampf(float(original.scale) * point.distance_to(Art.v(original.pos)) / maxf(1, old_distance), 0.02, 100)
-		else:
-			deform_node(object, point)
+		deform_node(object, point)
 		var entry: Dictionary = retained_marks.get(object.id, {})
-		if not entry.is_empty(): entry.mark.queue_redraw()
-		if paint_cache: paint_cache.invalidate_cache()
-		if node_index >= 0: pigment.entries.erase(object.id)
+		if not entry.is_empty():
+			entry.erase("bounds")
+			entry.mark.queue_redraw()
+		if paint_cache and not entry.is_empty() and entry.mark.get_parent() == paint_cache.artwork:
+			paint_cache.invalidate_cache()
+		pigment.entries.erase(object.id)
 		refresh_selection()
 		return
 	if not drawing: return
@@ -1555,7 +1638,9 @@ func finish() -> void:
 					else:
 						status.emit("The project has reached its layer limit.")
 	elif edit_started:
-		document.commit()
+		if not moving_selection.is_empty(): document.record_transform(moving_selection)
+		else: document.commit()
+	refresh_transform_cache()
 	edit_started = false
 	end_preview()
 	current = {}
@@ -1574,9 +1659,16 @@ func cancel() -> void:
 	marquee_active = false
 	lasso_points.clear()
 	if edit_started:
-		if not document.history.is_empty(): document.restore(document.history.pop_back())
-		document.future = edit_future
-		document.changed.emit()
+		if not moving_selection.is_empty():
+			for item in moving_selection:
+				item.object.pos = item.original_pos
+				item.object.scale = item.scale
+				update_mark_pose(item.object)
+		else:
+			if not document.history.is_empty(): document.restore(document.history.pop_back())
+			document.future = edit_future
+			document.changed.emit()
+	refresh_transform_cache()
 	edit_started = false
 	end_preview()
 	current = {}

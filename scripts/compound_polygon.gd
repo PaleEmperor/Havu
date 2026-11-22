@@ -1,5 +1,5 @@
 extends RefCounted
-## Encode one connected polygon with holes for Godot's single-loop triangulator.
+## Encode polygon components and holes for Godot's single-loop triangulator.
 ## Each hole is joined by two coincident, opposite edges with zero area.
 
 static func connected_outline(contours: Array[PackedVector2Array]) -> PackedVector2Array:
@@ -53,8 +53,8 @@ static func bridge_edges(points: PackedVector2Array) -> Dictionary:
 		var next := (index + 1) % points.size()
 		var reversed := [points[next], points[index]]
 		if directed.has(reversed):
-			bridges[index] = true
-			bridges[directed[reversed]] = true
+			bridges[index] = directed[reversed]
+			bridges[directed[reversed]] = index
 		directed[[points[index], points[next]]] = index
 	return bridges
 
@@ -86,3 +86,86 @@ static func filled_outlines(contours: Array[PackedVector2Array]) -> Array[Packed
 		var piece := connected_outline(shell)
 		if not piece.is_empty(): pieces.append(piece)
 	return pieces
+
+static func joined_outline(contours: Array[PackedVector2Array]) -> PackedVector2Array:
+	var pieces := filled_outlines(contours)
+	if pieces.is_empty(): return PackedVector2Array()
+	var result := pieces[0].duplicate()
+	for index in range(1, pieces.size()):
+		var piece := pieces[index]
+		# Add a zero-area round trip between contours. The fill and clipping
+		# representations stay compatible with existing Havu projects.
+		if result.size() + piece.size() + 2 > 8192: return PackedVector2Array()
+		var left := 0
+		var right := 0
+		var nearest := INF
+		for i in result.size():
+			for j in piece.size():
+				var distance := result[i].distance_squared_to(piece[j])
+				if distance < nearest:
+					nearest = distance
+					left = i
+					right = j
+		var connected := result.slice(0, left + 1)
+		connected.append_array(piece.slice(right))
+		connected.append_array(piece.slice(0, right + 1))
+		connected.append(result[left])
+		connected.append_array(result.slice(left + 1))
+		result = connected
+	return result
+
+static func signed_area(points: PackedVector2Array) -> float:
+	var result := 0.0
+	var origin := points[0]
+	for index in range(1, points.size() - 1):
+		result += (points[index] - origin).cross(points[index + 1] - origin)
+	return result * 0.5
+
+static func contains(points: PackedVector2Array, point: Vector2) -> bool:
+	var bridges := bridge_edges(points)
+	var inside := false
+	for index in points.size():
+		if bridges.has(index): continue
+		var a := points[index]
+		var b := points[(index + 1) % points.size()]
+		if point.distance_squared_to(Geometry2D.get_closest_point_to_segment(point, a, b)) <= 0.0000000001:
+			return true
+		if (a.y > point.y) == (b.y > point.y): continue
+		if point.x < lerpf(a.x, b.x, (point.y - a.y) / (b.y - a.y)): inside = not inside
+	return inside
+
+static func matches_area(points: PackedVector2Array, contours: Array[PackedVector2Array]) -> bool:
+	var triangles := Geometry2D.triangulate_polygon(points)
+	if triangles.is_empty(): return false
+	var expected_area := 0.0
+	for contour in contours: expected_area += signed_area(contour)
+	var area := 0.0
+	for index in range(0, triangles.size(), 3):
+		var a := points[triangles[index]]
+		var b := points[triangles[index + 1]]
+		var c := points[triangles[index + 2]]
+		area += absf((b - a).cross(c - a)) * 0.5
+	return absf(absf(expected_area) - area) <= maxf(0.001, absf(expected_area) * 0.00001)
+
+static func boundary_loops(points: PackedVector2Array) -> Array[PackedVector2Array]:
+	var bridges := bridge_edges(points)
+	if bridges.is_empty(): return [points]
+	var visited := {}
+	var loops: Array[PackedVector2Array] = []
+	for start in points.size():
+		if visited.has(start) or bridges.has(start): continue
+		var loop := PackedVector2Array()
+		var index := start
+		while not visited.has(index) and not bridges.has(index):
+			visited[index] = true
+			loop.append(points[index])
+			index = (index + 1) % points.size()
+			var skipped := 0
+			while bridges.has(index) and skipped < bridges.size():
+				index = (bridges[index] + 1) % points.size()
+				skipped += 1
+		if index == start and loop.size() >= 3: loops.append(loop)
+	return loops
+
+static func components(points: PackedVector2Array) -> Array[PackedVector2Array]:
+	return filled_outlines(boundary_loops(points))

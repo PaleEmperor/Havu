@@ -61,7 +61,7 @@ func draw_artwork() -> void:
 				var miniature := object.duplicate()
 				miniature.opacity = float(object.opacity) * layer_opacity
 				miniature.erase("clip")
-				if object.has("vertices") and object.vertices.size() > 64:
+				if object.has("vertices") and object.vertices.size() > 64 and not object.get("compound", false):
 					miniature.vertices = []
 					var step := ceili(object.vertices.size() / 64.0)
 					for vertex in range(0, object.vertices.size() - 1, step):

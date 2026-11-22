@@ -74,6 +74,72 @@ static func resize_bounds(layer: Dictionary, page: Vector2i) -> Dictionary:
 		objects.append(resized)
 	return {"objects": objects}
 
+static func artwork_bounds(layer: Dictionary) -> Dictionary:
+	var bounds := Rect2i()
+	for tile in layer.objects:
+		var asset := Raster.get_asset(tile)
+		if asset.is_empty(): return {"error": ERR_INVALID_DATA}
+		var used: Rect2i = asset.image.get_used_rect()
+		if not used.has_area(): continue
+		used.position += Vector2i(Art.v(tile.pos))
+		bounds = bounds.merge(used) if bounds.has_area() else used
+	return {"bounds": bounds}
+
+func transform_artwork(layer: Dictionary, page: Vector2i, source: Rect2i, factor: float, offset: Vector2) -> Dictionary:
+	if not source.has_area(): return {"objects": []}
+	page_size = page
+	if factor == 1.0:
+		# Retile with a pixel-aligned translation, without allocating a full image.
+		var shift := Vector2i(offset.round())
+		for tile in layer.objects:
+			var asset := Raster.get_asset(tile)
+			if asset.is_empty(): return {"error": ERR_INVALID_DATA}
+			blit_transformed_image(asset.image, Vector2i(Art.v(tile.pos)) + shift)
+	else:
+		# Resize a single image per layer so interpolation crosses tile edges.
+		# Refuse a dense allocation beyond the tablet memory budget.
+		var begin := (Vector2(source.position) * factor + offset).round()
+		var end := (Vector2(source.end) * factor + offset).round()
+		var target := Vector2i((end - begin).max(Vector2.ONE))
+		if source.get_area() + target.x * target.y > 8 * 1024 * 1024:
+			return {"error": ERR_OUT_OF_MEMORY}
+		var image := Image.create_empty(source.size.x, source.size.y, false, Image.FORMAT_RGBA8)
+		for tile in layer.objects:
+			var asset := Raster.get_asset(tile)
+			if asset.is_empty(): return {"error": ERR_INVALID_DATA}
+			var pixels: Image = rgba_image(asset.image)
+			var tile_rect := Rect2i(Vector2i(Art.v(tile.pos)), pixels.get_size())
+			var visible := tile_rect.intersection(source)
+			if visible.has_area():
+				image.blit_rect(pixels, Rect2i(visible.position - tile_rect.position, visible.size),
+					visible.position - source.position)
+		image.fix_alpha_edges()
+		image.resize(target.x, target.y, Image.INTERPOLATE_LANCZOS)
+		blit_transformed_image(image, Vector2i(begin))
+	return {"objects": encode_result({"objects": []}).get("objects", [])}
+
+static func rgba_image(source: Image) -> Image:
+	if source.get_format() == Image.FORMAT_RGBA8: return source
+	var copy := source.duplicate()
+	copy.convert(Image.FORMAT_RGBA8)
+	return copy
+
+func blit_transformed_image(source: Image, offset: Vector2i) -> void:
+	var pixels := rgba_image(source)
+	var used := pixels.get_used_rect()
+	used.position += offset
+	used = used.intersection(Rect2i(Vector2i.ZERO, page_size))
+	if not used.has_area(): return
+	var tile_start := tile_origin(used.position)
+	for y in range(tile_start.y, used.end.y, TILE_SIZE):
+		for x in range(tile_start.x, used.end.x, TILE_SIZE):
+			var origin := Vector2i(x, y)
+			var tile_size := (page_size - origin).min(Vector2i.ONE * TILE_SIZE)
+			var region := Rect2i(origin, tile_size).intersection(used)
+			if not changed.has(origin):
+				changed[origin] = Image.create_empty(tile_size.x, tile_size.y, false, Image.FORMAT_RGBA8)
+			changed[origin].blit_rect(pixels, Rect2i(region.position - offset, region.size), region.position - origin)
+
 func fill_region(layer: Dictionary, page: Vector2i, seed: Vector2i, ink: Color) -> Dictionary:
 	prepare_layer(layer, page)
 	if not Rect2i(Vector2i.ZERO, page).has_point(seed) or ink.a <= 0.0: return {}

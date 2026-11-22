@@ -215,17 +215,33 @@ static func contains(object: Dictionary, point: Vector2, tolerance = 0.0) -> boo
 		return false
 	var points := polygon(object)
 	var closed: bool = object.kind != "path"
-	if closed and has_fill(object) and Geometry2D.is_point_in_polygon(local, points): return true
+	if closed and has_fill(object) and shape_point_inside(object, points, local): return true
 	var width := outline_width(object)
 	if width <= 0: return false
 	var arrow := arrow_head(points, width) if not closed and object.get("arrow", false) else PackedVector2Array()
 	if not arrow.is_empty() and Geometry2D.is_point_in_polygon(local, arrow): return true
-	return outline_contains(vector_outline(points, closed, arrow), local, width * 0.5 + tolerance / float(object.scale))
+	return shape_outline_contains(object, points, local, width * 0.5 + tolerance / float(object.scale), arrow)
+
+static func shape_point_inside(object: Dictionary, points: PackedVector2Array, local: Vector2) -> bool:
+	if object.get("compound", false): return Compound.contains(points, local)
+	return Geometry2D.is_point_in_polygon(local, points)
+
+static func shape_outline_contains(object: Dictionary, points: PackedVector2Array, local: Vector2,
+		radius: float, arrow: PackedVector2Array) -> bool:
+	if not object.get("compound", false):
+		return outline_contains(vector_outline(points, object.kind != "path", arrow), local, radius)
+	var bridges := Compound.bridge_edges(points)
+	var radius_squared := radius * radius
+	for index in points.size():
+		if bridges.has(index): continue
+		var near := Geometry2D.get_closest_point_to_segment(local, points[index], points[(index + 1) % points.size()])
+		if local.distance_squared_to(near) <= radius_squared: return true
+	return false
 
 static func shape_interior_contains(object: Dictionary, point: Vector2) -> bool:
 	if object.kind not in SHAPES or object.kind == "path": return false
 	var local := local_point(object, point)
-	return point_inside_clip(object, local) and Geometry2D.is_point_in_polygon(local, polygon(object))
+	return point_inside_clip(object, local) and shape_point_inside(object, polygon(object), local)
 
 static func closed_stroke_outline(object: Dictionary) -> PackedVector2Array:
 	var points: Array = object.points
@@ -272,7 +288,7 @@ static func selection_contours(object: Dictionary) -> Array[PackedVector2Array]:
 		"text", "image":
 			return [AreaSelection.corners(bounds(object))]
 		_:
-			contours.append(polygon(object))
+			contours.assign(shape_fill_components(object, polygon(object)))
 	var selection: Array[PackedVector2Array] = []
 	var mask := prepare_paint_mask(object)
 	var position := v(object.pos)
@@ -335,13 +351,13 @@ static func color_at(object: Dictionary, point: Vector2) -> Color:
 		var points := polygon(object)
 		var closed: bool = object.kind != "path"
 		var result := Color.TRANSPARENT
-		if has_fill(object) and Geometry2D.is_point_in_polygon(local, points):
+		if has_fill(object) and shape_point_inside(object, points, local):
 			result = Color(object.color)
 			result.a *= object.opacity
 		var width := outline_width(object)
 		if width > 0:
 			var arrow := arrow_head(points, width) if not closed and object.get("arrow", false) else PackedVector2Array()
-			if outline_contains(vector_outline(points, closed, arrow), local, width * 0.5) or (
+			if shape_outline_contains(object, points, local, width * 0.5, arrow) or (
 				not arrow.is_empty() and Geometry2D.is_point_in_polygon(local, arrow)):
 				var ink := Color(object.outline_color)
 				ink.a *= object.opacity
@@ -424,8 +440,11 @@ static func vector_paint_mask(layer: Dictionary) -> Array:
 static func opaque_footprints(object: Dictionary) -> Array:
 	if object.kind in SHAPES and has_fill(object):
 		if object.get("vertices", []).size() > 4000: return []
-		var points := polygon(object)
-		return clipped_polygon(object, points) if not Geometry2D.triangulate_polygon(points).is_empty() else []
+		var footprints := []
+		for points in shape_fill_components(object, polygon(object)):
+			if not Geometry2D.triangulate_polygon(points).is_empty():
+				footprints.append_array(clipped_polygon(object, points))
+		return footprints
 	if object.kind != "stroke": return []
 	if uses_ink_outline(object) and object.points.size() <= 4000:
 		var outline := stroke_polygon(object)
@@ -544,8 +563,9 @@ static func close_points(points: PackedVector2Array) -> PackedVector2Array:
 	if not points.is_empty(): closed.append(points[0])
 	return closed
 
-static func draw_object(target: CanvasItem, object: Dictionary, origin = Vector2.ZERO, zoom = 1.0) -> void:
-	target.draw_set_transform(origin + v(object.pos) * zoom, 0, Vector2.ONE * zoom * float(object.scale))
+static func draw_object(target: CanvasItem, object: Dictionary, origin = Vector2.ZERO, zoom = 1.0, local_geometry := false) -> void:
+	if not local_geometry:
+		target.draw_set_transform(origin + v(object.pos) * zoom, 0, Vector2.ONE * zoom * float(object.scale))
 	var color = Color(object.color)
 	color.a *= object.opacity
 	match object.kind:
@@ -568,12 +588,17 @@ static func draw_object(target: CanvasItem, object: Dictionary, origin = Vector2
 		_:
 			draw_shape(target, object)
 
+static func shape_fill_components(object: Dictionary, points: PackedVector2Array) -> Array[PackedVector2Array]:
+	if object.get("compound_disjoint", false): return Compound.components(points)
+	return [points]
+
 static func draw_shape(target: CanvasItem, object: Dictionary) -> void:
 	var points := polygon(object)
 	if has_fill(object):
 		var fill := Color(object.color)
 		fill.a *= object.opacity
-		paint_polygon(target, object, points, fill)
+		for piece in shape_fill_components(object, points):
+			paint_polygon(target, object, piece, fill)
 	var width := outline_width(object)
 	if width <= 0 or points.size() < 2: return
 	var closed: bool = object.kind != "path"
@@ -581,7 +606,11 @@ static func draw_shape(target: CanvasItem, object: Dictionary) -> void:
 	var ink := Color(object.outline_color)
 	ink.a *= object.opacity
 	var arrow := arrow_head(points, width) if not closed and object.get("arrow", false) else PackedVector2Array()
-	target.draw_polyline(vector_outline(points, closed, arrow), ink, width, true)
+	if object.get("compound", false):
+		for contour in Compound.boundary_loops(points):
+			target.draw_polyline(close_points(contour), ink, width, true)
+	else:
+		target.draw_polyline(vector_outline(points, closed, arrow), ink, width, true)
 	if not arrow.is_empty(): paint_polygon(target, object, arrow, ink)
 
 static func stroke_batch_size(object: Dictionary) -> int:
@@ -973,7 +1002,7 @@ static func svg(document, embed_fonts = true) -> String:
 
 static func svg_shape(object: Dictionary) -> String:
 	var points := polygon(object)
-	if not object.has("fill_enabled") and not object.has("outline_width") and not object.has("corner_radius"):
+	if not object.get("compound_disjoint", false) and not object.has("fill_enabled") and not object.has("outline_width") and not object.has("corner_radius"):
 		return svg_polygon(points, Color(object.color), object.opacity)
 	var fill := Color(object.color)
 	var fill_value := 'fill="#%s" fill-opacity="%s"' % [fill.to_html(false), fill.a * object.opacity] if has_fill(object) else 'fill="none"'
@@ -984,6 +1013,11 @@ static func svg_shape(object: Dictionary) -> String:
 		stroke_value = ' stroke="#%s" stroke-opacity="%s" stroke-width="%s" stroke-linejoin="round"' % [
 			ink.to_html(false), ink.a * object.opacity, width]
 	var paint := fill_value + stroke_value
+	if object.get("compound_disjoint", false) or (object.get("compound", false) and width > 0):
+		var contours := PackedStringArray()
+		for contour in Compound.boundary_loops(points):
+			contours.append("M" + points_string(contour) + "Z")
+		return '<path d="%s" fill-rule="evenodd" %s/>' % [" ".join(contours), paint]
 	match object.kind:
 		"rect":
 			return '<rect width="%s" height="%s" rx="%s" %s/>' % [object.extent[0], object.extent[1], object.get("corner_radius", 0), paint]
