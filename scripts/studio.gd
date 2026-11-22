@@ -78,6 +78,9 @@ var selection_menu: PopupPanel
 var shape_icons: Array[Button] = []
 var selection_icons: Array[Button] = []
 var select_across_toggle: CheckButton
+var selection_move_button: Button
+var selection_move_dialog: ConfirmationDialog
+var selection_move_targets: OptionButton
 var deselect_button: Button
 var shape_style_dialog: ConfirmationDialog
 var shape_fill_switch: CheckBox
@@ -2245,14 +2248,73 @@ func build_selection_menu() -> void:
 	select_across_toggle.custom_minimum_size.y = 44
 	select_across_toggle.toggled.connect(func(enabled):
 		canvas.select_across_layers = enabled
-		canvas.clear_selection())
+		canvas.clear_selection()
+		update_selection_move_button())
 	content.add_child(select_across_toggle)
+	selection_move_button = button("Move to layer…", func():
+		selection_menu.hide()
+		show_selection_move.call_deferred(), "Move selected artwork to another layer")
+	selection_move_button.custom_minimum_size.y = 44
+	content.add_child(selection_move_button)
+	build_selection_move_dialog()
 	PopupTouch.watch_launcher(tool_buttons.select)
 
 func show_selection_menu() -> void:
 	tool_buttons.select.set_pressed_no_signal(canvas.tool == "select" or canvas.tool in Canvas.AREA_TOOLS)
 	select_across_toggle.set_pressed_no_signal(canvas.select_across_layers)
+	update_selection_move_button()
 	show_tool_picker(selection_menu, tool_buttons.select, selection_icons)
+
+func update_selection_move_button() -> void:
+	selection_move_button.visible = not document.layer_transfer_items(canvas.solo_layer_id).is_empty()
+
+func build_selection_move_dialog() -> void:
+	selection_move_dialog = ConfirmationDialog.new()
+	selection_move_dialog.name = "MoveSelectionToLayer"
+	selection_move_dialog.title = "Move selection to layer"
+	selection_move_dialog.ok_button_text = "Move"
+	selection_move_dialog.dialog_hide_on_ok = false
+	var content := margin(selection_move_dialog, 14)
+	content.custom_minimum_size.x = 294
+	selection_move_targets = OptionButton.new()
+	selection_move_targets.accessibility_name = "Destination layer"
+	selection_move_targets.custom_minimum_size.y = 44
+	selection_move_targets.fit_to_longest_item = false
+	selection_move_targets.clip_text = true
+	content.add_child(selection_move_targets)
+	selection_move_dialog.confirmed.connect(move_selection_to_chosen_layer)
+	add_child(selection_move_dialog)
+
+func show_selection_move() -> void:
+	canvas.finish()
+	var items: Array[Dictionary] = document.layer_transfer_items(canvas.solo_layer_id)
+	if items.is_empty(): return
+	selection_move_targets.clear()
+	for index in range(document.layers.size() - 1, -1, -1):
+		var layer: Dictionary = document.layers[index]
+		if not document.can_receive_selection(layer, items): continue
+		selection_move_targets.add_item(layer.name)
+		selection_move_targets.set_item_metadata(selection_move_targets.item_count - 1, layer.id)
+	if document.can_create_selection_layer(items):
+		selection_move_targets.add_item("New vector layer")
+		selection_move_targets.set_item_metadata(selection_move_targets.item_count - 1, "")
+	if selection_move_targets.item_count == 0:
+		notify("No compatible destination layer.")
+		return
+	selection_move_targets.select(0)
+	selection_move_dialog.popup_centered(Vector2i.ONE)
+
+func move_selection_to_chosen_layer() -> void:
+	var index := selection_move_targets.selected
+	if index < 0: return
+	var destination: String = selection_move_targets.get_item_metadata(index)
+	if not document.move_selection_to_layer(destination, canvas.solo_layer_id):
+		notify("Choose a visible, unlocked layer with Alpha Lock off.")
+		return
+	canvas.selected_area.clear()
+	canvas.refresh_selection()
+	selection_move_dialog.hide()
+	notify("Selection moved to %s." % document.layers[document.active].name)
 
 func build_shape_menu() -> void:
 	shape_menu = PopupPanel.new()

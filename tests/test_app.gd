@@ -31,6 +31,7 @@ func run() -> void:
 		await process_frame
 		await overhaul_regressions(app)
 		await transform_regressions(app)
+		await layer_transfer_regressions(app)
 		app.autosave_timer.stop()
 		app.queue_free()
 		await process_frame
@@ -3333,6 +3334,7 @@ func run() -> void:
 
 	await overhaul_regressions(app)
 	await transform_regressions(app)
+	await layer_transfer_regressions(app)
 
 	print("RESULT: %d checks, %d failures" % [checks, failures])
 	app.autosave_timer.stop()
@@ -3611,6 +3613,89 @@ func transform_regressions(app) -> void:
 	canvas.finish()
 	canvas.snap_to_canvas = false
 	check(not is_finite(canvas.drag_guides.x), "release clears the temporary alignment guide")
+
+func layer_transfer_regressions(app) -> void:
+	var doc: Document = app.document
+	var canvas: Canvas = app.canvas
+	doc.blank(400, 400, false)
+	canvas.set_solo_layer("")
+	app.set_tool("select")
+	var first := test_rect(doc, 40, 40, 60, 60)
+	var stayed := test_rect(doc, 280, 80, 30, 30)
+	doc.layers[0].opacity = 0.5
+	var source_id: String = doc.layers[0].id
+	doc.layers.append(doc.new_layer("Source 2"))
+	doc.active = 1
+	var second := test_rect(doc, 145, 45, 70, 50)
+	doc.layers[1].opacity = 0.8
+	for name_text in ["Hidden", "Locked", "Alpha Lock", "Paint", "Receiver"]:
+		doc.layers.append(doc.new_layer(name_text, "paint" if name_text == "Paint" else "vector"))
+	doc.layers[2].visible = false
+	doc.layers[3].locked = true
+	doc.layers[4].alpha_locked = true
+	var target: Dictionary = doc.layers.back()
+	doc.active = doc.layers.size() - 1
+	var underneath := test_rect(doc, 40, 40, 60, 60, "#ffaa00")
+	# Canvas shapes use floats and the JSON parser restores numeric arrays as floats.
+	for fixture in [first, second, stayed, underneath]:
+		fixture.pos = [float(fixture.pos[0]), float(fixture.pos[1])]
+		fixture.extent = [float(fixture.extent[0]), float(fixture.extent[1])]
+	doc.active = 0
+	var ids: Array[String] = [first.id, second.id]
+	doc.select_objects(ids)
+	doc.group_selected()
+	doc.commit()
+	var group: String = first.artwork_group
+	var original := doc.snapshot()
+	doc.selection = first.id
+	check(not doc.move_selection_to_layer(target.id), "moving part of an artwork group cannot strand its other members")
+	doc.select_objects(ids)
+	check(not doc.move_selection_to_layer(doc.layers[5].id) and not doc.move_selection_to_layer(doc.layers[4].id)
+		and doc.snapshot() == original, "paint and alpha-locked destinations leave the project untouched")
+	app.show_selection_menu()
+	await process_frame
+	check(app.selection_move_button.visible, "selected artwork exposes Move to layer in the selection picker")
+	tap_window_control(app.selection_menu, app.selection_move_button)
+	await process_frame
+	await process_frame
+	var choices: OptionButton = app.selection_move_targets
+	check(app.selection_move_dialog.visible and choices.item_count == 4 and choices.get_item_metadata(0) == target.id
+		and choices.get_item_text(3) == "New vector layer", "the layer picker lists only compatible targets and a new vector layer")
+	tap_window_control(app.selection_move_dialog, app.selection_move_dialog.get_ok_button())
+	check(doc.layers[doc.active].id == target.id and target.objects == [underneath, first, second]
+		and doc.layers[0].objects == [stayed] and doc.layers[1].objects.is_empty()
+		and first.artwork_group == group and second.artwork_group == group and doc.area_selection == ids,
+		"moving to an existing layer keeps order, group, positions and the selection")
+	check(canvas.hit(Vector2(60, 60), true).get("id") == first.id, "the moved artwork is selectable on its new layer immediately")
+	var moved := doc.snapshot()
+	doc.undo()
+	check(doc.snapshot() == original and doc.layers[0].id == source_id, "undo restores the original layer ownership")
+	doc.redo()
+	check(doc.snapshot() == moved, "redo restores the complete layer transfer")
+	doc.undo()
+
+	# Use the new-layer option on two disjoint translucent selections.
+	doc.layers.back().objects.clear()
+	doc.select_objects(ids)
+	var first_ink := Art.sample(doc, Vector2(55, 55))
+	var second_ink := Art.sample(doc, Vector2(155, 55))
+	app.show_selection_move()
+	await process_frame
+	choices.select(choices.item_count - 1)
+	tap_window_control(app.selection_move_dialog, app.selection_move_dialog.get_ok_button())
+	var created: Dictionary = doc.layers[doc.active]
+	check(created.name == "Selection" and created.get("type") == "vector" and doc.active == 2
+		and created.objects.map(func(object): return object.id) == ids,
+		"moving to a new layer inserts one editable layer above the selected sources")
+	check(Art.sample(doc, Vector2(55, 55)).is_equal_approx(first_ink)
+		and Art.sample(doc, Vector2(155, 55)).is_equal_approx(second_ink),
+		"a new layer retains the opacity of artwork moved from different layers")
+	var saved := Document.new()
+	check(doc.save_to("user://layer-transfer.havu") == OK and saved.load_from("user://layer-transfer.havu").is_empty()
+		and saved.snapshot() == doc.snapshot(), "transferred artwork, groups and compositing survive saving and reopening")
+	doc.undo()
+	check(doc.layer_index(created.id) == -1 and doc.layers[0].objects[0].id == ids[0],
+		"one undo removes the newly created layer and returns its objects")
 
 func tap_window_control(window: Window, control: Control) -> void:
 	var touch := InputEventScreenTouch.new()

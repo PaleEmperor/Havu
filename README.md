@@ -37,6 +37,8 @@ I’d love for you to use it, share it, or make it your own.
   Selection starts on the active layer. Turn on **Select across visible layers**
   from the Select menu for artwork spread across layers. Use **Union** to join
   matching solid fills or solid ink on one layer, including separated shapes.
+  Use **Select → Move to layer…** to send selected artwork to a compatible layer
+  or create a new vector layer for it.
 - **Transform and arrange.** Drag the round selection handle to rotate. Open
   **Transform** for flips, quarter turns, and snapping to the canvas or 15°
   angles. **Align & arrange** aligns objects, spaces them evenly, and changes

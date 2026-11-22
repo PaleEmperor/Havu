@@ -870,6 +870,88 @@ func delete_selected() -> void:
 	selection = ""
 	commit()
 
+func layer_transfer_items(solo_layer_id := "") -> Array[Dictionary]:
+	var items := selected_items()
+	var expected := area_selection.size() if selection.is_empty() else 1
+	if items.size() != expected: return []
+	var groups := {}
+	var selected_ids := {}
+	for item in items:
+		var object: Dictionary = item.object
+		if object.get("paint_tile", false) or (not solo_layer_id.is_empty() and item.layer.id != solo_layer_id):
+			return []
+		selected_ids[object.id] = true
+		if object.has("artwork_group"): groups[object.artwork_group] = true
+	if not groups.is_empty():
+		for layer in layers:
+			for object in layer.objects:
+				if groups.has(object.get("artwork_group")) and not selected_ids.has(object.id): return []
+	return items
+
+func can_receive_selection(layer: Dictionary, items: Array[Dictionary]) -> bool:
+	if not layer.visible or layer.locked or layer.get("alpha_locked", false): return false
+	if layer.get("type", "vector") not in ["vector", "composite"]: return false
+	return items.any(func(item): return item.layer.id != layer.id)
+
+func can_create_selection_layer(items: Array[Dictionary]) -> bool:
+	if items.is_empty() or layers.size() >= 100: return false
+	if items[0].layer.id == items[-1].layer.id: return true
+	for item in items:
+		if item.layer.get("opacity", 1.0) < 1.0 and item.object.get("opacity_groups", []).size() >= 32:
+			return false
+	return true
+
+func move_selection_to_layer(destination_id := "", solo_layer_id := "") -> bool:
+	var items := layer_transfer_items(solo_layer_id)
+	if items.is_empty(): return false
+	var destination_index := layer_index(destination_id)
+	var new_target := destination_id.is_empty()
+	var spans_layers: bool = items[0].layer.id != items[-1].layer.id
+	var target: Dictionary
+	if new_target:
+		if not can_create_selection_layer(items): return false
+		destination_index = layer_index(items[-1].layer.id) + 1
+		target = new_layer("Selection")
+		if not spans_layers:
+			target.opacity = items[0].layer.get("opacity", 1.0)
+	else:
+		if destination_index < 0 or not can_receive_selection(layers[destination_index], items): return false
+		target = layers[destination_index]
+
+	checkpoint()
+	if new_target: layers.insert(destination_index, target)
+	var removed := {}
+	var opacity_scopes := {}
+	var scope_ids := {}
+	var moved_ids: Array[String] = []
+	for item in items:
+		var object: Dictionary = item.object
+		var source: Dictionary = item.layer
+		moved_ids.append(object.id)
+		if source.id == target.id: continue
+		if not removed.has(source.id): removed[source.id] = {}
+		removed[source.id][object.id] = true
+		object.erase("merge_batch")
+		var scopes: Array = []
+		if new_target and spans_layers and source.get("opacity", 1.0) < 1.0:
+			if not opacity_scopes.has(source.id):
+				opacity_scopes[source.id] = {"id": uid(), "opacity": source.opacity}
+			scopes.append(opacity_scopes[source.id])
+		for scope in object.get("opacity_groups", []):
+			var key: String = source.id + ":" + scope.id
+			if not scope_ids.has(key): scope_ids[key] = uid()
+			scopes.append({"id": scope_ids[key], "opacity": scope.opacity})
+		if not scopes.is_empty(): object.opacity_groups = scopes
+		target.objects.append(object)
+	for source_id in removed:
+		var source: Dictionary = layers[layer_index(source_id)]
+		var ids: Dictionary = removed[source_id]
+		source.objects = source.objects.filter(func(object): return not ids.has(object.id))
+	active = destination_index
+	select_objects(moved_ids)
+	commit()
+	return true
+
 func duplicate_selected() -> void:
 	var items := selected_items()
 	if items.is_empty(): return
