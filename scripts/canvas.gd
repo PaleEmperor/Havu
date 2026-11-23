@@ -14,7 +14,17 @@ const ROTATION_HANDLE_GAP := 26.0
 const ROTATION_HANDLE_RADIUS := 14.0
 const SNAP_DISTANCE := 8.0
 const PAINT_CACHE_THRESHOLD := 1200
+const MAX_PAINT_CACHES := 4
+const CACHE_NAVIGATION_SETTLE := 0.12
+const PICK_GRID_THRESHOLD := 160
+const PICK_CELL_SIZE := 96.0
+const MAX_PICK_CELLS := 64
+const WET_MESH_SAMPLE_BUDGET := 26000
+const MAX_WET_MESH_SAMPLES := 2048
+const STROKE_REDO_MESH_LIMIT := 6
+const STROKE_REDO_SAMPLE_LIMIT := 900
 const WET_PIGMENT_SPACING := 0.26
+const INK_SAMPLES_PER_MOTION := 16
 const ANDROID_POINTER_IDLE := 0.18
 const DEFAULT_STROKE_NODE_SPREAD := 0.25
 const SHAPE_TOOLS := {
@@ -24,6 +34,7 @@ const SHAPE_TOOLS := {
 signal path_changed
 signal node_mode_changed
 signal status(message)
+signal fill_requested(point: Vector2)
 signal selected(object)
 signal color_used(value: Color)
 signal view_changed
@@ -46,8 +57,11 @@ var marquee_end := Vector2.ZERO
 var lasso_points := PackedVector2Array()
 var selected_area := PackedVector2Array()
 var moving_selection: Array[Dictionary] = []
-var transform_cache: IsolatedOpacity
+var transform_caches: Array[IsolatedOpacity] = []
+var navigation_caches: Array[IsolatedOpacity] = []
+var cache_navigation_timer: Timer
 var select_across_layers := false
+var keep_selecting := false
 var selection_move_bounds := Rect2()
 var selection_rotating := false
 var selection_rotation_delta := 0.0
@@ -113,17 +127,25 @@ var edit_started = false
 var edit_future: Array = []
 var artwork_root: Node2D
 var preview_root: Node2D
+var preview_surface: IsolatedOpacity
 var selection_overlay: Node2D
 var retained_marks: Dictionary = {}
 var layer_renderers: Dictionary = {}
+var pick_grids := {}
 var solo_layer_id := ""
 var merge_renderers: Dictionary = {}
 var cache_completed_paint := OS.has_feature("android")
+var cache_extra_layers := OS.has_feature("android")
+var cache_recent_strokes := OS.has_feature("android")
 var paint_cache: IsolatedOpacity
+var layer_cache_costs := {}
+var wet_mesh_samples := 0
+var stroke_redo_meshes := {}
 var overview_cache := false
 var opacity_preview_layer := ""
 var opacity_preview_value := 1.0
 static var checker_texture: ImageTexture
+static var grid_texture: ImageTexture
 var live_batch: Node2D
 var live_first := 0
 var pigment := PigmentIndex.new()
@@ -147,6 +169,11 @@ func _ready() -> void:
 	resized.connect(resize_view)
 	artwork_root = Node2D.new()
 	add_child(artwork_root)
+	if not exporting and cache_extra_layers:
+		cache_navigation_timer = Timer.new()
+		cache_navigation_timer.one_shot = true
+		cache_navigation_timer.timeout.connect(finish_cache_navigation)
+		add_child(cache_navigation_timer)
 	if not exporting and OS.has_feature("android"):
 		android_pointer_idle = Timer.new()
 		android_pointer_idle.one_shot = true
@@ -193,6 +220,7 @@ func zoom_at(factor: float, screen: Vector2) -> void:
 	var anchor = to_document(screen)
 	zoom = clampf(zoom * factor, 0.05 / ui_scale, 12.0 / ui_scale)
 	origin = screen - anchor * zoom
+	defer_navigation_cache_rebuilds()
 	redraw_view()
 	view_changed.emit()
 
@@ -213,6 +241,7 @@ func pan_by(delta: Vector2) -> void:
 	if delta.is_zero_approx(): return
 	view_fitted = false
 	origin += delta
+	defer_navigation_cache_rebuilds()
 	redraw_view()
 
 func to_document(point: Vector2) -> Vector2:
@@ -221,10 +250,12 @@ func to_document(point: Vector2) -> Vector2:
 func _draw() -> void:
 	if document == null: return
 	if not exporting:
-		draw_rect(Rect2(Vector2.ZERO, size), Color("#111111"))
-		# Subtle drafting grid, kept outside the exported page.
-		for x in range(18, int(size.x), 28):
-			for y in range(18, int(size.y), 28): draw_circle(Vector2(x, y), 0.6, Color("#252525"))
+		if grid_texture == null:
+			var tile := Image.create_empty(28, 28, false, Image.FORMAT_RGB8)
+			tile.fill(Color("#111111"))
+			tile.set_pixel(18, 18, Color("#252525"))
+			grid_texture = ImageTexture.create_from_image(tile)
+		draw_texture_rect(grid_texture, Rect2(Vector2.ZERO, size), true)
 		draw_rect(Rect2(origin + Vector2(6, 9), Vector2(document.width, document.height) * zoom), Color(0, 0, 0, 0.24))
 	var page := Rect2(origin, Vector2(document.width, document.height) * zoom)
 	if document.paper_visible:
@@ -286,8 +317,9 @@ func draw_selection() -> void:
 	var box = Rect2(origin + bounds.position * zoom, bounds.size * zoom)
 	selection_overlay.draw_rect(box.grow(SELECTION_PADDING), Color("#67d6b0"), false, 1.2)
 	if tool != "nodes":
-		selection_overlay.draw_rect(Rect2(box.end - Vector2(5, 5), Vector2(10, 10)), Color("#a1f2d4"))
-		draw_rotation_handle(bounds)
+		if not keep_selecting:
+			selection_overlay.draw_rect(Rect2(box.end - Vector2(5, 5), Vector2(10, 10)), Color("#a1f2d4"))
+			draw_rotation_handle(bounds)
 	elif object.kind in ["stroke", "polygon", "path"]:
 		var points: Array = node_points(object)
 		var added: Array = object.get("node_anchors", [])
@@ -308,9 +340,10 @@ func draw_multi_selection_bounds(bounds: Rect2) -> void:
 	selection_overlay.draw_polyline(border, Color("#a4f0d2"), 1.4, true)
 	for corner in AreaSelection.corners(box):
 		selection_overlay.draw_circle(corner, 3, Color("#a4f0d2"), true, -1, true)
-	var handle: Vector2 = origin + bounds.end * zoom
-	selection_overlay.draw_rect(Rect2(handle - Vector2(5, 5), Vector2(10, 10)), Color("#a1f2d4"))
-	draw_rotation_handle(bounds)
+	if not keep_selecting:
+		var handle: Vector2 = origin + bounds.end * zoom
+		selection_overlay.draw_rect(Rect2(handle - Vector2(5, 5), Vector2(10, 10)), Color("#a1f2d4"))
+		draw_rotation_handle(bounds)
 
 func rotation_handle(bounds: Rect2) -> Vector2:
 	var handle := Vector2(bounds.get_center().x, bounds.position.y - ROTATION_HANDLE_GAP / zoom)
@@ -382,30 +415,61 @@ func finish_marquee() -> void:
 	var region := AreaSelection.outline(tool, start, marquee_end, lasso_points)
 	lasso_points = PackedVector2Array()
 	if region.size() < 3:
-		clear_selection()
+		if not keep_selecting: clear_selection()
+		refresh_selection()
 		return
 	var bounds := Art.polygon_bounds(region)
 	if bounds.size.x * zoom < 4 or bounds.size.y * zoom < 4:
-		clear_selection()
+		if not keep_selecting: clear_selection()
+		refresh_selection()
 		return
 	if tool == "select_lasso" and Geometry2D.triangulate_polygon(region).is_empty():
 		status.emit("Draw a single loop to make a freehand selection.")
 		return
 	selected_area = region
 	var ids: Array[String] = []
+	var previously_selected := {}
+	if keep_selecting:
+		for item in transformable_items():
+			ids.append(item.object.id)
+			previously_selected[item.object.id] = true
 	for layer_index in document.layers.size():
 		var layer: Dictionary = document.layers[layer_index]
 		if not selectable_layer(layer_index): continue
 		for object in layer.objects:
 			if object.get("paint_tile", false): continue
 			if AreaSelection.encloses(tool, region, bounds, pick_bounds(object)):
-				ids.append(object.id)
+				if not previously_selected.has(object.id): ids.append(object.id)
 				if select_across_layers: document.active = layer_index
 	var blocked: bool = document.select_artwork(ids, solo_layer_id)
+	var count: int = document.area_selection.size() + (0 if document.selection.is_empty() else 1)
+	if keep_selecting and count > 0: selected_area.clear()
 	selected.emit({})
-	if blocked and document.selected_items().is_empty(): status.emit("Show and unlock the group’s layers to select it.")
+	if blocked and count == 0: status.emit("Show and unlock the group’s layers to select it.")
 	elif ids.is_empty(): status.emit("Area selected. Use Paint inside selection to keep brush marks inside it.")
-	else: status.emit("%d selected · Drag the box to move or the corner to resize." % document.selected_items().size())
+	else:
+		status.emit("%d selected · Draw another area to add more." % count if keep_selecting
+			else "%d selected · Drag the box to move or the corner to resize." % count)
+	refresh_selection()
+
+func toggle_object_pick(point: Vector2) -> void:
+	var target := hit(point, true)
+	if target.is_empty(): return
+	var ids: Array[String] = []
+	var picked := false
+	var group: String = target.get("artwork_group", "")
+	for item in transformable_items():
+		var object: Dictionary = item.object
+		if object.id == target.id or (not group.is_empty() and object.get("artwork_group", "") == group):
+			picked = true
+		else:
+			ids.append(object.id)
+	if not picked: ids.append(target.id)
+	var blocked: bool = document.select_artwork(ids, solo_layer_id)
+	selected_area.clear()
+	selected.emit({})
+	if blocked: status.emit("Show and unlock the group’s layers to select it.")
+	else: status.emit("Tap objects or groups to add or remove them. Turn off Keep selecting to move them.")
 	refresh_selection()
 
 func clear_selection() -> void:
@@ -491,11 +555,11 @@ func update_selection_move(point: Vector2) -> void:
 		if offset.length() < 1.0 / zoom: return
 		selected_area.clear()
 		edit_started = true
-		if paint_cache and moving_selection.any(func(item): return layer_renderers.get(item.layer_id) == paint_cache):
-			# Keep selected marks live until release. Replaying the whole cached layer
-			# on every pointer sample is more expensive than drawing its retained items.
-			transform_cache = paint_cache
-			transform_cache.show_live_marks()
+		for item in moving_selection:
+			var holder: Node2D = layer_renderers.get(item.layer_id)
+			if is_artwork_cache(holder) and holder not in transform_caches:
+				transform_caches.append(holder)
+				holder.show_live_marks()
 	if selection_rotating:
 		var center := selection_move_bounds.get_center()
 		var delta := (start - center).angle_to(point - center)
@@ -531,9 +595,27 @@ func update_selection_move(point: Vector2) -> void:
 	refresh_selection()
 
 func refresh_transform_cache() -> void:
-	if not is_instance_valid(transform_cache): return
-	transform_cache.resume_cache()
-	transform_cache = null
+	for holder in transform_caches:
+		if is_instance_valid(holder): holder.resume_cache()
+	transform_caches.clear()
+
+func defer_navigation_cache_rebuilds() -> void:
+	if not cache_navigation_timer or drawing: return
+	var density := maxf(0.01, get_screen_transform().get_scale().x)
+	for holder in layer_renderers.values():
+		if not is_artwork_cache(holder) or not holder.visible: continue
+		if holder.uses_document_cache(zoom, density): continue
+		if holder == paint_cache and holder.opacity >= 1.0: continue
+		if holder in navigation_caches or holder in transform_caches: continue
+		holder.show_live_marks()
+		navigation_caches.append(holder)
+	if not navigation_caches.is_empty(): cache_navigation_timer.start(CACHE_NAVIGATION_SETTLE)
+
+func finish_cache_navigation() -> void:
+	if cache_navigation_timer: cache_navigation_timer.stop()
+	for holder in navigation_caches:
+		if is_instance_valid(holder): holder.resume_cache()
+	navigation_caches.clear()
 
 func redraw_view() -> void:
 	if artwork_root:
@@ -549,13 +631,10 @@ func redraw_view() -> void:
 		if preview_root and preview_root.get_parent() == self:
 			preview_root.position = origin
 			preview_root.scale = Vector2.ONE * zoom
-		if paint_cache or not merge_renderers.is_empty():
-			if paint_cache: paint_cache.update_view(size, origin, zoom, density)
-			if not merge_renderers.is_empty():
-				for holder in layer_renderers.values():
-					if holder is IsolatedOpacity and holder != paint_cache: holder.update_view(size, origin, zoom, density)
-				for holder in merge_renderers.values():
-					if holder is IsolatedOpacity: holder.update_view(size, origin, zoom, density)
+		for holder in layer_renderers.values():
+			if holder is IsolatedOpacity and holder.visible: holder.update_view(size, origin, zoom, density)
+		for holder in merge_renderers.values():
+			if holder is IsolatedOpacity: holder.update_view(size, origin, zoom, density)
 	refresh_selection()
 	queue_redraw()
 
@@ -570,81 +649,194 @@ func validate_solo_layer() -> void:
 func set_solo_layer(layer_id: String) -> void:
 	if solo_layer_id == layer_id: return
 	solo_layer_id = layer_id
-	sync_artwork()
+	refresh_layer_visibility()
+
+func refresh_layer_visibility() -> void:
+	validate_solo_layer()
+	var missing: Array[String] = []
+	for layer in document.layers:
+		var shown := layer_is_visible(layer)
+		var holder: Node2D = layer_renderers.get(layer.id)
+		if holder:
+			var revealing := shown and not holder.visible
+			holder.visible = shown
+			if revealing and holder is IsolatedOpacity:
+				var density := maxf(0.01, get_screen_transform().get_scale().x)
+				holder.update_view(size, origin, zoom, density)
+		elif shown:
+			missing.append(layer.id)
+	if not missing.is_empty():
+		sync_artwork(missing[0] if missing.size() == 1 else "")
+		return
+	pigment_dirty = true
+	refresh_selection()
 
 func layer_is_visible(layer: Dictionary) -> bool:
 	return layer.visible and (solo_layer_id.is_empty() or layer.id == solo_layer_id)
 
 func update_content_marks(change: Dictionary) -> bool:
+	if not change.has("layer"): return false
+	var holder: Node2D = layer_renderers.get(change.layer)
 	if change.has("redraw"):
 		var object: Dictionary = change.redraw
 		var entry: Dictionary = retained_marks.get(object.id, {})
 		if not entry.is_empty():
 			entry.appearance = object.duplicate()
 			entry.mark.queue_redraw()
-			if paint_cache and entry.mark.get_parent() == paint_cache.artwork:
-				paint_cache.invalidate_cache()
+			if is_artwork_cache(holder): holder.invalidate_mark(entry.mark)
 		return true
-	var holder: Node2D = layer_renderers.get(change.layer)
-	if not holder or (holder is IsolatedOpacity and holder != paint_cache): return false
+	var cached := is_artwork_cache(holder)
+	if not holder or (holder is IsolatedOpacity and not cached): return false
 	var parent := holder_artwork(holder)
+	var redraw_recent := false
+	var redraw_base := false
 	for id in change.remove:
 		if not retained_marks.has(id): continue
-		var mark: Node2D = retained_marks[id].mark
-		if mark.get_parent() != parent: return false
+		var entry: Dictionary = retained_marks[id]
+		var mark: Node2D = entry.mark
+		if mark.get_parent() == parent:
+			redraw_base = true
+		elif cached and holder.is_recent_mark(mark):
+			redraw_recent = true
+		else:
+			return false
+		if layer_cache_costs.has(change.layer):
+			layer_cache_costs[change.layer] -= cache_sample_cost(entry.object)
+		if change.get("undo_append", false): remember_redo_mesh(entry)
 		remove_mark(mark)
 		retained_marks.erase(id)
 	for object in change.add:
-		retained_marks[object.id] = mount_mark(parent, object)
-	if holder == paint_cache: paint_cache.invalidate_cache()
+		retained_marks[object.id] = mount_mark(parent, object, change.layer)
+	if cached:
+		if redraw_base or not change.add.is_empty(): holder.invalidate_cache()
+		if redraw_recent: holder.invalidate_recent()
 	return true
 
 func on_artwork_changed() -> void:
-	if not document.transformed_on_commit.is_empty():
-		var invalidate_surface := false
-		for transformed in document.transformed_on_commit:
-			var mark := update_mark_pose(transformed)
-			invalidate_surface = invalidate_surface or (paint_cache != null and mark != null and mark.get_parent() == paint_cache.artwork)
-		if invalidate_surface: paint_cache.invalidate_cache()
+	finish_cache_navigation()
+	var resync: Array = document.content_on_commit.get("resync", [])
+	if not resync.is_empty() and resync.size() <= 3:
+		for id in resync: sync_artwork(id)
+		return
+	if document.content_on_commit.get("layer_order", false):
+		var order := 0
+		for layer in document.layers:
+			var holder: Node2D = layer_renderers.get(layer.id)
+			if not holder: continue
+			if holder.get_index() != order: artwork_root.move_child(holder, order)
+			order += 1
 		pigment_dirty = true
 		refresh_selection()
 		return
-	if not document.content_on_commit.is_empty() and update_content_marks(document.content_on_commit):
+	if document.content_on_commit.has("group_ids"):
+		for id in document.content_on_commit.group_ids:
+			var entry: Dictionary = retained_marks.get(id, {})
+			if entry.is_empty(): continue
+			if entry.object.has("artwork_group"): entry.appearance.artwork_group = entry.object.artwork_group
+			else: entry.appearance.erase("artwork_group")
+		refresh_selection()
+		return
+	var flag: String = document.content_on_commit.get("layer_flag", "")
+	if not flag.is_empty():
+		if flag == "visible": refresh_layer_visibility()
+		else: refresh_selection()
+		return
+	var page_resize: bool = document.content_on_commit.get("page_resize", false)
+	if page_resize or not document.transformed_on_commit.is_empty():
+		for layer_id in document.content_on_commit.get("layers", []): pick_grids.erase(layer_id)
+		var resized_holders := {}
+		for transformed in document.transformed_on_commit:
+			var mark := update_mark_pose(transformed)
+			if mark:
+				var holder: Node2D = layer_renderers.get(retained_marks[transformed.id].layer)
+				if is_artwork_cache(holder):
+					holder.invalidate_mark(mark)
+					if holder.document_bounds.has_area():
+						holder.document_bounds = holder.document_bounds.merge(pick_bounds(transformed).grow(4.0))
+						resized_holders[holder] = true
+		var density := maxf(0.01, get_screen_transform().get_scale().x)
+		for holder in resized_holders: holder.update_view(size, origin, zoom, density)
 		pigment_dirty = true
+		if page_resize:
+			last_page_size = Vector2(document.width, document.height)
+			if view_fitted and not exporting: fit()
+			else: redraw_view()
+		else:
+			refresh_selection()
+		return
+	var content: Dictionary = document.content_on_commit
+	if not content.is_empty() and update_content_marks(content):
+		pick_grids.erase(content.layer)
+		if not pigment_dirty and content.has("remove") and content.get("add", []).is_empty():
+			for id in content.remove: pigment.erase_entry(id)
+		else:
+			pigment_dirty = true
 		refresh_selection()
 		return
 	var object: Dictionary = document.appended_on_commit
 	var layer: Dictionary = document.layers[document.active] if not document.layers.is_empty() else {}
-	if not object.is_empty() and paint_cache and layer_renderers.get(layer.get("id")) == paint_cache \
-			and not object.has("opacity_groups") and not retained_marks.has(object.id) \
+	var holder: Node2D = layer_renderers.get(layer.get("id"))
+	if not object.is_empty() and holder and not object.has("opacity_groups") and not retained_marks.has(object.id) \
 			and not layer.objects.is_empty() and is_same(layer.objects.back(), object):
-		# An append to the cached layer changes only its newest mark.
-		# Keep the existing surface and add the mark on its next frame.
-		var entry := mount_mark(paint_cache.artwork, object)
+		if should_promote_cache(layer, object):
+			sync_artwork()
+			return
+		var entry := mount_mark(holder_artwork(holder), object, layer.id)
 		retained_marks[object.id] = entry
-		paint_cache.append_mark(entry.mark)
-		if not pigment_dirty:
-			pigment_dirty = not pigment.append_latest(layer, document.active, object)
-		refresh_selection()
-		return
-	if not object.is_empty() and not cache_completed_paint and layer_renderers.has(layer.get("id")) \
-			and not object.has("opacity_groups") and not retained_marks.has(object.id) and not layer.objects.is_empty() \
-			and is_same(layer.objects.back(), object):
-		retained_marks[object.id] = mount_mark(holder_artwork(layer_renderers[layer.id]), object)
-		if not pigment_dirty:
+		if pick_grids.has(layer.id): index_pick_bounds(pick_grids[layer.id], layer.objects.size() - 1, object)
+		if is_artwork_cache(holder):
+			if holder.document_bounds.has_area():
+				var bounds := pick_bounds(object).grow(4.0)
+				if not holder.document_bounds.encloses(bounds):
+					holder.document_bounds = holder.document_bounds.merge(bounds)
+					holder.update_view(size, origin, zoom, maxf(0.01, get_screen_transform().get_scale().x))
+			holder.append_mark(entry.mark)
+		if not pigment_dirty and layer_is_visible(layer):
 			pigment_dirty = not pigment.append_latest(layer, document.active, object)
 		refresh_selection()
 		return
 	sync_artwork()
 
-func mount_mark(holder: Node2D, object: Dictionary) -> Dictionary:
+func should_promote_cache(layer: Dictionary, object: Dictionary) -> bool:
+	var layer_id: String = layer.id
+	if not cache_completed_paint or not layer_cache_costs.has(layer_id): return false
+	var cost: int = layer_cache_costs[layer_id] + cache_sample_cost(object)
+	layer_cache_costs[layer_id] = cost
+	if float(layer.get("opacity", 1.0)) < 1.0: return false
+	# Build additional surfaces on artwork synchronization, outside the
+	# append path. Allocating one automatically stalls a pen lift.
+	return not paint_cache and (cost >= PAINT_CACHE_THRESHOLD or overview_cache)
+
+func remember_redo_mesh(entry: Dictionary) -> void:
+	var mark: Node2D = entry.mark
+	if not mark.has_meta(Art.WET_MESH) or int(mark.get_meta(Art.WET_MESH_SAMPLES, 0)) > STROKE_REDO_SAMPLE_LIMIT: return
+	if stroke_redo_meshes.size() >= STROKE_REDO_MESH_LIMIT:
+		stroke_redo_meshes.erase(stroke_redo_meshes.keys()[0])
+	stroke_redo_meshes[entry.object.id] = {"object": entry.appearance, "geometry": mark.get_meta(Art.WET_MESH)}
+
+func inherit_wet_geometry(mark: Node2D, object: Dictionary) -> void:
+	if stroke_redo_meshes.has(object.id):
+		var entry: Dictionary = stroke_redo_meshes[object.id]
+		stroke_redo_meshes.erase(object.id)
+		if entry.object == object:
+			mark.set_meta(Art.WET_MESH, entry.geometry)
+
+func mount_mark(holder: Node2D, object: Dictionary, layer_id: String) -> Dictionary:
 	var mark := Node2D.new()
 	if object.kind == "image": mark.texture_filter = CanvasItem.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
 	Art.use_screen_edges(mark, object)
+	if not exporting and object.kind == "stroke" and Art.uses_wet_batches(object):
+		var samples: int = object.points.size()
+		# Soft dabs carry several feather rings, unlike the wet ribbon brushes.
+		var cost := samples * (4 if object.brush == "soft" else 1)
+		if samples <= MAX_WET_MESH_SAMPLES and wet_mesh_samples + cost <= WET_MESH_SAMPLE_BUDGET:
+			wet_mesh_samples += cost
+			mark.set_meta(Art.WET_MESH_SAMPLES, cost)
+			inherit_wet_geometry(mark, object)
 	mark.draw.connect(Art.draw_object.bind(mark, object, Vector2.ZERO, 1.0, true))
 	mark.transform = Art.object_transform(object)
 	holder.add_child(mark)
-	return {"mark": mark, "object": object, "appearance": object.duplicate()}
+	return {"mark": mark, "object": object, "appearance": object.duplicate(), "layer": layer_id}
 
 func update_mark_pose(object: Dictionary) -> Node2D:
 	var entry: Dictionary = retained_marks.get(object.id, {})
@@ -666,27 +858,56 @@ func pick_bounds(object: Dictionary) -> Rect2:
 		return entry.bounds
 	return Art.coverage_bounds(object)
 
-func sync_artwork() -> void:
+func sync_artwork(only_layer_id := "") -> void:
 	if not artwork_root or document == null: return
+	finish_cache_navigation()
 	refresh_transform_cache()
 	validate_solo_layer()
-	if preview_root and preview_root.get_parent() != self: preview_root.reparent(self, false)
-	var next_layers := {}
-	var next_merge_renderers := {}
-	var next_marks := {}
+	detach_preview()
+	var full_sync := only_layer_id.is_empty()
+	if paint_cache and (full_sync or layer_renderers.get(only_layer_id) == paint_cache):
+		paint_cache.flush_recent()
+	if full_sync:
+		stroke_redo_meshes.clear()
+		pick_grids.clear()
+	else:
+		pick_grids.erase(only_layer_id)
+	var next_layers := {} if full_sync else layer_renderers
+	var next_merge_renderers := {} if full_sync else merge_renderers
+	var next_marks := {} if full_sync else retained_marks
+	var previous_marks := {}
+	var previous_scopes := {}
+	if not full_sync:
+		for id in retained_marks:
+			if retained_marks[id].layer == only_layer_id: previous_marks[id] = true
+		for key in merge_renderers:
+			if key.begins_with(only_layer_id + ":"): previous_scopes[key] = true
 	var stale_layers: Array[Node2D] = []
 	var layer_index := 0
-	var cache_layer := select_paint_cache_layer()
-	paint_cache = null
+	var keep_cache := is_artwork_cache(layer_renderers.get(only_layer_id))
+	var cache_layers := select_paint_cache_layers() if full_sync else ([only_layer_id] if keep_cache else [])
+	if full_sync: paint_cache = null
 	for layer in document.layers:
-		if not layer_is_visible(layer): continue
+		var shown := layer_is_visible(layer)
+		if not shown and not layer_renderers.has(layer.id): continue
+		if not full_sync and layer.id != only_layer_id:
+			if layer_renderers.has(layer.id): layer_index += 1
+			continue
 		var layer_alpha: float = opacity_preview_value if layer.id == opacity_preview_layer else layer.get("opacity", 1.0)
 		var holder: Node2D = layer_renderers.get(layer.id)
 		var use_group := layer_alpha < 1.0
 		var nesting := find_nested_scopes(layer)
 		var isolate_layer: bool = use_group and nesting.has_groups
-		var cache_layer_marks: bool = layer.id == cache_layer and not nesting.has_groups
+		var cache_layer_marks: bool = layer.id in cache_layers and not nesting.has_groups and layer_alpha > 0.0
 		var needs_surface := isolate_layer or cache_layer_marks
+		if keep_cache and not cache_layer_marks and holder == paint_cache: paint_cache = null
+		if not full_sync and layer_cache_costs.has(layer.id):
+			if nesting.has_groups:
+				layer_cache_costs.erase(layer.id)
+			else:
+				var cost := 0
+				for object in layer.objects: cost += cache_sample_cost(object)
+				layer_cache_costs[layer.id] = cost
 		if not holder or (holder is IsolatedOpacity) != needs_surface or (
 				holder is IsolatedOpacity and holder.cache_finished_marks != cache_layer_marks) or (
 				holder is CanvasGroup) != (use_group and not isolate_layer):
@@ -696,9 +917,13 @@ func sync_artwork() -> void:
 				holder.cache_finished_marks = cache_layer_marks
 				holder.overview = cache_layer_marks and overview_cache
 			artwork_root.add_child(holder)
+		holder.visible = shown
+		var cached_area := Rect2(Vector2.ZERO, Vector2(document.width, document.height)) if cache_layer_marks and use_group else Rect2()
 		if cache_layer_marks:
-			paint_cache = holder
-			paint_cache.invalidate_cache()
+			if full_sync and layer.id == cache_layers[0]: paint_cache = holder
+			holder.allow_overview = holder == paint_cache
+			holder.keep_recent_marks = not use_group and holder == paint_cache and cache_recent_strokes and not overview_cache \
+				and int(layer_cache_costs.get(layer.id, 0)) >= PAINT_CACHE_THRESHOLD
 		if use_group: set_holder_opacity(holder, layer_alpha)
 		if holder.get_index() != layer_index: artwork_root.move_child(holder, layer_index)
 		layer_index += 1
@@ -707,6 +932,7 @@ func sync_artwork() -> void:
 		var scopes := []
 		var holders: Array[Node2D] = [holder_artwork(holder)]
 		var positions: Array[int] = [0]
+		var cache_changed: bool = cache_layer_marks and holders[0].get_child_count() != layer.objects.size()
 		for object in layer.objects:
 			var groups: Array = object.get("opacity_groups", [])
 			if not groups.is_empty() or not scopes.is_empty():
@@ -728,6 +954,7 @@ func sync_artwork() -> void:
 					if subgroup.get_index() != positions[-1]: parent.move_child(subgroup, positions[-1])
 					positions[-1] += 1
 					next_merge_renderers[key] = subgroup
+					previous_scopes.erase(key)
 					holders.append(holder_artwork(subgroup))
 					positions.append(0)
 				scopes = groups
@@ -740,24 +967,43 @@ func sync_artwork() -> void:
 				if mark.get_parent() != mark_holder:
 					mark.reparent(mark_holder, false)
 					mark.show()
+					cache_changed = true
 			else:
 				if not entry.is_empty(): remove_mark(entry.mark)
-				entry = mount_mark(mark_holder, object)
+				entry = mount_mark(mark_holder, object, layer.id)
 				mark = entry.mark
-			if mark.get_index() != object_index: mark_holder.move_child(mark, object_index)
+				cache_changed = true
+			entry.layer = layer.id
+			if mark.get_index() != object_index:
+				mark_holder.move_child(mark, object_index)
+				cache_changed = true
 			next_marks[object.id] = entry
+			if cached_area.has_area(): cached_area = cached_area.merge(pick_bounds(object))
+			previous_marks.erase(object.id)
 			positions[-1] += 1
+		if cache_layer_marks:
+			holder.document_bounds = cached_area.grow(4.0) if cached_area.has_area() else Rect2()
+			if cache_changed: holder.invalidate_cache()
 
-	for id in retained_marks:
-		if not next_marks.has(id): remove_mark(retained_marks[id].mark)
-	for key in merge_renderers:
-		if not next_merge_renderers.has(key): remove_mark(merge_renderers[key])
-	for id in layer_renderers:
-		if not next_layers.has(id): stale_layers.append(layer_renderers[id])
-	for holder in stale_layers: remove_mark(holder)
-	layer_renderers = next_layers
-	merge_renderers = next_merge_renderers
-	retained_marks = next_marks
+	if full_sync:
+		for id in retained_marks:
+			if not next_marks.has(id): remove_mark(retained_marks[id].mark)
+		for key in merge_renderers:
+			if not next_merge_renderers.has(key): remove_mark(merge_renderers[key])
+		for id in layer_renderers:
+			if not next_layers.has(id): stale_layers.append(layer_renderers[id])
+		for holder in stale_layers: remove_mark(holder)
+		layer_renderers = next_layers
+		merge_renderers = next_merge_renderers
+		retained_marks = next_marks
+	else:
+		for id in previous_marks:
+			remove_mark(retained_marks[id].mark)
+			retained_marks.erase(id)
+		for key in previous_scopes:
+			remove_mark(merge_renderers[key])
+			merge_renderers.erase(key)
+		for holder in stale_layers: remove_mark(holder)
 	if drawing: mount_preview()
 	pigment_dirty = true
 	var page_size := Vector2(document.width, document.height)
@@ -766,28 +1012,48 @@ func sync_artwork() -> void:
 	if view_fitted and was_resized and not exporting: fit()
 	else: redraw_view()
 
-func select_paint_cache_layer() -> String:
-	if exporting or not cache_completed_paint: return ""
-	# Limit the canvas to one extra surface. Ordinary opaque layers can
-	# composite the live stroke above their cached finished strokes.
+func cache_sample_cost(object: Dictionary) -> int:
+	if object.kind != "stroke": return 0
+	return object.points.size() * (5 if object.brush in ["soft", "pencil", "chalk"] else 1)
+
+func is_artwork_cache(holder: Node2D) -> bool:
+	return holder is IsolatedOpacity and holder.cache_finished_marks
+
+func select_paint_cache_layers() -> Array:
+	layer_cache_costs.clear()
+	if exporting or not cache_completed_paint: return []
+	var heavy_layers := []
+	var limit := MAX_PAINT_CACHES if cache_extra_layers else 1
 	var overview_layer := ""
 	for index in document.layers.size():
 		var layer: Dictionary = document.layers[index]
-		if not layer_is_visible(layer) or layer.get("opacity", 1.0) < 1.0 or layer.id == opacity_preview_layer: continue
+		if layer.id == opacity_preview_layer \
+				or layer.get("type", "vector") == "paint": continue
 		var dabs := 0
 		var isolated := false
 		for object in layer.objects:
 			if object.has("opacity_groups"):
 				isolated = true
 				break
-			if object.kind == "stroke":
-				match object.brush:
-					"soft", "pencil", "chalk": dabs += object.points.size() * 5
-					_: dabs += object.points.size()
-		if not isolated and dabs >= PAINT_CACHE_THRESHOLD: return layer.id
-		if overview_cache and not isolated and index == document.active and layer.get("type", "vector") != "paint" and not layer.objects.is_empty():
-			overview_layer = layer.id
-	return overview_layer
+			dabs += cache_sample_cost(object)
+		if isolated: continue
+		layer_cache_costs[layer.id] = dabs
+		if not layer_is_visible(layer): continue
+		var alpha: float = layer.get("opacity", 1.0)
+		if alpha <= 0.0: continue
+		if heavy_layers.size() < limit and dabs >= PAINT_CACHE_THRESHOLD: heavy_layers.append(layer.id)
+		if overview_cache and alpha == 1.0 and index == document.active and not layer.objects.is_empty(): overview_layer = layer.id
+	if heavy_layers.is_empty() and not overview_layer.is_empty(): heavy_layers.append(overview_layer)
+	return heavy_layers
+
+func refresh_background_cache(previous_layer_id: String) -> void:
+	if not cache_completed_paint or previous_layer_id == document.layers[document.active].id: return
+	var index: int = document.layer_index(previous_layer_id)
+	if index < 0 or int(layer_cache_costs.get(previous_layer_id, 0)) < PAINT_CACHE_THRESHOLD: return
+	var layer: Dictionary = document.layers[index]
+	if float(layer.get("opacity", 1.0)) > 0.0 and layer_is_visible(layer) \
+			and not is_artwork_cache(layer_renderers.get(previous_layer_id)):
+		sync_artwork()
 
 func scope_key(layer_id: String, object_id: String, depth: int) -> String:
 	return "%s:%s:%d" % [layer_id, object_id, depth]
@@ -821,6 +1087,7 @@ func holder_artwork(holder: Node2D) -> Node2D:
 	return holder.artwork if holder is IsolatedOpacity else holder
 
 func remove_mark(mark: Node2D) -> void:
+	wet_mesh_samples -= int(mark.get_meta(Art.WET_MESH_SAMPLES, 0))
 	mark.get_parent().remove_child(mark)
 	mark.queue_free()
 
@@ -836,9 +1103,14 @@ func preview_layer_opacity(layer_id: String, value: float) -> void:
 
 func mount_preview() -> void:
 	if not preview_root or not document.editable(): return
-	var holder: Node2D = layer_renderers.get(document.layers[document.active].id)
+	var id: String = document.layers[document.active].id
+	var holder: Node2D = layer_renderers.get(id)
 	if not holder: return
-	if holder != paint_cache: holder = holder_artwork(holder)
+	if is_artwork_cache(holder):
+		preview_surface = holder
+		holder = preview_surface.preview_parent()
+	else:
+		holder = holder_artwork(holder)
 	if preview_root.get_parent() != holder: preview_root.reparent(holder, false)
 	preview_root.position = Vector2.ZERO
 	preview_root.scale = Vector2.ONE
@@ -846,7 +1118,7 @@ func mount_preview() -> void:
 
 func sample_pigment(point: Vector2) -> Color:
 	if pigment_dirty:
-		pigment.rebuild(document, solo_layer_id)
+		pigment.rebuild(document, solo_layer_id, pick_bounds)
 		pigment_dirty = false
 	return pigment.sample(point)
 
@@ -908,9 +1180,14 @@ func clear_preview() -> void:
 	for batch in preview_root.get_children():
 		preview_root.remove_child(batch)
 		batch.queue_free()
-	if preview_root.get_parent() != self: preview_root.reparent(self, false)
+	detach_preview()
 	live_batch = null
 	live_first = 0
+
+func detach_preview() -> void:
+	if preview_root and preview_root.get_parent() != self: preview_root.reparent(self, false)
+	if is_instance_valid(preview_surface): preview_surface.release_preview()
+	preview_surface = null
 
 func redraw_preview() -> void:
 	if not preview_root: return
@@ -1160,6 +1437,45 @@ func selectable_layer(index: int) -> bool:
 	var layer: Dictionary = document.layers[index]
 	return (select_across_layers or index == document.active) and layer_is_visible(layer) and not layer.locked
 
+func pick_cell(point: Vector2) -> Vector2i:
+	return Vector2i((point / PICK_CELL_SIZE).floor())
+
+func build_pick_grid(layer: Dictionary) -> Dictionary:
+	var grid := {"cells": {}, "broad": []}
+	for index in layer.objects.size():
+		var object: Dictionary = layer.objects[index]
+		index_pick_bounds(grid, index, object)
+	return grid
+
+func index_pick_bounds(grid: Dictionary, index: int, object: Dictionary) -> void:
+	if object.get("paint_tile", false): return
+	var bounds := pick_bounds(object)
+	var first := pick_cell(bounds.position)
+	var last := pick_cell(bounds.end)
+	if (last.x - first.x + 1) * (last.y - first.y + 1) > MAX_PICK_CELLS:
+		grid.broad.append(index)
+		return
+	for x in range(first.x, last.x + 1):
+		for y in range(first.y, last.y + 1):
+			var cell := Vector2i(x, y)
+			if not grid.cells.has(cell): grid.cells[cell] = []
+			grid.cells[cell].append(index)
+
+func pick_candidate_indices(layer: Dictionary, point: Vector2, tolerance: float) -> Array:
+	if not pick_grids.has(layer.id): pick_grids[layer.id] = build_pick_grid(layer)
+	var grid: Dictionary = pick_grids[layer.id]
+	var first := pick_cell(point - Vector2.ONE * tolerance)
+	var last := pick_cell(point + Vector2.ONE * tolerance)
+	var candidates := {}
+	for index in grid.broad: candidates[index] = true
+	for x in range(first.x, last.x + 1):
+		for y in range(first.y, last.y + 1):
+			for index in grid.cells.get(Vector2i(x, y), []): candidates[index] = true
+	var ordered := candidates.keys()
+	ordered.sort()
+	ordered.reverse()
+	return ordered
+
 func hit(point: Vector2, include_interior: bool) -> Dictionary:
 	var tolerance: float = 6.0 / zoom
 	var top: int = document.layers.size() - 1 if select_across_layers and include_interior else document.active
@@ -1167,7 +1483,9 @@ func hit(point: Vector2, include_interior: bool) -> Dictionary:
 	for layer_index in range(top, bottom, -1):
 		if not selectable_layer(layer_index): continue
 		var layer: Dictionary = document.layers[layer_index]
-		for i in range(layer.objects.size() - 1, -1, -1):
+		var indices := pick_candidate_indices(layer, point, tolerance) if layer.objects.size() >= PICK_GRID_THRESHOLD \
+			else range(layer.objects.size() - 1, -1, -1)
+		for i in indices:
 			var object: Dictionary = layer.objects[i]
 			if object.get("paint_tile", false) or not pick_bounds(object).grow(tolerance).has_point(point): continue
 			if Art.contains(object, point, tolerance) or (include_interior and contains_selectable_interior(object, point)):
@@ -1291,8 +1609,7 @@ func _gui_input(event: InputEvent) -> void:
 			else:
 				dragging = false
 				metrics_pressure = -1.0
-				if marquee_active: update_marquee(to_document(event.position))
-				finish()
+				finish_at(event.position)
 	elif event is InputEventMouseMotion:
 		if touch_points.is_empty():
 			metrics_pointer = event.position
@@ -1343,7 +1660,7 @@ func begin_contact(index: int, point: Vector2) -> void:
 			node_touch = (not object.is_empty() and document.can_edit(object.id)
 				and nearest_editable_node(object, to_document(point)) >= 0)
 		var touches_selection := false
-		if tool == "select":
+		if tool == "select" and not keep_selecting:
 			var bounds := Rect2()
 			if document.area_selection.is_empty():
 				var object := editable_selected_object()
@@ -1365,7 +1682,7 @@ func begin_contact(index: int, point: Vector2) -> void:
 				begin(point, 0.55)
 	elif not touch_navigating:
 		clear_pointer_metrics()
-		cancel()
+		cancel(keep_selecting and (tool == "select" or tool in AREA_TOOLS))
 		touch_tap_tool = ""
 		touch_navigating = true
 
@@ -1405,6 +1722,7 @@ func move_contact(index: int, point: Vector2, pressure: float) -> void:
 		zoom = clampf(zoom * new_span / old_span, 0.05 / ui_scale, 12.0 / ui_scale)
 	view_fitted = false
 	origin = (first + second) * 0.5 - anchor * zoom
+	defer_navigation_cache_rebuilds()
 	redraw_view()
 	if zoom != old_zoom: view_changed.emit()
 
@@ -1417,8 +1735,7 @@ func end_contact(index: int, point: Vector2, canceled: bool) -> void:
 		if canceled:
 			cancel()
 		elif touch_tap_tool.is_empty():
-			if marquee_active: update_marquee(to_document(point))
-			finish()
+			finish_at(point)
 		elif not touch_tap_moved and touch_start.distance_to(point) <= 8.0:
 			if touch_tap_tool == tool or (touch_tap_tool == "add_node" and tool == "nodes" and adding_node):
 				begin(point, 0.55)
@@ -1438,6 +1755,7 @@ func reset_touch() -> void:
 	set_process_input(false)
 
 func begin(screen: Vector2, pressure: float, shortcut: String = "") -> void:
+	finish_cache_navigation()
 	if drawing: return
 	# Document signals can refresh the toolbar while an eraser tap runs.
 	# Keep the selected tool separate from this contact's action.
@@ -1445,7 +1763,7 @@ func begin(screen: Vector2, pressure: float, shortcut: String = "") -> void:
 	var point = to_document(screen)
 	start = point
 	if action == "select" or action in AREA_TOOLS:
-		if begin_selection_transform(point): return
+		if not keep_selecting and begin_selection_transform(point): return
 		if action in AREA_TOOLS:
 			marquee_active = true
 			marquee_end = point
@@ -1453,6 +1771,9 @@ func begin(screen: Vector2, pressure: float, shortcut: String = "") -> void:
 			refresh_selection()
 			return
 	if not Rect2(0, 0, document.width, document.height).has_point(point): return
+	if action == "select" and keep_selecting:
+		toggle_object_pick(point)
+		return
 	var unavailable := tool_unavailable_reason(action)
 	if not unavailable.is_empty():
 		status.emit(unavailable)
@@ -1471,13 +1792,8 @@ func begin(screen: Vector2, pressure: float, shortcut: String = "") -> void:
 		selected.emit({"picked_color": color})
 		return
 	if action == "fill":
-		if document.paints_pixels():
-			match document.fill_paint(Vector2i(point.floor()), color):
-				OK: color_used.emit(color)
-				ERR_UNAVAILABLE: status.emit("Choose a visible, unlocked paint layer.")
-				_: status.emit("The project has reached its embedded paint size limit.")
-		else:
-			fill_at(point)
+		if fill_requested.has_connections(): fill_requested.emit(point)
+		else: apply_fill(point)
 		return
 	if action == "nodes" and adding_node:
 		add_node_at(point)
@@ -1685,9 +2001,11 @@ func update_stroke(screen: Vector2, pressure: float) -> void:
 		var entry: Dictionary = retained_marks.get(object.id, {})
 		if not entry.is_empty():
 			entry.erase("bounds")
+			entry.mark.remove_meta(Art.WET_MESH)
 			entry.mark.queue_redraw()
-		if paint_cache and not entry.is_empty() and entry.mark.get_parent() == paint_cache.artwork:
-			paint_cache.invalidate_cache()
+		if not entry.is_empty():
+			var holder: Node2D = layer_renderers.get(entry.layer)
+			if is_artwork_cache(holder): holder.invalidate_mark(entry.mark)
 		pigment.entries.erase(object.id)
 		refresh_selection()
 		return
@@ -1717,10 +2035,29 @@ func append_motion(point: Vector2, pressure: float, finishing := false) -> void:
 	if distance < (0.03 if finishing else 0.45 / zoom): return
 	var spacing := maxf(1.5, float(current.size) * float(current.get("spacing", 0.16)))
 	if current.brush == "ink": spacing = maxf(spacing, 0.7 / zoom)
-	var count := mini(100000 - current.points.size(), mini(120, maxi(1, ceili(distance / spacing))))
+	# Interpolated samples lie on one straight segment. Limit their count
+	# for solid ink so a fast event does not flood the outline renderer.
+	var limit := INK_SAMPLES_PER_MOTION if Art.uses_ink_outline(current) else 120
+	var count := mini(100000 - current.points.size(), mini(limit, maxi(1, ceili(distance / spacing))))
 	for i in range(1, count + 1):
 		var t := float(i) / count
 		append_point(previous.lerp(point, t), lerpf(previous_pressure, pressure, t))
+
+func apply_fill(point: Vector2) -> void:
+	if not document.paints_pixels():
+		fill_at(point)
+		return
+	match document.fill_paint(Vector2i(point.floor()), color):
+		OK: color_used.emit(color)
+		ERR_UNAVAILABLE: status.emit("Choose a visible, unlocked paint layer.")
+		_: status.emit("The project has reached its embedded paint size limit.")
+
+func finish_at(screen: Vector2) -> void:
+	var point := to_document(screen)
+	if marquee_active: update_marquee(point)
+	if drawing and current.get("brush") == "ink":
+		raw_point = point.clamp(Vector2.ZERO, Vector2(document.width, document.height))
+	finish()
 
 func finish() -> void:
 	if marquee_active: finish_marquee()
@@ -1760,9 +2097,9 @@ func finish() -> void:
 	node_arc.clear()
 	refresh_selection()
 
-func cancel() -> void:
+func cancel(keep_picks := false) -> void:
 	clear_path()
-	if document != null and not marquee_active and (not selected_area.is_empty() or not document.area_selection.is_empty()):
+	if document != null and not keep_picks and not marquee_active and (not selected_area.is_empty() or not document.area_selection.is_empty()):
 		clear_selection()
 	marquee_active = false
 	lasso_points.clear()
@@ -1821,5 +2158,8 @@ func _notification(what: int) -> void:
 		restore_android_pointer_buffering()
 		dragging = false
 		reset_touch()
-	elif what == NOTIFICATION_APPLICATION_RESUMED and paint_cache:
-		paint_cache.invalidate_cache()
+	elif what == NOTIFICATION_APPLICATION_RESUMED:
+		for holder in layer_renderers.values():
+			if is_artwork_cache(holder):
+				holder.invalidate_cache()
+				holder.invalidate_recent()

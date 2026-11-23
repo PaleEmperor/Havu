@@ -70,11 +70,11 @@ static func find_union(objects: Array, incoming: Dictionary, ink_gap := TIP_GAP)
 	return {"object": result, "indices": joined}
 
 static func union_objects(objects: Array[Dictionary]) -> Dictionary:
-	var outline := mergeable_outline(objects[0])
+	var outline := mergeable_outline(objects[0], true)
 	if outline.is_empty(): return {}
 	var contours: Array[PackedVector2Array] = []
 	for index in range(1, objects.size()):
-		var edge := mergeable_outline(objects[index])
+		var edge := mergeable_outline(objects[index], true)
 		if edge.is_empty(): return {}
 		contours.clear()
 		for contour in Geometry2D.merge_polygons(outline, edge):
@@ -145,16 +145,17 @@ static func closest_edge(outline: PackedVector2Array, point: Vector2, skip := {}
 static func valid_outline(outline: PackedVector2Array) -> bool:
 	return outline.size() >= 3 and outline.size() <= MAX_VERTICES and not Geometry2D.triangulate_polygon(outline).is_empty()
 
-static func can_union(object: Dictionary) -> bool:
+static func can_union(object: Dictionary, include_grouped := false) -> bool:
 	if object.opacity != 1.0 or Color(object.color).a != 1.0: return false
-	if object.has("artwork_group") or object.has("node_anchors") or object.has("clip") or object.has("paint_mask"): return false
+	if not include_grouped and (object.has("artwork_group") or object.has("node_anchors")): return false
+	if object.has("clip") or object.has("paint_mask"): return false
 	if not object.get("opacity_groups", []).is_empty(): return false
 	if object.kind == "stroke": return Art.uses_ink_outline(object) and object.points.size() <= (MAX_VERTICES - 24) / 2
 	return object.kind in ["rect", "ellipse", "polygon"] and Art.has_fill(object) and Art.outline_width(object) <= 0.0 \
 		and object.get("vertices", []).size() <= MAX_VERTICES
 
-static func mergeable_outline(object: Dictionary) -> PackedVector2Array:
-	if not can_union(object): return PackedVector2Array()
+static func mergeable_outline(object: Dictionary, include_grouped := false) -> PackedVector2Array:
+	if not can_union(object, include_grouped): return PackedVector2Array()
 	var points := Art.stroke_polygon(object) if object.kind == "stroke" else Art.polygon(object)
 	if points.size() < 3: return PackedVector2Array()
 	if not object.get("compound_disjoint", false) and Geometry2D.triangulate_polygon(points).is_empty(): return PackedVector2Array()

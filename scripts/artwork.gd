@@ -14,6 +14,8 @@ const GRAIN_SHADER := preload("res://assets/grain_tip.gdshader")
 const GRAIN_SIDES := 7
 const GRAIN_STRIDE := 16
 const GRAIN_BATCHES := &"_grain_batches"
+const WET_MESH := &"_wet_mesh"
+const WET_MESH_SAMPLES := &"_wet_mesh_samples"
 const SOFT_BATCH_SIZE := 24
 static var edge_material: ShaderMaterial
 static var grain_material: ShaderMaterial
@@ -607,6 +609,9 @@ static func draw_object(target: CanvasItem, object: Dictionary, origin = Vector2
 				target.draw_string(font, Vector2(0, y), line, HORIZONTAL_ALIGNMENT_LEFT, -1, int(object.font_size), color)
 				y += float(object.font_size) * 1.35
 		"stroke":
+			if target.has_meta(WET_MESH_SAMPLES) and target.material == edge_material and edge_material != null:
+				draw_retained_wet_mesh(target, object)
+				return
 			var batch_size := stroke_batch_size(object)
 			for first in range(0, object.points.size(), batch_size):
 				draw_stroke_range(target, object, first, mini(first + batch_size, object.points.size()), first / batch_size)
@@ -669,6 +674,36 @@ static func wet_batch_geometry(object: Dictionary, first: int, end: int) -> Dict
 		colors.append_array(geometry.colors)
 		uv.append_array(geometry.uv)
 	return {"vertices": vertices, "colors": colors, "indices": indices, "uv": uv}
+
+static func build_wet_mesh(object: Dictionary, first: int, end: int) -> ArrayMesh:
+	var geometry := wet_batch_geometry(object, first, end)
+	if geometry.indices.is_empty(): return null
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = geometry.vertices
+	arrays[Mesh.ARRAY_COLOR] = geometry.colors
+	arrays[Mesh.ARRAY_TEX_UV] = geometry.uv
+	arrays[Mesh.ARRAY_INDEX] = geometry.indices
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	var box := polygon_bounds(geometry.vertices).grow(24.0)
+	mesh.custom_aabb = AABB(Vector3(box.position.x, box.position.y, -1.0), Vector3(box.size.x, box.size.y, 2.0))
+	return mesh
+
+static func local_stroke_style(object: Dictionary) -> Dictionary:
+	var local := object.duplicate()
+	for property in ["id", "pos", "scale", "angle", "mirrored", "artwork_group", "opacity_groups", "merge_batch"]:
+		local.erase(property)
+	return local
+
+static func draw_retained_wet_mesh(target: CanvasItem, object: Dictionary) -> void:
+	var mesh: ArrayMesh
+	if target.has_meta(WET_MESH):
+		mesh = target.get_meta(WET_MESH)
+	else:
+		mesh = build_wet_mesh(object, 0, object.points.size())
+		if mesh: target.set_meta(WET_MESH, mesh)
+	if mesh: target.draw_mesh(mesh, null)
 
 static func ink_outline(object: Dictionary, first: int, end: int) -> PackedVector2Array:
 	return stroke_polygon(object, maxi(0, first - 1), end)
@@ -966,6 +1001,8 @@ static func svg(document, embed_fonts = true) -> String:
 		output.append('<rect width="100%%" height="100%%" fill="%s"/>' % document.paper)
 	output.append('<g clip-path="url(#page)">')
 	var counter = 0
+	var stroke_cache := {}
+	var cached_stroke_length := 0
 	for layer in document.layers:
 		if not layer.visible: continue
 		output.append('<g aria-label="%s" opacity="%s">' % [layer.name.xml_escape(true), layer.get("opacity", 1.0)])
@@ -1013,16 +1050,20 @@ static func svg(document, embed_fonts = true) -> String:
 							[y, family.xml_escape(true), font_attributes, object.font_size, object.color, object.opacity, line.xml_escape()])
 						y += object.font_size * 1.35
 				"stroke":
-					var batch_size := stroke_batch_size(object)
-					for first in range(0, object.points.size(), batch_size):
-						var end := mini(first + batch_size, object.points.size())
-						if uses_ink_outline(object):
-							var outline := ink_outline(object, first, end)
-							if not Geometry2D.triangulate_polygon(outline).is_empty():
-								output.append(svg_polygon(outline, Color(object.color), object.opacity))
-								continue
-						for segment in segments(object, first, end):
-							output.append(svg_polygon(segment.polygon, segment.color, 1.0))
+					if object.points.size() < 64:
+						output.append(svg_stroke(object))
+					else:
+						var local := local_stroke_style(object)
+						var key := local.hash()
+						var cached: Dictionary = stroke_cache.get(key, {})
+						if not cached.is_empty() and cached.local == local:
+							output.append(cached.svg)
+						else:
+							var fragment := svg_stroke(object)
+							output.append(fragment)
+							if cached.is_empty() and stroke_cache.size() < 128 and cached_stroke_length + fragment.length() < 4 * 1024 * 1024:
+								stroke_cache[key] = {"local": local, "svg": fragment}
+								cached_stroke_length += fragment.length()
 				_:
 					output.append(svg_shape(object))
 			if object.has("clip"): output.append('</g>')
@@ -1031,6 +1072,20 @@ static func svg(document, embed_fonts = true) -> String:
 		for unused in scopes: output.append('</g>')
 		output.append('</g>')
 	output.append('</g></svg>')
+	return "\n".join(output)
+
+static func svg_stroke(object: Dictionary) -> String:
+	var output := PackedStringArray()
+	var batch_size := stroke_batch_size(object)
+	for first in range(0, object.points.size(), batch_size):
+		var end := mini(first + batch_size, object.points.size())
+		if uses_ink_outline(object):
+			var outline := ink_outline(object, first, end)
+			if not Geometry2D.triangulate_polygon(outline).is_empty():
+				output.append(svg_polygon(outline, Color(object.color), object.opacity))
+				continue
+		for segment in segments(object, first, end):
+			output.append(svg_polygon(segment.polygon, segment.color, 1.0))
 	return "\n".join(output)
 
 static func svg_shape(object: Dictionary) -> String:

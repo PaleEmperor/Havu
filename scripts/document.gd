@@ -56,13 +56,13 @@ func layer_index(layer_id: String) -> int:
 func snapshot(copy_content := true) -> Dictionary:
 	return {"format": "havu", "version": VERSION, "title": title, "width": width, "height": height, "paper": paper, "paper_visible": paper_visible, "active": active, "layers": layers.duplicate(true) if copy_content else layers}
 
-func restore(data: Dictionary) -> void:
+func restore(data: Dictionary, copy_content := true) -> void:
 	title = data.title
 	width = float(data.width)
 	height = float(data.height)
 	paper = data.paper
 	paper_visible = data.get("paper_visible", true)
-	layers = data.layers.duplicate(true)
+	layers = data.layers.duplicate(true) if copy_content else data.layers
 	active = clampi(int(data.get("active", 0)), 0, layers.size() - 1)
 	selection = ""
 
@@ -93,8 +93,15 @@ func estimate_history_bytes(entry: Dictionary) -> int:
 		for objects in entry.transform.values(): bytes += 480 * objects.size()
 	elif entry.has("paint"):
 		for tile in entry.before + entry.after: bytes += estimate_object_bytes(tile.tile)
+	elif entry.has("artwork_groups"):
+		bytes += 96 * entry.artwork_groups.size()
 	elif entry.has("object_order"):
 		for orders in entry.object_order.values(): bytes += 64 * orders[0].size()
+	elif entry.has("membership"):
+		for slots in entry.membership.values():
+			for slot in slots: bytes += estimate_object_bytes(slot.object)
+	elif entry.has("layer_order"):
+		bytes += 128 * entry.layer_order[0].size()
 	elif entry.has("span"):
 		for object in entry.before + entry.after: bytes += estimate_object_bytes(object)
 	return bytes
@@ -392,6 +399,12 @@ func record_transform(items: Array[Dictionary]) -> void:
 func restore_transform(change: Dictionary, forward: bool) -> void:
 	var changed_objects: Array[Dictionary] = []
 	var slot := int(forward)
+	var page_resize := change.has("page_sizes")
+	if page_resize:
+		var dimensions: Vector2 = change.page_sizes[slot]
+		width = dimensions.x
+		height = dimensions.y
+		active = layer_index(change.active_id)
 	for layer_id in change.transform:
 		var index := layer_index(layer_id)
 		if index == -1: continue
@@ -408,7 +421,7 @@ func restore_transform(change: Dictionary, forward: bool) -> void:
 			remaining -= 1
 			if remaining == 0: break
 	selection = ""
-	commit({}, changed_objects, {"layers": change.transform.keys()})
+	commit({}, changed_objects, {"layers": change.transform.keys(), "page_resize": page_resize})
 
 func undo() -> void:
 	if history.is_empty(): return
@@ -417,9 +430,22 @@ func undo() -> void:
 		append_history_entry(future, change)
 		restore_transform(change, false)
 		return
+	if change.has("artwork_groups"):
+		append_history_entry(future, change)
+		selection = ""
+		apply_artwork_groups(change.artwork_groups, change.next_group, false)
+		return
+	if change.has("layer_flag"):
+		append_history_entry(future, change)
+		apply_layer_flag(change.layer, change.layer_flag, change.values[0])
+		return
 	if change.has("object_order"):
 		append_history_entry(future, change)
 		apply_object_order(change.object_order, false)
+		return
+	if change.has("membership") or change.has("layer_order"):
+		append_history_entry(future, change)
+		restore_membership_or_order(change, false)
 		return
 	if change.has("paint"):
 		append_history_entry(future, change)
@@ -442,7 +468,7 @@ func undo() -> void:
 		active = change.layer
 		selection = ""
 		append_history_entry(future, change)
-		commit({}, [], {"layer": layers[active].id, "remove": {change.append.id: true}, "add": []})
+		commit({}, [], {"layer": layers[active].id, "remove": {change.append.id: true}, "add": [], "undo_append": true})
 		return
 	else:
 		append_history_entry(future, snapshot())
@@ -456,9 +482,22 @@ func redo() -> void:
 		push_history(change)
 		restore_transform(change, true)
 		return
+	if change.has("artwork_groups"):
+		push_history(change)
+		selection = ""
+		apply_artwork_groups(change.artwork_groups, change.next_group, true)
+		return
+	if change.has("layer_flag"):
+		push_history(change)
+		apply_layer_flag(change.layer, change.layer_flag, change.values[1])
+		return
 	if change.has("object_order"):
 		push_history(change)
 		apply_object_order(change.object_order, true)
+		return
+	if change.has("membership") or change.has("layer_order"):
+		push_history(change)
+		restore_membership_or_order(change, true)
 		return
 	if change.has("paint"):
 		push_history(change)
@@ -505,6 +544,9 @@ func select_objects(ids: Array[String]) -> void:
 	if ids.size() > 1: area_selection.assign(ids)
 
 func select_artwork(ids: Array[String], solo_layer_id := "") -> bool:
+	if ids.is_empty():
+		selection = ""
+		return false
 	var picked := {}
 	var groups := {}
 	for id in ids: picked[id] = true
@@ -545,19 +587,34 @@ func grouping_actions(items: Array[Dictionary]) -> Dictionary:
 func group_selected() -> bool:
 	var items := selected_items()
 	if not grouping_actions(items).group: return false
-	checkpoint()
-	var id := uid()
-	for item in items: item.object.artwork_group = id
-	commit()
+	change_artwork_groups(items, uid())
 	return true
 
 func ungroup_selected() -> bool:
 	var items := selected_items()
 	if not grouping_actions(items).ungroup: return false
-	checkpoint()
-	for item in items: item.object.erase("artwork_group")
-	commit()
+	change_artwork_groups(items, "")
 	return true
+
+func change_artwork_groups(items: Array[Dictionary], next_group: String) -> void:
+	var before := {}
+	for item in items: before[item.object.id] = item.object.get("artwork_group", "")
+	push_history({"artwork_groups": before, "next_group": next_group})
+	future.clear()
+	apply_artwork_groups(before, next_group, true)
+
+func apply_artwork_groups(before: Dictionary, next_group: String, forward: bool) -> void:
+	var remaining := before.size()
+	for layer in layers:
+		for object in layer.objects:
+			if not before.has(object.id): continue
+			var group: String = next_group if forward else before[object.id]
+			if group.is_empty(): object.erase("artwork_group")
+			else: object.artwork_group = group
+			remaining -= 1
+			if remaining == 0: break
+		if remaining == 0: break
+	commit({}, [], {"group_ids": before.keys()})
 
 func union_selection_reason(items: Array[Dictionary]) -> String:
 	if items.size() < 2: return "Select at least two vector objects."
@@ -565,15 +622,15 @@ func union_selection_reason(items: Array[Dictionary]) -> String:
 	var ink := Color(first.object.color)
 	for item in items:
 		if item.layer.id != first.layer.id: return "Move the objects to the same layer first."
-		if not VectorUnion.can_union(item.object):
-			return "Union supports solid fills and solid ink. Ungroup artwork before using Union."
+		if not VectorUnion.can_union(item.object, true):
+			return "Merge supports opaque filled shapes and solid ink."
 		if Color(item.object.color) != ink: return "Give the objects the same color before using Union."
 	var layer: Dictionary = first.layer
 	if layer.get("alpha_locked", false): return "Turn off Alpha Lock before using Union."
 	return ""
 
-func union_selected() -> String:
-	var items := selected_items()
+func union_selected(solo_layer_id := "") -> String:
+	var items := layer_transfer_items(solo_layer_id)
 	var reason := union_selection_reason(items)
 	if not reason.is_empty(): return reason
 	var ids := {}
@@ -641,7 +698,7 @@ func replace_layer_span(index: int, start: int, count: int, values: Array, selec
 	swap_layer_span(layer, start, count, values)
 	active = index
 	selection = selected_id
-	commit()
+	commit({}, [], {"layers": [layer.id], "resync": [layer.id]})
 
 func swap_layer_span(layer: Dictionary, start: int, count: int, values: Array) -> void:
 	var objects: Array = layer.objects
@@ -655,7 +712,7 @@ func restore_layer_span(change: Dictionary, forward: bool) -> void:
 	swap_layer_span(layers[index], change.start, previous.size(), values.duplicate(true))
 	active = index
 	selection = ""
-	commit()
+	commit({}, [], {"layers": [change.span], "resync": [change.span]})
 
 func selected_items() -> Array[Dictionary]:
 	var result: Array[Dictionary] = []
@@ -733,6 +790,21 @@ func duplicate_layer(index: int) -> bool:
 	selection = ""
 	commit()
 	return true
+
+func toggle_layer_flag(index: int, flag: String) -> void:
+	if index < 0 or index >= layers.size() or flag not in ["visible", "locked"]: return
+	var layer: Dictionary = layers[index]
+	var previous: bool = layer[flag]
+	push_history({"layer_flag": flag, "layer": layer.id, "values": [previous, not previous]})
+	future.clear()
+	apply_layer_flag(layer.id, flag, not previous)
+
+func apply_layer_flag(layer_id: String, flag: String, value: bool) -> void:
+	var index := layer_index(layer_id)
+	if index < 0: return
+	layers[index][flag] = value
+	selection = ""
+	commit({}, [], {"layer": layer_id, "layer_flag": flag})
 
 func set_layer_opacity(index: int, value: float) -> void:
 	if index < 0 or index >= layers.size() or layers[index].locked: return
@@ -855,20 +927,75 @@ func move_layer(source: int, destination: int) -> void:
 	if source < 0 or source >= layers.size(): return
 	if destination < 0 or destination >= layers.size() or source == destination: return
 	if layers[source].locked: return
-	checkpoint()
-	var active_layer: Dictionary = layers[active]
+	var before := layers.map(func(layer): return layer.id)
+	var active_id: String = layers[active].id
 	var layer: Dictionary = layers.pop_at(source)
 	layers.insert(destination, layer)
-	active = layers.find(active_layer)
-	commit()
+	active = layer_index(active_id)
+	push_history({"layer_order": [before, layers.map(func(entry): return entry.id)], "active_id": active_id})
+	future.clear()
+	commit({}, [], {"layer_order": true})
 
 func delete_selected() -> void:
 	var items := selected_items()
 	if items.is_empty(): return
-	checkpoint()
-	for item in items: item.layer.objects.erase(item.object)
+	var change := {"membership": {}, "adding": false, "active_id": layers[active].id}
+	var selected_by_layer := {}
+	for item in items:
+		var id: String = item.layer.id
+		if not selected_by_layer.has(id): selected_by_layer[id] = {}
+		selected_by_layer[id][item.object.id] = true
+	for id in selected_by_layer:
+		var layer: Dictionary = layers[layer_index(id)]
+		var wanted: Dictionary = selected_by_layer[id]
+		var kept := []
+		var slots := []
+		for index in layer.objects.size():
+			var object: Dictionary = layer.objects[index]
+			if wanted.has(object.id): slots.append({"index": index, "object": object.duplicate(true)})
+			else: kept.append(object)
+		change.membership[id] = slots
+		layer.objects = kept
+	push_history(change)
+	future.clear()
 	selection = ""
-	commit()
+	commit_membership(change)
+
+func restore_membership_or_order(change: Dictionary, forward: bool) -> void:
+	active = layer_index(change.active_id)
+	selection = ""
+	if change.has("layer_order"):
+		var by_id := {}
+		for layer in layers: by_id[layer.id] = layer
+		layers = change.layer_order[int(forward)].map(func(id): return by_id[id])
+		active = layer_index(change.active_id)
+		commit({}, [], {"layer_order": true})
+		return
+	var insert: bool = change.adding == forward
+	for id in change.membership:
+		var layer: Dictionary = layers[layer_index(id)]
+		var slots: Array = change.membership[id]
+		if insert:
+			var restored := []
+			var slot_index := 0
+			for object in layer.objects:
+				while slot_index < slots.size() and slots[slot_index].index == restored.size():
+					restored.append(slots[slot_index].object.duplicate(true))
+					slot_index += 1
+				restored.append(object)
+			while slot_index < slots.size():
+				restored.append(slots[slot_index].object.duplicate(true))
+				slot_index += 1
+			layer.objects = restored
+		else:
+			var ids := {}
+			for slot in slots: ids[slot.object.id] = true
+			layer.objects = layer.objects.filter(func(object): return not ids.has(object.id))
+	commit_membership(change)
+
+func commit_membership(change: Dictionary) -> void:
+	var affected: Array = change.membership.keys()
+	commit({}, [], {"layers": affected, "resync": affected})
 
 func layer_transfer_items(solo_layer_id := "") -> Array[Dictionary]:
 	var items := selected_items()
@@ -962,7 +1089,7 @@ func duplicate_selected() -> void:
 	for item in items:
 		if item.object.kind == "image": projected_images += item.object.image_data.length()
 	if projected_images > MAX_IMAGE_PAYLOAD: return
-	checkpoint()
+	var change := {"membership": {}, "adding": true, "active_id": layers[active].id}
 	var ids: Array[String] = []
 	var groups := {}
 	var artwork_groups := {}
@@ -976,10 +1103,14 @@ func duplicate_selected() -> void:
 			if not groups.has(key): groups[key] = uid()
 			group.id = groups[key]
 		copy.pos = [copy.pos[0] + 24, copy.pos[1] + 24]
+		if not change.membership.has(item.layer.id): change.membership[item.layer.id] = []
+		change.membership[item.layer.id].append({"index": item.layer.objects.size(), "object": copy.duplicate(true)})
 		item.layer.objects.append(copy)
 		ids.append(copy.id)
+	push_history(change)
+	future.clear()
 	select_objects(ids)
-	commit()
+	commit_membership(change)
 
 func remap_artwork_group(object: Dictionary, remap: Dictionary) -> void:
 	if not object.has("artwork_group"): return
@@ -998,6 +1129,7 @@ func resize_canvas(dimensions: Vector2i, mode: ResizeArtwork = ResizeArtwork.KEE
 
 	var old_size := Vector2(width, height)
 	var new_size := Vector2(dimensions)
+	var has_paint := has_pixel_paint()
 	var factor := minf(new_size.x / old_size.x, new_size.y / old_size.y)
 	var center_offset := (new_size - old_size * factor) * 0.5
 	var paint_bounds := {}
@@ -1011,7 +1143,7 @@ func resize_canvas(dimensions: Vector2i, mode: ResizeArtwork = ResizeArtwork.KEE
 			adapted_axis(content.position.x, content.size.x, old_size.x, new_size.x, factor),
 			adapted_axis(content.position.y, content.size.y, old_size.y, new_size.y, factor))
 		center_offset = location.clamp(Vector2.ZERO, (new_size - content.size * factor).max(Vector2.ZERO)) - content.position * factor
-		if factor == 1.0 and has_pixel_paint():
+		if factor == 1.0 and has_paint:
 			# Align to the paint grid while keeping every vector on the same transform.
 			center_offset = center_offset.round()
 	var layout := adapted_layout_offsets(old_size, new_size, factor) if mode == ResizeArtwork.ADAPT else {}
@@ -1046,6 +1178,24 @@ func resize_canvas(dimensions: Vector2i, mode: ResizeArtwork = ResizeArtwork.KEE
 			if object.kind == "image": image_bytes += object.image_data.length()
 		if image_bytes > MAX_IMAGE_PAYLOAD: return ERR_OUT_OF_MEMORY
 		next_layers.append(next)
+	if not has_paint:
+		var transforms := {}
+		for index in layers.size():
+			var layer: Dictionary = layers[index]
+			var resized: Array = next_layers[index].objects
+			var poses := {}
+			for object_index in layer.objects.size():
+				var object: Dictionary = layer.objects[object_index]
+				var next: Dictionary = resized[object_index]
+				if object.pos == next.pos and object.scale == next.scale: continue
+				poses[object.id] = [[object.pos.duplicate(), object.scale, object.get("angle"), object.get("mirrored")],
+					[next.pos.duplicate(), next.scale, next.get("angle"), next.get("mirrored")]]
+			if not poses.is_empty(): transforms[layer.id] = poses
+		var change := {"transform": transforms, "page_sizes": [old_size, new_size], "active_id": layers[active].id}
+		push_history(change)
+		future.clear()
+		restore_transform(change, true)
+		return OK
 	checkpoint()
 	width = float(dimensions.x)
 	height = float(dimensions.y)
@@ -1114,7 +1264,7 @@ func blank(w = 900.0, h = 1100.0, background_visible := true, first_layer := "ve
 	dirty = false
 	changed.emit()
 
-func save_to(path: String) -> Error:
+func encode_for_save() -> PackedByteArray:
 	var save_state := snapshot(false)
 	for layer in layers:
 		if not layer.objects.any(func(object): return object.get("compound_disjoint", false)): continue
@@ -1124,8 +1274,13 @@ func save_to(path: String) -> Error:
 		if not layer.objects.any(Art.has_orientation): continue
 		save_state.version = ORIENTED_OBJECT_VERSION
 		break
-	var encoded := JSON.stringify(save_state)
-	if encoded.to_utf8_buffer().size() > MAX_PROJECT_BYTES: return ERR_OUT_OF_MEMORY
+	return JSON.stringify(save_state, "", false).to_utf8_buffer()
+
+func save_to(path: String) -> Error:
+	return save_encoded_to(path, encode_for_save())
+
+func save_encoded_to(path: String, encoded: PackedByteArray) -> Error:
+	if encoded.size() > MAX_PROJECT_BYTES: return ERR_OUT_OF_MEMORY
 	# Android's Storage Access Framework returns opaque content URIs.
 	# They cannot be renamed or have extensions appended. Keep an internal
 	# staged copy, then write exactly the URI selected by the user.
@@ -1134,7 +1289,7 @@ func save_to(path: String) -> Error:
 		if staged != OK: return staged
 		var external_file = FileAccess.open(path, FileAccess.WRITE)
 		if external_file == null: return FileAccess.get_open_error()
-		external_file.store_string(encoded)
+		external_file.store_buffer(encoded)
 		external_file.flush()
 		var external_result = external_file.get_error()
 		external_file.close()
@@ -1144,11 +1299,11 @@ func save_to(path: String) -> Error:
 	if result == OK: dirty = false
 	return result
 
-func write_project_file(path: String, encoded: String) -> Error:
+func write_project_file(path: String, encoded: PackedByteArray) -> Error:
 	var temporary = path + ".tmp"
 	var file = FileAccess.open(temporary, FileAccess.WRITE)
 	if file == null: return FileAccess.get_open_error()
-	file.store_string(encoded)
+	file.store_buffer(encoded)
 	file.flush()
 	var write_result = file.get_error()
 	file.close()
@@ -1156,21 +1311,27 @@ func write_project_file(path: String, encoded: String) -> Error:
 	return DirAccess.rename_absolute(temporary, path)
 
 func load_from(path: String) -> String:
-	var file = FileAccess.open(path, FileAccess.READ)
-	if file == null: return "Project could not be opened: " + error_string(FileAccess.get_open_error())
-	if file.get_length() > MAX_PROJECT_BYTES: return "Project exceeds the 64 MB beta limit."
-	var contents = file.get_as_text()
-	file.close()
-	var parser = JSON.new()
-	if parser.parse(contents) != OK: return "This is not a valid Havu project."
-	var error = validate(parser.data)
-	if not error.is_empty(): return error
-	restore(parser.data)
+	var result := read_project(path)
+	if result.has("error"): return result.error
+	restore(result.project, false)
 	history.clear()
 	future.clear()
 	dirty = false
 	changed.emit()
 	return ""
+
+static func read_project(path: String) -> Dictionary:
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null: return {"error": "Project could not be opened: " + error_string(FileAccess.get_open_error())}
+	if file.get_length() > MAX_PROJECT_BYTES:
+		file.close()
+		return {"error": "Project exceeds the 64 MB beta limit."}
+	var contents := file.get_as_text()
+	file.close()
+	var parser := JSON.new()
+	if parser.parse(contents) != OK: return {"error": "This is not a valid Havu project."}
+	var error := validate(parser.data)
+	return {"project": parser.data} if error.is_empty() else {"error": error}
 
 static func validate(data) -> String:
 	if not data is Dictionary or data.get("format") != "havu" or (data.get("version") != VERSION and data.get("version") != DISJOINT_COMPOUND_VERSION and data.get("version") != ORIENTED_OBJECT_VERSION):

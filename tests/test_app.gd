@@ -7,6 +7,8 @@ const BrushLibrary = preload("res://scripts/brush_library.gd")
 const PigmentIndex = preload("res://scripts/pigment_index.gd")
 const Sample = preload("res://scripts/sample.gd")
 const Canvas = preload("res://scripts/canvas.gd")
+const IsolatedOpacity = preload("res://scripts/isolated_opacity.gd")
+const PaintTiles = preload("res://scripts/paint_tiles.gd")
 const MyPaintBrush = preload("res://scripts/mypaint_brush.gd")
 var checks = 0
 var failures = 0
@@ -32,6 +34,9 @@ func run() -> void:
 		await overhaul_regressions(app)
 		await transform_regressions(app)
 		await layer_transfer_regressions(app)
+		await layer_editing_regressions(app)
+		await brush_performance_regressions(app)
+		editing_scale_regressions()
 		app.autosave_timer.stop()
 		app.queue_free()
 		await process_frame
@@ -673,7 +678,12 @@ func run() -> void:
 	check(app.project_home.visible and app.project_home.resume_button.visible, "return to Projects offers Resume")
 	check(app.project_home.recent_rows.get_child_count() == 1, "saved project appears in Recent projects")
 	app.project_home.project_requested.emit("user://missing.havu")
-	check(app.project_home.visible and app.document.title == "Unsaved artwork", "failed recent open preserves the session")
+	check(app.project_loading_overlay.visible and app.project_loading_label.text == "Opening project…",
+		"opening a recent project immediately shows the loading indicator")
+	app.project_home.project_requested.emit("user://home-recent.havu")
+	var failed_load: bool = await app.project_load_finished
+	check(not failed_load and not app.project_loading_overlay.visible and app.project_home.visible
+		and app.document.title == "Unsaved artwork", "a failed open dismisses the indicator, preserves the session and ignores a second tap")
 	var legacy_recents: Array = app.recent_projects.duplicate()
 	legacy_recents.append({"path": ProjectSettings.globalize_path("user://home-recent.havu"), "title": "Duplicate bookmark"})
 	app.settings.set_value("projects", "recent", legacy_recents)
@@ -687,10 +697,16 @@ func run() -> void:
 	await process_frame
 	check(app.project_home.visible and app.project_home.recent_rows.get_child_count() == 1, "startup collapses legacy recent entries for the same file")
 	app.project_home.resume_requested.emit()
-	check(app.document.title == "Unsaved artwork" and app.document.dirty and app.file_path == "user://home-recent.havu", "Resume restores edits and the original save destination")
+	check(app.project_loading_overlay.visible and app.project_loading_label.text == "Restoring project…",
+		"resuming a stored session shows the loading indicator")
+	var restored_session: bool = await app.project_load_finished
+	check(restored_session and not app.project_loading_overlay.visible and app.document.title == "Unsaved artwork" and app.document.dirty and app.file_path == "user://home-recent.havu", "Resume restores edits and the original save destination")
 	app.show_project_home()
-	app.project_home.project_requested.emit("user://home-recent.havu")
-	check(not app.project_home.visible and app.document.title != "Unsaved artwork", "recent project opens the explicitly saved version")
+	app.open_dialog.file_selected.emit("user://home-recent.havu")
+	check(app.project_loading_overlay.visible, "the file picker uses the same loading indicator")
+	var opened_saved: bool = await app.project_load_finished
+	check(opened_saved and not app.project_loading_overlay.visible and not app.project_home.visible
+		and app.document.title != "Unsaved artwork", "opening a saved project dismisses the indicator when its canvas is ready")
 	app.show_project_home()
 	var recovery_entry: Dictionary = app.recovered_projects[0]
 	check(recovery_entry.title == "Unsaved artwork" and FileAccess.file_exists(recovery_entry.path)
@@ -698,6 +714,7 @@ func run() -> void:
 		"switching keeps unsaved edits accessible separately from Recent projects")
 	for repeat_index in 3:
 		app.project_home.project_requested.emit(ProjectSettings.globalize_path("user://home-recent.havu"))
+		await app.project_load_finished
 		app.show_project_home()
 	check(app.project_home.recent_rows.get_child_count() == 1 and app.recovered_projects.size() == 1,
 		"reopening the same project never adds another recent or recovery entry")
@@ -705,7 +722,9 @@ func run() -> void:
 		== app.project_path_key("content://provider/document/primary%3aPictures%2fMenu.havu"),
 		"Android tree and document URIs for the same project use one recent key")
 	app.project_home.recovery_menu.id_pressed.emit(0)
-	check(app.document.title == "Unsaved artwork" and app.file_path.is_empty(), "opening an archived recovery uses Save As")
+	var archive_opened: bool = await app.project_load_finished
+	check(archive_opened and not app.project_loading_overlay.visible and app.document.title == "Unsaved artwork"
+		and app.file_path.is_empty(), "opening an archived recovery loads it and uses Save As")
 	app.show_project_home()
 	app.project_home.sample_requested.emit()
 	check(not app.project_home.visible and app.document.title == "The little green café", "editable café sample opens from Projects")
@@ -925,6 +944,12 @@ func run() -> void:
 	var input_accumulation := Input.use_accumulated_input
 	context_canvas.begin(stroke_origin + Vector2(100, 300) * stroke_zoom, 0.25)
 	check(not Input.use_accumulated_input, "freehand stroke receives unmerged input")
+	var flick := Vector2(340, 300)
+	context_canvas.update_stroke(stroke_origin + flick * stroke_zoom, 0.6)
+	check(context_canvas.current.points.size() <= Canvas.INK_SAMPLES_PER_MOTION + 1,
+		"a fast Ink motion bounds the number of interpolated samples")
+	for x in [460, 580, 700, 820]:
+		context_canvas.update_stroke(stroke_origin + Vector2(x, 300) * stroke_zoom, 0.8)
 	var endpoint := Vector2(950, 300)
 	context_canvas.update_stroke(stroke_origin + endpoint * stroke_zoom, 0.95)
 	var live_point: Vector2 = Art.v(context_canvas.current.points[-1])
@@ -932,9 +957,13 @@ func run() -> void:
 	check(live_point.distance_to(endpoint) * physical_per_unit <= 2.01, "stabilization keeps the stroke tail within two physical pixels")
 	check(context_canvas.live_first >= 64 and context_canvas.preview_root.get_child_count() > 1, "long live stroke retains completed batches")
 	var live_edges: Material = context_canvas.preview_root.get_child(0).material
-	context_canvas.finish()
+	var lift := endpoint + Vector2(50, 9)
+	var ink_release := InputEventMouseButton.new()
+	ink_release.button_index = MOUSE_BUTTON_LEFT
+	ink_release.position = stroke_origin + lift * stroke_zoom
+	context_canvas._gui_input(ink_release)
 	var completed_stroke: Dictionary = context_doc.layers[0].objects[0]
-	check(Art.v(completed_stroke.points[-1]).distance_to(endpoint) < 0.01, "lifting the pen finishes at the last received sample")
+	check(Art.v(completed_stroke.points[-1]).distance_to(lift) < 0.01, "lifting the pen captures the final contact position")
 	check(Input.use_accumulated_input == input_accumulation, "finishing restores normal input buffering")
 	var committed_mark: Node2D = context_canvas.retained_marks[completed_stroke.id].mark
 	check(live_edges != null and committed_mark.material == live_edges,
@@ -1100,14 +1129,47 @@ func run() -> void:
 	finger_toggle.button_pressed = true
 	check(not app.canvas.pressure_enabled and app.canvas.touch_paints, "input settings update the canvas")
 	var pen_button_choice: OptionButton = app.input_settings_dialog.find_child("PenSideButton", true, false)
-	check(pen_button_choice.selected == 0, "the pen shortcut is off by default")
+	check(pen_button_choice.selected == 0 and app.pen_button_selector.item_count == 1,
+		"pen shortcuts are off by default and setup starts with one slot")
 	pen_button_choice.item_selected.emit(1)
-	app.select_detected_pen_button(2)
+	var contact_report := [0]
+	var contact_reads := [0]
+	app.pen_detection_contact = func():
+		contact_reads[0] += 1
+		return contact_report[0]
+	app.show_pen_detection_target()
+	await process_frame
+	var pen_probe_target: PanelContainer = app.pen_test_target
+	var pen_probe_dialog: ConfirmationDialog = app.pen_detection_dialog
+	var pen_probe_hover := InputEventMouseMotion.new()
+	pen_probe_hover.position = pen_probe_target.get_global_rect().get_center()
+	pen_probe_dialog.push_input(pen_probe_hover, true)
+	check(pen_probe_dialog.visible and pen_probe_dialog.get_ok_button().disabled and contact_reads[0] == 0,
+		"pen setup waits for a tap on its target and ignores hover")
+	tap_window_control(pen_probe_dialog, pen_probe_target)
+	check(pen_probe_dialog.get_ok_button().disabled and app.pen_test_feedback.text.begins_with("Use the pen"),
+		"finger or mouse input cannot assign a pen button")
+	contact_report[0] = -1
+	tap_window_control(pen_probe_dialog, pen_probe_target)
+	check(pen_probe_dialog.get_ok_button().disabled and app.pen_test_feedback.text.begins_with("Pen tip detected"),
+		"setup distinguishes an unmodified pen tap from a held button")
+	contact_report[0] = 1
+	tap_window_control(pen_probe_dialog, pen_probe_target)
+	check(not pen_probe_dialog.get_ok_button().disabled and app.pen_test_feedback.text == "Android reported Button 1.",
+		"the target shows the button reported during down")
+	tap_window_control(pen_probe_dialog, pen_probe_target)
+	check(pen_probe_dialog.visible and app.detected_pen_slot == 1,
+		"retesting the same reported number uses the same slot")
+	contact_report[0] = 2
+	tap_window_control(pen_probe_dialog, pen_probe_target)
+	tap_window_control(pen_probe_dialog, pen_probe_dialog.get_ok_button())
+	await process_frame
 	pen_button_choice.get_popup().hide()
-	check(app.pen_button_selector.get_selected_id() == 2 and pen_button_choice.selected == 0,
-		"detecting the other rocker end opens its independent assignment")
+	check(not pen_probe_dialog.visible and app.pen_button_selector.get_selected_id() == 2
+		and app.pen_button_selector.item_count == 2 and pen_button_choice.selected == 0,
+		"confirming a distinct reported number opens its own assignment")
 	pen_button_choice.item_selected.emit(2)
-	check(app.canvas.pen_button_tools == {1: "picker", 2: "erase"}, "the two rocker ends can have different shortcuts")
+	check(app.canvas.pen_button_tools == {1: "picker", 2: "erase"}, "distinct reported buttons can have different shortcuts")
 	app.input_settings_dialog.hide()
 	app.autosave_timer.stop()
 	app.queue_free()
@@ -1116,7 +1178,7 @@ func run() -> void:
 	root.add_child(app)
 	await process_frame
 	check(not app.canvas.pressure_enabled and app.canvas.touch_paints, "input settings persist across restart")
-	check(app.canvas.pen_button_tools == {1: "picker", 2: "erase"}, "both pen assignments survive restart")
+	check(app.canvas.pen_button_tools == {1: "picker", 2: "erase"}, "both detected button assignments survive restart")
 
 	var pen_doc := Document.new()
 	pen_doc.blank(240, 200, false)
@@ -1530,6 +1592,7 @@ func run() -> void:
 	await process_frame
 	check(not grip_panel.is_visible_in_tree(), "a queued layout refresh keeps Move group hidden on Projects")
 	app.project_home.resume_requested.emit()
+	if app.project_loading_overlay.visible: await app.project_load_finished
 	await process_frame
 	check(not app.project_home.visible and grip_panel.is_visible_in_tree(), "resuming the workspace restores Move group")
 
@@ -1550,6 +1613,7 @@ func run() -> void:
 	var restored_grip: Control = app.group_grips[app.panel_groups[0].id]
 	check(app.project_home.visible and not restored_grip.is_visible_in_tree(), "restored groups stay hidden on the startup Projects screen")
 	app.project_home.resume_requested.emit()
+	if app.project_loading_overlay.visible: await app.project_load_finished
 	await process_frame
 	check(restored_grip.is_visible_in_tree(), "Move group appears when resuming after restart")
 	var restored_group: Dictionary = app.panel_groups[0]
@@ -1962,6 +2026,7 @@ func run() -> void:
 	await process_frame
 	check(not color_tab.is_visible_in_tree(), "covered-panel grab tabs stay out of Projects")
 	app.project_home.resume_requested.emit()
+	if app.project_loading_overlay.visible: await app.project_load_finished
 	await process_frame
 	check(color_tab.is_visible_in_tree(), "grab tabs return on the canvas")
 	app.set_workspace_option("panel_reveal_tabs", false)
@@ -2336,6 +2401,7 @@ func run() -> void:
 	root.content_scale_size = app.android_content_base(Vector2i(800, 1050))
 	root.size = Vector2i(800, 1050)
 	app.project_home.resume_requested.emit()
+	if app.project_loading_overlay.visible: await app.project_load_finished
 	app.ui_scale_slider.choose_percent(130)
 	app.show_workspace_settings()
 	await process_frame
@@ -2751,17 +2817,17 @@ func run() -> void:
 	solo_doc.commit()
 	var whole_stack: Dictionary = solo_doc.snapshot()
 	app.layer_solo_button.pressed.emit()
-	check(app.canvas.layer_renderers.size() == 1 and app.canvas.layer_renderers.has(upper_layer_id)
+	check(app.canvas.layer_renderers[upper_layer_id].visible and not app.canvas.layer_renderers[first_layer_id].visible
 		and app.layer_solo_button.button_pressed and solo_doc.snapshot() == whole_stack,
 		"Solo isolates the active layer without changing visibility or document history")
 	check(app.canvas.sample_pigment(Vector2(125, 125)).is_equal_approx(Color(solo_doc.paper))
 		and app.export_document("").snapshot() == whole_stack, "Solo affects picking while export retains the full stack")
 	app.select_layer(first_layer_id)
-	check(app.layer_solo_button.button_pressed and app.canvas.layer_renderers.has(first_layer_id)
-		and not app.canvas.layer_renderers.has(upper_layer_id), "Solo follows the selected layer")
+	check(app.layer_solo_button.button_pressed and app.canvas.layer_renderers[first_layer_id].visible
+		and not app.canvas.layer_renderers[upper_layer_id].visible, "Solo follows the selected layer")
 	app.layer_solo_button.pressed.emit()
-	check(app.canvas.solo_layer_id.is_empty() and app.canvas.layer_renderers.has(upper_layer_id)
-		and not app.canvas.layer_renderers.has(hidden_between), "leaving Solo restores the original visibility")
+	check(app.canvas.solo_layer_id.is_empty() and app.canvas.layer_renderers[upper_layer_id].visible
+		and not app.canvas.layer_renderers[hidden_between].visible, "leaving Solo restores the original visibility")
 
 	var mixer: Dictionary = app.builtin_brushes.filter(func(preset): return preset.name == "Color mixer")[0]
 	app.apply_brush(mixer)
@@ -3335,6 +3401,9 @@ func run() -> void:
 	await overhaul_regressions(app)
 	await transform_regressions(app)
 	await layer_transfer_regressions(app)
+	await layer_editing_regressions(app)
+	await brush_performance_regressions(app)
+	editing_scale_regressions()
 
 	print("RESULT: %d checks, %d failures" % [checks, failures])
 	app.autosave_timer.stop()
@@ -3652,11 +3721,13 @@ func layer_transfer_regressions(app) -> void:
 	doc.select_objects(ids)
 	check(not doc.move_selection_to_layer(doc.layers[5].id) and not doc.move_selection_to_layer(doc.layers[4].id)
 		and doc.snapshot() == original, "paint and alpha-locked destinations leave the project untouched")
-	app.show_selection_menu()
+	app.set_workspace_option("contextual_actions", true)
+	app.update_selection_actions()
 	await process_frame
-	check(app.selection_move_button.visible, "selected artwork exposes Move to layer in the selection picker")
-	tap_window_control(app.selection_menu, app.selection_move_button)
-	await process_frame
+	check(app.selection_move_button.is_visible_in_tree() and not app.selection_move_button.disabled
+		and app.selection_move_button.get_parent() == app.selection_actions and app.selection_move_button.get_index() == 2,
+		"Move to layer appears beside Duplicate and Delete in the selection action bar")
+	tap_window_control(root, app.selection_move_button)
 	await process_frame
 	var choices: OptionButton = app.selection_move_targets
 	check(app.selection_move_dialog.visible and choices.item_count == 4 and choices.get_item_metadata(0) == target.id
@@ -3696,6 +3767,525 @@ func layer_transfer_regressions(app) -> void:
 	doc.undo()
 	check(doc.layer_index(created.id) == -1 and doc.layers[0].objects[0].id == ids[0],
 		"one undo removes the newly created layer and returns its objects")
+
+func layer_editing_regressions(app) -> void:
+	var doc: Document = app.document
+	var canvas: Canvas = app.canvas
+	doc.blank(400, 400, false)
+	canvas.set_solo_layer("")
+	var a := test_rect(doc, 50, 50, 55, 60)
+	var b := test_rect(doc, 90, 72, 45, 65)
+	var lower: Dictionary = doc.layers[0]
+	var upper := doc.new_layer("Extra")
+	doc.layers.append(upper)
+	doc.active = 1
+	var c := test_rect(doc, 155, 110, 45, 45)
+	upper.visible = false
+	doc.commit()
+	var mark: Node2D = canvas.retained_marks[a.id].mark
+	check(not canvas.retained_marks.has(c.id), "an initially hidden layer mounts on its first reveal")
+	app.toggle_layer_flag(upper.id, "visible")
+	var victim: Node2D = canvas.retained_marks[c.id].mark
+	var retained_layer: Node2D = canvas.layer_renderers[upper.id]
+	check(retained_layer.visible and is_same(canvas.retained_marks[a.id].mark, mark),
+		"revealing a cold layer mounts it without rebuilding other artwork")
+	app.toggle_layer_flag(upper.id, "visible")
+	check(not retained_layer.visible and is_same(canvas.retained_marks[c.id].mark, victim)
+		and doc.history.back().has("layer_flag"), "hiding keeps the renderer and records only the layer flag")
+	doc.undo()
+	check(retained_layer.visible and is_same(canvas.retained_marks[c.id].mark, victim), "undo shows the layer with its existing renderer")
+	doc.redo()
+	check(not retained_layer.visible, "redo hides the same layer again")
+	app.select_layer(lower.id)
+	check(app.layer_rows[lower.id].get_theme_stylebox("panel") == app.layer_row_styles[1]
+		and app.layer_rows[upper.id].get_theme_stylebox("panel") == app.layer_row_styles[0]
+		and is_same(canvas.retained_marks[a.id].mark, mark), "selecting a layer moves the highlight without rebuilding marks")
+	app.set_tool("select")
+	canvas.fit()
+	var ids: Array[String] = [a.id, b.id]
+	doc.select_objects(ids)
+	doc.group_selected()
+	var stationary := test_rect(doc, 232, 72, 33, 44)
+	doc.commit()
+	doc.select_objects(ids)
+	app.update_selection_actions()
+	check(app.union_button.visible, "a selected vector group exposes Merge vectors")
+	var group: String = a.artwork_group
+	app.union_button.pressed.emit()
+	check(doc.layers[0].objects.size() == 2 and doc.find_object(b.id).kind == "polygon"
+		and not doc.find_object(b.id).has("artwork_group"), "merging a group produces one real editable vector object")
+	doc.undo()
+	check(doc.find_object(a.id).artwork_group == group and doc.find_object(b.id).artwork_group == group,
+		"undo restores the original group and its members")
+	app.keep_selecting_toggle.button_pressed = true
+	check(canvas.keep_selecting, "the selection option enables additive picking")
+	var at := func(point: Vector2) -> Vector2: return canvas.origin + point * canvas.zoom
+	for point in [Vector2(62, 66), Vector2(248, 90), Vector2(385, 365)]:
+		touch_press(canvas, 23, at.call(point))
+		touch_release(canvas, 23, at.call(point))
+	check(doc.area_selection == [a.id, b.id, stationary.id], "separate taps collect a whole group and another object while a miss keeps them")
+	touch_press(canvas, 23, at.call(Vector2(115, 110)))
+	touch_release(canvas, 23, at.call(Vector2(115, 110)))
+	check(doc.selection == stationary.id, "tapping any selected group member again removes the whole group")
+	app.set_tool("select_rect")
+	canvas.begin(at.call(Vector2(45, 45)), 0.8)
+	canvas.update_stroke(at.call(Vector2(141, 143)), 0.8)
+	canvas.finish()
+	check(doc.area_selection == [a.id, b.id, stationary.id] and canvas.selected_area.is_empty(),
+		"a marquee adds to the picked objects without replacing their paint selection")
+	canvas.keep_selecting = false
+	app.set_tool("select")
+	app.merge_on_group_toggle.button_pressed = true
+	doc.select_objects([a.id, b.id, stationary.id])
+	app.change_artwork_group(false)
+	check(app.merge_on_group and doc.layers[0].objects.size() == 1 and doc.layers[0].objects[0].kind == "polygon",
+		"Group & merge turns compatible grouped and separate artwork into one vector")
+	doc.undo()
+	var restored_stationary := doc.find_object(stationary.id)
+	doc.recolor_shape(0, restored_stationary, "#ad5539")
+	doc.select_objects([a.id, b.id, stationary.id])
+	app.change_artwork_group(false)
+	check(doc.layers[0].objects.size() == 3 and doc.find_object(a.id).artwork_group == restored_stationary.artwork_group
+		and app.toast_label.text.contains("same color"), "Group & merge keeps differing colors as grouped editable objects")
+	app.merge_on_group = false
+
+func brush_performance_regressions(app) -> void:
+	var doc := Document.new()
+	doc.blank(640, 480, false)
+	for index in 90:
+		var background := stroke()
+		background.brush = "soft"
+		background.pos = [index % 10 * 46, index / 10 * 32]
+		doc.add(background)
+	var shape_layer := doc.new_layer("Stroke and shape")
+	doc.layers.append(shape_layer)
+	doc.active = 1
+	var shape := test_rect(doc, 135, 105, 120, 90)
+	var cover_layer := doc.new_layer("Overlay")
+	cover_layer.opacity = 0.5
+	doc.layers.append(cover_layer)
+	doc.active = 2
+	test_rect(doc, 110, 90, 180, 130, "#ffffff")
+	doc.active = 1
+	var canvas := Canvas.new()
+	canvas.document = doc
+	canvas.cache_completed_paint = true
+	canvas.size = Vector2(640, 480)
+	root.add_child(canvas)
+	var surface = canvas.paint_cache
+	surface.finish_cache_frame()
+	var static_mark: Node2D = canvas.retained_marks[shape.id].mark
+	var wet := stroke("#8199ad")
+	wet.brush = "soft"
+	wet.pos = [116, 109]
+	wet.opacity = 0.64
+	var sample_point := Vector2(141, 121)
+	var before := canvas.sample_pigment(sample_point)
+	doc.append_vector_object(wet)
+	var reference := PigmentIndex.new()
+	reference.rebuild(doc)
+	check(canvas.paint_cache == surface and not surface.rebuild_pending
+		and canvas.retained_marks[shape.id].mark == static_mark,
+		"committing a stroke on another layer keeps the cached background intact")
+	check(not canvas.pigment_dirty and canvas.sample_pigment(sample_point).is_equal_approx(reference.sample(sample_point)),
+		"incremental pigment indexing preserves composition under translucent upper layers")
+	doc.undo()
+	check(not canvas.pigment_dirty and canvas.sample_pigment(sample_point).is_equal_approx(before)
+		and not canvas.retained_marks.has(wet.id), "brush undo removes only its renderer and pigment entry")
+	doc.redo()
+	var restored := doc.find_object(wet.id)
+	check(restored == wet and canvas.sample_pigment(sample_point).is_equal_approx(reference.sample(sample_point)),
+		"brush redo preserves the stroke and restores its place in the pigment stack")
+	doc.select_objects([shape.id, wet.id])
+	var wet_mark: Node2D = canvas.retained_marks[wet.id].mark
+	check(not doc.union_selection_reason(doc.selected_items()).is_empty()
+		and doc.group_selected() and shape.artwork_group == restored.artwork_group
+		and canvas.retained_marks[wet.id].mark == wet_mark,
+		"mixed watercolor strokes and shapes group without merging or rebuilding their renderers")
+	doc.select_artwork([wet.id])
+	check(doc.area_selection.size() == 2 and doc.area_selection.has(shape.id),
+		"picking a stroke selects both members of its mixed group")
+	doc.undo()
+	check(not restored.has("artwork_group") and not shape.has("artwork_group"),
+		"one undo restores independent stroke and shape editing")
+	doc.redo()
+	check(restored.artwork_group == shape.artwork_group and canvas.retained_marks[wet.id].mark == wet_mark,
+		"redo restores mixed grouping without changing the brush geometry")
+	doc.select_artwork([wet.id])
+	var original_position: Vector2 = Art.v(restored.pos)
+	var points: Array = restored.points.duplicate(true)
+	check(canvas.turn_selection(PI / 2.0) and not Art.v(restored.pos).is_equal_approx(original_position)
+		and restored.points == points and canvas.retained_marks[wet.id].mark == wet_mark,
+		"rotating a mixed group moves both objects without rebuilding or copying stroke geometry")
+	doc.undo()
+	check(Art.v(restored.pos).is_equal_approx(original_position) and restored.points == points,
+		"undo restores the grouped stroke transform exactly")
+	canvas.free()
+	var called := [false]
+	var operation := func() -> bool:
+		called[0] = true
+		return app.project_loading_overlay.visible
+	var outcome = await app.run_indicated_operation("brush_regression_slow", "Working…", 101, 100, operation)
+	check(called[0] and outcome == true and not app.project_loading_overlay.visible,
+		"an expensive operation presents feedback before work and clears it afterwards")
+	outcome = await app.run_indicated_operation("brush_regression_fast", "Working…", 1, 100, operation)
+	check(outcome == false, "small operations complete without covering the canvas")
+	recent_stroke_cache_regression()
+	secondary_stroke_cache_regression()
+	translucent_background_cache_regression()
+	var tile_writer := PaintTiles.new()
+	tile_writer.prepare_layer({"objects": []}, Vector2i(32, 32))
+	var footprint := PackedVector2Array([
+		Vector2(-3, 3.5), Vector2(26, 3.5), Vector2(25, 27.5), Vector2(17, 27.5),
+		Vector2(16, 11.5), Vector2(7, 11.5), Vector2(6, 29.5), Vector2(-3, 29.5)])
+	tile_writer.paint_polygon(footprint, Color(0.4, 0.6, 0.8, 0.5))
+	var actual: Image = tile_writer.changed[Vector2i.ZERO]
+	var differences := 0
+	for y in 32:
+		for x in 32:
+			var sample := Vector2(x + 0.5, y + 0.5)
+			var inside := false
+			var previous := footprint[-1]
+			for point in footprint:
+				if (previous.y > sample.y) != (point.y > sample.y):
+					var crossing := lerpf(previous.x, point.x, (sample.y - previous.y) / (point.y - previous.y))
+					if sample.x < crossing: inside = not inside
+				previous = point
+			if absf(actual.get_pixel(x, y).a - (0.5 if inside else 0.0)) > 0.01: differences += 1
+	check(differences == 0, "raster scanlines match half-pixel coverage at clipped and concave edges")
+	if DisplayServer.get_name() != "headless":
+		await wet_rendering_regression()
+		await recent_cache_rendering_regression()
+		await translucent_background_rendering_regression()
+
+func translucent_cache_fixture() -> Document:
+	var doc := Document.new()
+	doc.blank(400, 240, false)
+	doc.layers[0].opacity = 0.55
+	for index in 90:
+		var brushwork := stroke()
+		brushwork.brush = "soft"
+		brushwork.pos = [index % 15 * 14, 160 + index / 15 * 20]
+		doc.add(brushwork)
+	test_rect(doc, 20, 20, 100, 100, "#2b7161")
+	test_rect(doc, 60, 35, 90, 100, "#d58847").opacity = 0.75
+	doc.layers.append(doc.new_layer("Ink above background"))
+	doc.active = 1
+	var accent := test_rect(doc, 80, 60, 80, 50, "#384eab")
+	accent.opacity = 0.35
+	return doc
+
+func translucent_background_cache_regression() -> void:
+	var doc := translucent_cache_fixture()
+	var layer: Dictionary = doc.layers[0]
+	var canvas := Canvas.new()
+	canvas.document = doc
+	canvas.size = Vector2(400, 240)
+	canvas.zoom = 1.0
+	canvas.cache_completed_paint = true
+	canvas.cache_extra_layers = true
+	root.add_child(canvas)
+	var background: IsolatedOpacity = canvas.layer_renderers[layer.id]
+	check(background.cache_finished_marks and is_equal_approx(background.opacity, 0.55),
+		"a heavy translucent background gets a cache with layer opacity applied once")
+	background.finish_cache_frame()
+	var old_offset := background.artwork.position
+	canvas.pan_by(Vector2(20, 10))
+	canvas.zoom_at(1.05, Vector2(180, 100))
+	check(background.document_bounds.has_area() and background.artwork.position == old_offset
+		and not background.rebuild_pending and background.live_move == null,
+		"panning and normal zoom reuse the cached translucent artwork in document coordinates")
+	canvas.begin(canvas.origin + Vector2(22, 45) * canvas.zoom, 0.7)
+	canvas.update_stroke(canvas.origin + Vector2(140, 45) * canvas.zoom, 0.6)
+	canvas.finish()
+	check(canvas.layer_renderers[layer.id] == background and not background.rebuild_pending,
+		"fast inking above a translucent background leaves its cached pixels undisturbed")
+	var dense := stroke()
+	dense.points = []
+	for index in Canvas.PAINT_CACHE_THRESHOLD:
+		dense.points.append([15.0 + index * 0.25, 80.0, 0.5, "#226451"])
+	var ink_layer_id: String = doc.layers[1].id
+	var ink_holder: Node2D = canvas.layer_renderers[ink_layer_id]
+	doc.append_vector_object(dense)
+	check(canvas.layer_renderers[ink_layer_id] == ink_holder and not canvas.is_artwork_cache(ink_holder)
+		and not background.rebuild_pending, "crossing the cache threshold does not rebuild artwork during pen lift")
+	doc.undo()
+	doc.active = 0
+	canvas.begin(canvas.origin + Vector2(30, 35) * canvas.zoom, 0.7)
+	check(canvas.layer_renderers[layer.id] == background and background.preview_group is CanvasGroup
+		and canvas.preview_root.get_parent() == background.preview_group
+		and is_equal_approx(background.preview_group.self_modulate.a, 0.55),
+		"painting directly on the translucent layer retains its cached artwork and groups the preview")
+	canvas.finish()
+	doc.active = 1
+	canvas.refresh_background_cache(layer.id)
+	check(canvas.layer_renderers[layer.id] == background and background.preview_group == null,
+		"leaving the edited translucent layer keeps its cache and releases the live group")
+	canvas.free()
+
+func translucent_background_rendering_regression() -> void:
+	var viewport := SubViewport.new()
+	viewport.size = Vector2i(800, 240)
+	viewport.transparent_bg = true
+	viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	root.add_child(viewport)
+	var canvases: Array[Canvas] = []
+	for index in 2:
+		var canvas := Canvas.new()
+		canvas.document = translucent_cache_fixture()
+		canvas.size = Vector2(400, 240)
+		canvas.position.x = index * 400
+		canvas.zoom = 1.0
+		canvas.cache_completed_paint = index == 1
+		viewport.add_child(canvas)
+		canvases.append(canvas)
+	await RenderingServer.frame_post_draw
+	await RenderingServer.frame_post_draw
+	var image := viewport.get_texture().get_image()
+	var matched := true
+	for sample in [Vector2i(36, 40), Vector2i(72, 58), Vector2i(94, 80), Vector2i(131, 84), Vector2i(155, 95)]:
+		var live := image.get_pixelv(sample)
+		var cached := image.get_pixelv(sample + Vector2i(400, 0))
+		if absf(live.a - cached.a) > 0.02 or Vector3(live.r, live.g, live.b).distance_to(Vector3(cached.r, cached.g, cached.b)) > 0.035:
+			matched = false
+	check(matched, "cached and live translucent layers composite the same colors where their marks overlap")
+	for canvas in canvases:
+		canvas.document.active = 0
+		canvas.brush_size = 24.0
+		canvas.begin(Vector2(42, 50), 0.85)
+		canvas.update_stroke(Vector2(122, 50), 0.85)
+	await RenderingServer.frame_post_draw
+	await RenderingServer.frame_post_draw
+	image = viewport.get_texture().get_image()
+	var live := image.get_pixel(85, 50)
+	var cached := image.get_pixel(485, 50)
+	check(absf(live.a - cached.a) < 0.02 and Vector3(live.r, live.g, live.b).distance_to(Vector3(cached.r, cached.g, cached.b)) < 0.035,
+		"live ink on a cached translucent layer composites with the same color and opacity")
+	viewport.queue_free()
+
+func recent_cache_rendering_regression() -> void:
+	var viewport := SubViewport.new()
+	viewport.size = Vector2i(320, 120)
+	viewport.transparent_bg = true
+	viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	root.add_child(viewport)
+	var surfaces: Array[IsolatedOpacity] = []
+	for index in 2:
+		var layer := IsolatedOpacity.new()
+		layer.cache_finished_marks = true
+		layer.keep_recent_marks = index == 1
+		layer.position.x = index * 160
+		viewport.add_child(layer)
+		layer.update_view(Vector2(160, 120), Vector2.ZERO, 1.0, 1.0)
+		surfaces.append(layer)
+		var base := Node2D.new()
+		base.draw.connect(base.draw_rect.bind(Rect2(10, 12, 80, 80), Color(0.19, 0.51, 0.35, 0.55)))
+		layer.artwork.add_child(base)
+	await RenderingServer.frame_post_draw
+	var overlay: Array[Node2D] = []
+	for layer in surfaces:
+		var mark := Node2D.new()
+		mark.draw.connect(mark.draw_rect.bind(Rect2(51, 26, 75, 48), Color(0.88, 0.32, 0.18, 0.48)))
+		layer.artwork.add_child(mark)
+		layer.append_mark(mark)
+		overlay.append(mark)
+	await RenderingServer.frame_post_draw
+	await RenderingServer.frame_post_draw
+	var both := viewport.get_texture().get_image()
+	var expected := both.get_pixel(65, 55)
+	var recent := both.get_pixel(225, 55)
+	check(expected.a > 0.7 and absf(expected.a - recent.a) <= 0.01 \
+		and Vector3(expected.r, expected.g, expected.b).distance_to(Vector3(recent.r, recent.g, recent.b)) < 0.025,
+		"the recent-stroke surface preserves translucent overlap over cached artwork")
+	surfaces[1].recent.artwork.remove_child(overlay[1])
+	overlay[1].queue_free()
+	surfaces[1].invalidate_recent()
+	await RenderingServer.frame_post_draw
+	await RenderingServer.frame_post_draw
+	var undone := viewport.get_texture().get_image()
+	check(not surfaces[1].rebuild_pending and absf(undone.get_pixel(225, 55).a - undone.get_pixel(20, 20).a) < 0.01
+		and undone.get_pixel(270, 55).a <= 0.01, "recent-stroke undo restores older pixels and clears the full removed mark")
+	viewport.queue_free()
+
+func recent_stroke_cache_regression() -> void:
+	var doc := Document.new()
+	doc.blank(640, 480, false)
+	for index in 90:
+		var brushwork := stroke()
+		brushwork.brush = "soft"
+		brushwork.pos = [index % 20 * 20, index / 20 * 25]
+		doc.add(brushwork)
+	var canvas := Canvas.new()
+	canvas.document = doc
+	canvas.size = Vector2(640, 480)
+	canvas.cache_completed_paint = true
+	canvas.cache_recent_strokes = true
+	canvas.zoom = 1.0
+	root.add_child(canvas)
+	var base = canvas.paint_cache
+	base.finish_cache_frame()
+	var first := stroke()
+	var second := stroke("#aa5544")
+	doc.append_vector_object(first)
+	doc.append_vector_object(second)
+	var first_mark: Node2D = canvas.retained_marks[first.id].mark
+	var second_mark: Node2D = canvas.retained_marks[second.id].mark
+	check(base.is_recent_mark(first_mark) and base.is_recent_mark(second_mark) and not base.rebuild_pending,
+		"recent strokes accumulate separately from a finished tablet layer")
+	base.recent.finish_cache_frame()
+	doc.undo()
+	check(not base.rebuild_pending and base.recent.rebuild_pending and not canvas.retained_marks.has(second.id),
+		"recent stroke undo redraws its short cache without replaying the finished layer")
+	doc.redo()
+	base.flush_recent()
+	check(not base.recent.visible and base.artwork.get_child_count() == 92
+		and base.artwork.get_child(90) == first_mark and base.artwork.get_child(91) == canvas.retained_marks[second.id].mark,
+		"consolidating recent strokes preserves the original source-over drawing order")
+	canvas.free()
+
+func secondary_stroke_cache_regression() -> void:
+	var doc := Document.new()
+	doc.blank(640, 480, false)
+	doc.layers.append(doc.new_layer("Upper ink"))
+	for index in 2:
+		doc.active = index
+		for mark_index in 90:
+			var brushwork := stroke()
+			brushwork.brush = "soft"
+			brushwork.pos = [mark_index % 20 * 20, mark_index / 20 * 25]
+			doc.add(brushwork)
+	var canvas := Canvas.new()
+	canvas.document = doc
+	canvas.size = Vector2(640, 480)
+	canvas.zoom = 1.0
+	canvas.cache_completed_paint = true
+	canvas.cache_extra_layers = true
+	root.add_child(canvas)
+	var primary: IsolatedOpacity = canvas.paint_cache
+	var secondary: IsolatedOpacity = canvas.layer_renderers[doc.layers[1].id]
+	check(primary != secondary and secondary.cache_finished_marks and not secondary.allow_overview,
+		"two heavy layers can reuse separate screen caches within the tablet pixel budget")
+	primary.finish_cache_frame()
+	secondary.finish_cache_frame()
+	canvas.begin(canvas.origin + Vector2(120, 200) * canvas.zoom, 0.5)
+	check(canvas.preview_root.get_parent() == secondary, "Ink preview stays live above its own secondary layer cache")
+	canvas.finish()
+	var appended: Dictionary = doc.layers[1].objects.back()
+	check(secondary.pending_marks == [canvas.retained_marks[appended.id].mark] and not primary.rebuild_pending,
+		"committing Ink to a secondary cache leaves the primary layer untouched")
+	secondary.finish_cache_frame()
+	doc.undo()
+	check(secondary.rebuild_pending and not primary.rebuild_pending and not canvas.retained_marks.has(appended.id),
+		"undo invalidates the secondary cache without replaying other layers")
+	canvas.pan_by(Vector2(25, 10))
+	check(secondary.live_move != null and canvas.navigation_caches.has(secondary),
+		"panning temporarily displays live secondary artwork instead of rebaking all caches per frame")
+	canvas.finish_cache_navigation()
+	check(secondary.live_move == null and secondary.artwork.get_child_count() == 90,
+		"resuming the secondary cache keeps artwork and drawing order intact")
+	canvas.free()
+
+func editing_scale_regressions() -> void:
+	var doc := Document.new()
+	doc.blank(1400, 1200, false)
+	for index in 180:
+		test_rect(doc, 410 + (index % 20) * 26, 410 + (index / 20) * 32, 20, 20)
+	var under := test_rect(doc, 91, 96, 18, 22)
+	var over := test_rect(doc, 94, 96, 18, 22, "#aa4455")
+	var lower_id: String = doc.layers[0].id
+	doc.layers.append(doc.new_layer("Cover"))
+	doc.active = 1
+	var cover := test_rect(doc, 81, 89, 65, 60, "#ffffff")
+	cover.opacity = 0.4
+	doc.active = 0
+	var canvas := Canvas.new()
+	canvas.document = doc
+	canvas.size = Vector2(720, 540)
+	root.add_child(canvas)
+	canvas.zoom = 1.0
+	check(canvas.hit(Vector2(97, 102), true).id == over.id
+		and canvas.pick_grids.has(lower_id), "large-layer hit testing crosses grid cells and keeps topmost order within the active layer")
+	canvas.select_across_layers = true
+	check(canvas.hit(Vector2(97, 102), true).id == cover.id, "an explicit cross-layer pick keeps layer stacking order")
+	doc.layers[1].locked = true
+	check(canvas.hit(Vector2(97, 102), true).id == over.id, "a locked covering layer cannot intercept grid picks")
+	canvas.select_across_layers = false
+	var original_mark: Node2D = canvas.retained_marks[under.id].mark
+	var cover_mark: Node2D = canvas.retained_marks[cover.id].mark
+	doc.select_objects([over.id])
+	doc.delete_selected()
+	check(canvas.hit(Vector2(97, 102), true).id == under.id and not canvas.retained_marks.has(over.id)
+		and canvas.retained_marks[under.id].mark == original_mark
+		and canvas.retained_marks[cover.id].mark == cover_mark,
+		"deleting from a dense layer updates its index and leaves other renderers mounted")
+	doc.undo()
+	check(canvas.hit(Vector2(97, 102), true).id == over.id and doc.layers[0].objects.back().id == over.id,
+		"membership undo restores exact drawing order and invalidates the old grid")
+	doc.select_objects([over.id])
+	doc.duplicate_selected()
+	var duplicate_id: String = doc.selection
+	check(canvas.hit(Vector2(126, 130), true).id == duplicate_id, "the spatial index picks newly duplicated artwork")
+	doc.undo()
+	check(canvas.hit(Vector2(126, 130), true).is_empty() and not canvas.retained_marks.has(duplicate_id),
+		"undoing duplication removes the duplicate from both the canvas and the index")
+	doc.redo()
+	check(canvas.hit(Vector2(126, 130), true).id == duplicate_id, "redo restores the same duplicate ID")
+	doc.select_objects([under.id])
+	canvas.turn_selection(0.0, 1)
+	doc.move_layer(0, 1)
+	check(doc.active == 1 and canvas.layer_renderers[lower_id].get_index() == 1
+		and canvas.retained_marks[under.id].mark == original_mark,
+		"reordering a layer changes compositing without recreating its artwork")
+	doc.undo()
+	check(doc.active == 0 and canvas.layer_renderers[lower_id].get_index() == 0
+		and canvas.retained_marks[cover.id].mark == cover_mark, "undo restores layer order and keeps the active layer identity")
+	var before_resize := doc.snapshot()
+	check(doc.resize_canvas(Vector2i(700, 600), Document.ResizeArtwork.FIT) == OK
+		and canvas.last_page_size == Vector2(700, 600) and canvas.retained_marks[under.id].mark == original_mark,
+		"vector canvas resize updates the viewport and poses while retaining brush and shape renderers")
+	doc.active = 1
+	doc.undo()
+	check(doc.snapshot() == before_resize and canvas.last_page_size == Vector2(1400, 1200)
+		and canvas.retained_marks[cover.id].mark == cover_mark,
+		"vector resize undo restores exact dimensions and poses without rebuilding artwork")
+	canvas.free()
+
+func wet_rendering_regression() -> void:
+	var viewport := SubViewport.new()
+	viewport.size = Vector2i(512, 144)
+	viewport.transparent_bg = true
+	viewport.render_target_update_mode = SubViewport.UPDATE_ONCE
+	root.add_child(viewport)
+	var wet := stroke("#436b9a")
+	wet.brush = "soft"
+	wet.opacity = 0.52
+	wet.points.clear()
+	for index in 70:
+		wet.points.append([16.0 + index * 2.8, 70.0 + sin(index * 0.31) * 23.0,
+			0.35 + 0.5 * absf(sin(index * 0.17)), "#436b9a"])
+	for index in 2:
+		var node := Node2D.new()
+		node.position.x = index * 256
+		Art.use_screen_edges(node, wet)
+		if index == 1: node.set_meta(Art.WET_MESH_SAMPLES, wet.points.size())
+		node.draw.connect(Art.draw_object.bind(node, wet, Vector2.ZERO, 1.0, true))
+		viewport.add_child(node)
+	await RenderingServer.frame_post_draw
+	var image := viewport.get_texture().get_image()
+	var painted := 0
+	var mismatched := 0
+	for y in 144:
+		for x in 256:
+			var original := image.get_pixel(x, y)
+			var retained := image.get_pixel(x + 256, y)
+			if original.a > 0.01: painted += 1
+			if absf(original.a - retained.a) > 0.035 \
+					or (original.a > 0.1 and Vector3(original.r, original.g, original.b)
+						.distance_to(Vector3(retained.r, retained.g, retained.b)) > 0.06):
+				mismatched += 1
+	check(painted > 400 and mismatched < painted * 0.02,
+		"retained wet meshes reproduce the original feathering and pigment (%d changed pixels)" % mismatched)
+	viewport.queue_free()
 
 func tap_window_control(window: Window, control: Control) -> void:
 	var touch := InputEventScreenTouch.new()

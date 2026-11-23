@@ -242,21 +242,26 @@ func paint_polygon(polygon: PackedVector2Array, color: Color) -> void:
 	var bounds := Art.polygon_bounds(polygon)
 	var first_y := maxi(0, floori(bounds.position.y))
 	var stop_y := mini(page_size.y, ceili(bounds.end.y))
-	var crossings := PackedFloat32Array()
-	scanline.fill(color)
-	for y in range(first_y, stop_y):
-		var row := float(y) + 0.5
-		crossings.clear()
-		var previous := polygon[-1]
-		for point in polygon:
-			if (previous.y > row) != (point.y > row):
-				crossings.append(lerpf(previous.x, point.x, (row - previous.y) / (point.y - previous.y)))
-			previous = point
+	if first_y >= stop_y: return
+	var rows: Array[Array] = []
+	for index in range(stop_y - first_y): rows.append([])
+	var previous := polygon[-1]
+	# Visit each edge only on rows that cross it. The same half-pixel rule
+	# governs horizontal edges and coincident vertices as in span filling.
+	for point in polygon:
+		var from_y := maxi(first_y, ceili(minf(previous.y, point.y) - 0.5))
+		var to_y := mini(stop_y, ceili(maxf(previous.y, point.y) - 0.5))
+		for y in range(from_y, to_y):
+			rows[y - first_y].append(lerpf(previous.x, point.x, (float(y) + 0.5 - previous.y) / (point.y - previous.y)))
+		previous = point
+	if not erasing and not alpha_locked and color.a < 1.0: scanline.fill(color)
+	for index_y in rows.size():
+		var crossings: Array = rows[index_y]
 		crossings.sort()
 		for index in range(0, crossings.size() - 1, 2):
 			var start := maxi(0, ceili(crossings[index] - 0.5))
 			var stop := mini(page_size.x, ceili(crossings[index + 1] - 0.5))
-			paint_span(y, start, stop, color)
+			paint_span(first_y + index_y, start, stop, color)
 
 func paint_span(y: int, start: int, stop: int, ink: Color) -> void:
 	var x := start

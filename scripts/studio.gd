@@ -1,4 +1,6 @@
 extends Control
+
+signal project_load_finished(success: bool)
 const PngExport = preload("res://scripts/png_export.gd")
 const Raster = preload("res://scripts/raster_asset.gd")
 const Document = preload("res://scripts/document.gd")
@@ -46,6 +48,8 @@ var tool_buttons = {}
 var layer_list: VBoxContainer
 var layer_scroll
 var layer_rows := {}
+var highlighted_layer_id := ""
+var layer_rows_solo_id := ""
 var layer_icons := {}
 var layer_row_styles: Array[StyleBoxFlat] = []
 var layer_preview_refresh_queued := false
@@ -78,6 +82,9 @@ var selection_menu: PopupPanel
 var shape_icons: Array[Button] = []
 var selection_icons: Array[Button] = []
 var select_across_toggle: CheckButton
+var keep_selecting_toggle: CheckButton
+var merge_on_group_toggle: CheckButton
+var merge_on_group := false
 var selection_move_button: Button
 var selection_move_dialog: ConfirmationDialog
 var selection_move_targets: OptionButton
@@ -216,9 +223,11 @@ const PEN_BUTTON_TOOLS := ["", "picker", "erase", "hand"]
 var pen_bridge
 var pen_button_selector: OptionButton
 var pen_action_selector: OptionButton
-var pen_detect_button: Button
-var pen_detection_timer: Timer
-var pen_detection_deadline := 0
+var pen_detection_dialog: ConfirmationDialog
+var pen_test_target: PanelContainer
+var pen_test_feedback: Label
+var pen_detection_contact := Callable()
+var detected_pen_slot := 0
 var ui_scale_percent := 100
 var ui_scale_slider: Control
 var ui_scale_label: Label
@@ -287,6 +296,10 @@ var new_swap: Button
 var new_dimensions_note: Label
 var rebuilding = false
 var project_home
+var project_loading_overlay: ColorRect
+var project_loading_label: Label
+const BUSY_FEEDBACK_MS := 120.0
+var operation_time_per_unit := {}
 var session_active = false
 var recovered_revision := -1
 var recent_projects: Array = []
@@ -349,6 +362,7 @@ func _ready() -> void:
 	autosave_timer.start()
 	get_tree().auto_accept_quit = false
 	build_project_home()
+	build_project_loading()
 	show_project_home()
 	if not "--test" in OS.get_cmdline_user_args(): show_splash()
 	canvas.fit.call_deferred()
@@ -469,6 +483,7 @@ func build_workspace() -> void:
 	add_child(canvas)
 	canvas.set_ui_scale(ui_scale_percent / 100.0)
 	canvas.status.connect(notify)
+	canvas.fill_requested.connect(apply_canvas_fill)
 	canvas.selected.connect(on_selected)
 	canvas.color_used.connect(remember_color)
 	canvas.view_changed.connect(update_zoom_readout)
@@ -525,8 +540,8 @@ func build_workspace() -> void:
 	undo_button = UndoButton.new()
 	undo_button.text = "↶"
 	undo_button.tooltip_text = shortcut_hint("Undo · Hold to repeat", "Ctrl+Z")
-	undo_button.pressed.connect(func(): canvas.cancel(); document.undo())
-	redo_button = button("↷", func(): canvas.cancel(); document.redo(), shortcut_hint("Redo", "Ctrl+Shift+Z"))
+	undo_button.pressed.connect(apply_history_step.bind(false))
+	redo_button = button("↷", apply_history_step.bind(true), shortcut_hint("Redo", "Ctrl+Shift+Z"))
 	bar.add_child(undo_button)
 	bar.add_child(redo_button)
 	bar.add_child(VSeparator.new())
@@ -2248,25 +2263,34 @@ func build_selection_menu() -> void:
 	select_across_toggle.custom_minimum_size.y = 44
 	select_across_toggle.toggled.connect(func(enabled):
 		canvas.select_across_layers = enabled
-		canvas.clear_selection()
-		update_selection_move_button())
+		canvas.clear_selection())
 	content.add_child(select_across_toggle)
-	selection_move_button = button("Move to layer…", func():
-		selection_menu.hide()
-		show_selection_move.call_deferred(), "Move selected artwork to another layer")
-	selection_move_button.custom_minimum_size.y = 44
-	content.add_child(selection_move_button)
-	build_selection_move_dialog()
+	keep_selecting_toggle = CheckButton.new()
+	keep_selecting_toggle.text = "Keep selecting"
+	keep_selecting_toggle.tooltip_text = "Tap to add or remove objects and groups"
+	keep_selecting_toggle.custom_minimum_size.y = 44
+	keep_selecting_toggle.toggled.connect(func(enabled):
+		canvas.keep_selecting = enabled
+		if enabled: status_label.text = "Tap objects or groups to add or remove them."
+		else: status_label.text = "Drag the selection to move it."
+		canvas.refresh_selection())
+	content.add_child(keep_selecting_toggle)
+	merge_on_group_toggle = CheckButton.new()
+	merge_on_group_toggle.text = "Merge vectors on grouping"
+	merge_on_group_toggle.tooltip_text = "When possible, Group joins the selection into one vector shape"
+	merge_on_group_toggle.custom_minimum_size.y = 44
+	merge_on_group_toggle.toggled.connect(func(enabled):
+		merge_on_group = enabled
+		update_selection_actions())
+	content.add_child(merge_on_group_toggle)
 	PopupTouch.watch_launcher(tool_buttons.select)
 
 func show_selection_menu() -> void:
 	tool_buttons.select.set_pressed_no_signal(canvas.tool == "select" or canvas.tool in Canvas.AREA_TOOLS)
 	select_across_toggle.set_pressed_no_signal(canvas.select_across_layers)
-	update_selection_move_button()
+	keep_selecting_toggle.set_pressed_no_signal(canvas.keep_selecting)
+	merge_on_group_toggle.set_pressed_no_signal(merge_on_group)
 	show_tool_picker(selection_menu, tool_buttons.select, selection_icons)
-
-func update_selection_move_button() -> void:
-	selection_move_button.visible = not document.layer_transfer_items(canvas.solo_layer_id).is_empty()
 
 func build_selection_move_dialog() -> void:
 	selection_move_dialog = ConfirmationDialog.new()
@@ -2288,7 +2312,9 @@ func build_selection_move_dialog() -> void:
 func show_selection_move() -> void:
 	canvas.finish()
 	var items: Array[Dictionary] = document.layer_transfer_items(canvas.solo_layer_id)
-	if items.is_empty(): return
+	if items.is_empty():
+		notify("Select editable artwork to move it to a layer.")
+		return
 	selection_move_targets.clear()
 	for index in range(document.layers.size() - 1, -1, -1):
 		var layer: Dictionary = document.layers[index]
@@ -2471,13 +2497,16 @@ func build_selection_tray() -> void:
 	selection_tray.add_child(selection_actions)
 	selection_actions.add_child(button("Duplicate", document.duplicate_selected, shortcut_hint("Duplicate selection", "Ctrl+D")))
 	selection_actions.add_child(button("Delete", document.delete_selected, "Delete selection"))
+	selection_move_button = button("Move to layer…", show_selection_move, "Move selected artwork to another layer")
+	selection_actions.add_child(selection_move_button)
+	build_selection_move_dialog()
 	for action in selection_actions.get_children():
 		action.custom_minimum_size = Vector2(92, 44)
 	group_artwork_button = button("Group", change_artwork_group.bind(false), shortcut_hint("Group selected vectors", "Ctrl+G"))
 	ungroup_artwork_button = button("Ungroup", change_artwork_group.bind(true), shortcut_hint("Ungroup selected vectors", "Ctrl+Shift+G"))
 	selection_actions.add_child(group_artwork_button)
 	selection_actions.add_child(ungroup_artwork_button)
-	union_button = button("Union", union_artwork, "Join overlapping shapes or solid ink of the same color")
+	union_button = button("Merge vectors", union_artwork, "Join compatible artwork into one editable shape")
 	union_button.custom_minimum_size.y = 44
 	selection_actions.add_child(union_button)
 	build_transform_menus()
@@ -2563,14 +2592,22 @@ func refresh_node_spread() -> void:
 		node_spread_readout.text = "—"
 
 func change_artwork_group(ungroup: bool) -> void:
+	if project_loading_overlay.visible: return
 	if canvas.tool != "select" and canvas.tool not in Canvas.AREA_TOOLS: return
 	canvas.finish()
+	var merge_reason := ""
+	if not ungroup and merge_on_group:
+		merge_reason = await merge_vector_selection()
+		if merge_reason.is_empty():
+			finish_vector_merge()
+			return
 	var changed: bool = document.ungroup_selected() if ungroup else document.group_selected()
 	if changed:
 		canvas.selected_area.clear()
 		canvas.refresh_selection()
 		update_selection_actions()
-		notify("Artwork ungrouped." if ungroup else "Grouped. Drag the corner to resize.")
+		notify("Grouped. " + merge_reason if not merge_reason.is_empty() else (
+			"Artwork ungrouped." if ungroup else "Grouped. Drag the corner to resize."))
 	else:
 		notify("Select grouped artwork first." if ungroup else "Select at least two separate vector objects or groups.")
 
@@ -2666,11 +2703,24 @@ func arrange_action(id: int) -> void:
 		canvas.refresh_selection()
 
 func union_artwork() -> void:
+	if project_loading_overlay.visible: return
 	canvas.finish()
-	var reason := document.union_selected()
+	var reason: String = await merge_vector_selection()
 	if not reason.is_empty():
 		notify(reason)
 		return
+	finish_vector_merge()
+
+func merge_vector_selection() -> String:
+	var items: Array[Dictionary] = document.selected_items()
+	var reason: String = document.union_selection_reason(items)
+	if not reason.is_empty(): return reason
+	var units := items.size() * items.size()
+	for item in items: units += object_work_units(item.object)
+	return await run_indicated_operation("merge", "Merging vectors…", units, 5500,
+		document.union_selected.bind(canvas.solo_layer_id))
+
+func finish_vector_merge() -> void:
 	canvas.selected_area.clear()
 	canvas.refresh_selection()
 	notify("Joined into one vector shape.")
@@ -2681,17 +2731,20 @@ func update_selection_actions() -> void:
 	if selection_tool: items = document.selected_items()
 	var can_act := not items.is_empty()
 	var grouping: Dictionary = document.grouping_actions(items)
-	for id in [8, 9, 11, 12, 14]:
+	for id in [8, 9, 11, 12, 14, 15, 16]:
 		var index := workspace_menu.get_item_index(id)
-		var available: bool = grouping.group if id == 11 else grouping.ungroup if id == 12 else can_act
+		var available: bool = grouping.group if id == 11 else grouping.ungroup if id == 12 else (items.size() > 1 if id == 15 else can_act)
 		if index >= 0: workspace_menu.set_item_disabled(index, not available)
 	var is_select: bool = workspace_options.contextual_actions and selection_tool and panels.Tools.visible
 	var is_shape: bool = canvas.tool in Canvas.SHAPE_TOOLS and panels.Tools.visible
 	var is_paint: bool = workspace_options.contextual_actions and canvas.tool == "brush" and canvas.clip_enabled and panels.Tools.visible
 	selection_actions.visible = is_select
 	group_artwork_button.visible = grouping.group
+	group_artwork_button.text = "Group & merge" if merge_on_group else "Group"
 	ungroup_artwork_button.visible = grouping.ungroup
-	union_button.visible = items.size() > 1 and document.union_selection_reason(items).is_empty()
+	union_button.visible = items.size() > 1
+	var merge_reason: String = document.union_selection_reason(items)
+	union_button.tooltip_text = merge_reason if not merge_reason.is_empty() else "Join compatible artwork into one editable shape"
 	shape_actions.visible = is_shape
 	paint_actions.visible = is_paint
 	node_actions.visible = canvas.tool == "nodes" and panels.Tools.visible
@@ -2703,6 +2756,7 @@ func update_selection_actions() -> void:
 	deselect_button.visible = selection_tool and (not canvas.selected_area.is_empty() or not document.area_selection.is_empty())
 	selection_actions.get_child(0).disabled = not can_act
 	selection_actions.get_child(1).disabled = not can_act
+	selection_move_button.disabled = not can_act
 	transform_button.visible = can_act
 	var pen_path: bool = canvas.tool == "path"
 	finish_path_button.visible = pen_path
@@ -2778,7 +2832,7 @@ func on_selected(object: Dictionary) -> void:
 	if object.has("picked_color"):
 		set_color(object.picked_color, true)
 		return
-	rebuild_layers()
+	refresh_layer_selection()
 	if object.get("kind") == "text":
 		text_edit.text = object.text
 		canvas.text_content = object.text
@@ -2813,33 +2867,71 @@ func rename_document() -> void:
 func on_document_changed() -> void:
 	if not canvas: return
 	canvas.refresh_selection()
-	page_dimensions.text = "%d × %d" % [roundi(document.width), roundi(document.height)]
-	title_edit.text = document.title
-	var previews: Array = document.content_on_commit.get("layers", [])
-	if document.content_on_commit.has("layer"): previews = [document.content_on_commit.layer]
-	if not document.appended_on_commit.is_empty(): previews = [document.layers[document.active].id]
-	rebuild_layers(previews)
+	if document.content_on_commit.has("layer_flag"):
+		refresh_layer_selection(document.content_on_commit.layer)
+	elif document.content_on_commit.has("group_ids"):
+		update_selection_actions()
+	elif document.content_on_commit.has("layer_order"):
+		rebuild_layers([], false)
+	else:
+		page_dimensions.text = "%d × %d" % [roundi(document.width), roundi(document.height)]
+		title_edit.text = document.title
+		var previews: Array = document.content_on_commit.get("layers", [])
+		if document.content_on_commit.has("layer"): previews = [document.content_on_commit.layer]
+		if not document.appended_on_commit.is_empty(): previews = [document.layers[document.active].id]
+		if document.content_on_commit.get("page_resize", false): previews = []
+		if not previews.is_empty() and layer_rows.size() == document.layers.size() \
+				and previews.all(func(id): return layer_rows.has(id)):
+			refresh_layer_selection("", previews)
+			queue_layer_preview_refresh()
+		else:
+			rebuild_layers(previews)
 	undo_button.disabled = document.history.is_empty()
 	redo_button.disabled = document.future.is_empty()
 	save_label.text = "Unsaved changes" if document.dirty else "Saved locally"
 
-func rebuild_layers(previews: Array = []) -> void:
-	if not layer_list: return
+func refresh_layer_selection(changed_id := "", previews: Array = []) -> void:
+	var current: Dictionary = document.layers[document.active]
+	sync_active_solo_layer()
+	canvas.refresh_background_cache(highlighted_layer_id)
+	var affected := {highlighted_layer_id: true, current.id: true, changed_id: true}
+	for id in previews: affected[id] = true
+	if layer_rows_solo_id != canvas.solo_layer_id:
+		for layer in document.layers:
+			if layer_rows.has(layer.id): update_layer_row(layer_rows[layer.id], layer, layer.id == current.id, layer.id in previews)
+	else:
+		for id in affected:
+			if not layer_rows.has(id): continue
+			var index := find_layer_index(id)
+			if index >= 0: update_layer_row(layer_rows[id], document.layers[index], id == current.id, id in previews)
+	highlighted_layer_id = current.id
+	layer_rows_solo_id = canvas.solo_layer_id
+	refresh_layer_tool_state()
+	refresh_layer_controls()
+
+func sync_active_solo_layer() -> void:
 	canvas.validate_solo_layer()
 	if not canvas.solo_layer_id.is_empty():
 		var layer: Dictionary = document.layers[document.active]
 		canvas.set_solo_layer(layer.id if layer.visible else "")
+
+func refresh_layer_tool_state() -> void:
 	if canvas.tool_unavailable_reason(canvas.tool).is_empty():
 		refresh_tool_buttons()
+		update_selection_actions()
 	else:
 		activate_tool("brush" if canvas.tool_unavailable_reason("brush").is_empty() else "select")
-	update_selection_actions()
+
+func rebuild_layers(previews: Array = [], refresh_all_previews := true) -> void:
+	if not layer_list: return
+	sync_active_solo_layer()
+	refresh_layer_tool_state()
 	layer_scroll.cancel_drag()
 	var current_rows := {}
 	for index in range(document.layers.size() - 1, -1, -1):
 		var layer: Dictionary = document.layers[index]
 		var row: PanelContainer = layer_rows.get(layer.id)
-		var refresh_preview: bool = not row or previews.is_empty() or layer.id in previews
+		var refresh_preview: bool = not row or layer.id in previews or (previews.is_empty() and refresh_all_previews)
 		if not row: row = create_layer_row(layer.id)
 		current_rows[layer.id] = row
 		var position_in_list: int = document.layers.size() - 1 - index
@@ -2850,6 +2942,8 @@ func rebuild_layers(previews: Array = []) -> void:
 		layer_list.remove_child(layer_rows[layer_id])
 		layer_rows[layer_id].queue_free()
 	layer_rows = current_rows
+	highlighted_layer_id = document.layers[document.active].id
+	layer_rows_solo_id = canvas.solo_layer_id
 	refresh_layer_controls()
 	queue_layer_preview_refresh()
 
@@ -2873,7 +2967,7 @@ func toggle_active_layer_solo() -> void:
 	if not layer.visible: return
 	canvas.set_solo_layer("" if canvas.solo_layer_id == layer.id else layer.id)
 	document.selection = ""
-	rebuild_layers()
+	refresh_layer_selection()
 	canvas.refresh_selection()
 
 func begin_layer_opacity_drag() -> void:
@@ -3045,17 +3139,14 @@ func select_layer(layer_id: String) -> void:
 	document.active = index
 	document.selection = ""
 	canvas.selected_area.clear()
-	rebuild_layers()
+	layer_scroll.cancel_drag()
+	refresh_layer_selection()
 	canvas.refresh_selection()
 
 func toggle_layer_flag(layer_id: String, key: String) -> void:
 	canvas.finish()
 	var index := find_layer_index(layer_id)
-	if index < 0: return
-	document.checkpoint()
-	document.layers[index][key] = not document.layers[index][key]
-	document.selection = ""
-	document.commit()
+	document.toggle_layer_flag(index, key)
 
 func toggle_merge_touching() -> void:
 	canvas.finish()
@@ -3215,21 +3306,28 @@ func save_as() -> void:
 	save_dialog.popup_centered_ratio(0.75)
 
 func write_project(path: String) -> void:
+	if project_loading_overlay.visible: return
+	await run_indicated_operation("save", "Saving project…", document_work_units(), 18000, save_project_file.bind(path))
+
+func save_project_file(path: String) -> void:
 	if not path.begins_with("content://") and not path.ends_with(".havu"): path += ".havu"
-	var result = document.save_to(path)
+	var encoded: PackedByteArray = document.encode_for_save()
+	var result = document.save_encoded_to(path, encoded)
 	if result != OK: notify("Save failed: %s. Your artwork remains open; try Save as." % error_string(result)); return
 	file_path = path
 	remember_project(path)
 	save_label.text = "Project saved"
-	preserve_recovery()
+	preserve_recovery(encoded)
 	notify("Saved “%s”" % path.get_file())
 
-func preserve_recovery() -> bool:
+func preserve_recovery(encoded := PackedByteArray()) -> bool:
 	if not session_active: return true
+	var revision: int = document.revision
 	canvas.finish()
 	rename_document()
 	var was_dirty = document.dirty
-	var result = document.save_to(RECOVERY_PATH)
+	var result: Error = document.save_encoded_to(RECOVERY_PATH, encoded) \
+		if not encoded.is_empty() and revision == document.revision else document.save_to(RECOVERY_PATH)
 	document.dirty = was_dirty
 	if result != OK:
 		notify("Recovery could not be saved: %s" % error_string(result))
@@ -3242,7 +3340,7 @@ func preserve_recovery() -> bool:
 	return true
 
 func autosave() -> void:
-	if not session_active or project_home.visible: return
+	if not session_active or project_home.visible or project_loading_overlay.visible: return
 	if canvas.drawing or canvas.moving or canvas.resizing or canvas.node_index >= 0: return
 	if Time.get_ticks_msec() - canvas.last_brush_activity < 1000: return
 	if recovered_revision == document.revision:
@@ -3252,23 +3350,113 @@ func autosave() -> void:
 	if document.dirty: save_label.text = "Recovery saved · save project to keep a file"
 
 func open_project(path: String) -> void:
-	var opened = Document.new()
-	var error = opened.load_from(path)
-	if not error.is_empty():
-		notify(error)
+	await load_project(path, false)
+
+func load_project(path: String, resuming: bool) -> void:
+	if project_loading_overlay.visible: return
+	canvas.finish()
+	canvas.reset_touch()
+	undo_button.stop_hold()
+	show_work_indicator("Restoring project…" if resuming else "Opening project…")
+	await presented_project_frame()
+
+	# Keep Android file access and project validation on the engine's main thread.
+	var result := Document.read_project(path)
+	if result.has("error"):
+		finish_project_load(false, result.error)
 		return
-	if not preserve_before_switch(): return
-	document.restore(opened.snapshot())
+	if not resuming and not preserve_before_switch():
+		finish_project_load(false)
+		return
+
+	document.restore(result.project, false)
 	document.history.clear()
 	document.future.clear()
-	var is_recovery = path.begins_with("user://recovered-")
-	document.dirty = is_recovery
-	file_path = "" if is_recovery else path
-	if not is_recovery: remember_project(path)
+	if resuming:
+		file_path = str(settings.get_value("session", "file_path", ""))
+		document.dirty = bool(settings.get_value("session", "dirty", true))
+	else:
+		var archived := path.begins_with("user://recovered-")
+		document.dirty = archived
+		file_path = "" if archived else path
+		if not archived: remember_project(path)
 	canvas.sync_artwork()
 	on_document_changed()
 	enter_project()
-	notify("Opened “%s”" % document.title)
+	await presented_project_frame()
+	finish_project_load(true, "" if resuming else "Opened “%s”" % document.title)
+
+func object_work_units(object: Dictionary) -> int:
+	var units := 4
+	units += object.get("points", []).size() + object.get("vertices", []).size()
+	if object.kind == "image": units += ceili(object.image_data.length() / 96.0)
+	return units
+
+func document_work_units() -> int:
+	var units := 0
+	for layer in document.layers:
+		for object in layer.objects: units += object_work_units(object)
+	return units
+
+func show_work_indicator(caption: String) -> void:
+	project_loading_label.text = caption
+	project_loading_overlay.show()
+	project_loading_overlay.grab_focus()
+
+func run_indicated_operation(action: String, caption: String, units: int,
+		estimate_threshold: int, operation: Callable) -> Variant:
+	# A synchronous operation cannot show a frame after a timer has already
+	# expired. Estimate from document size and refine it with measured runtime.
+	var rate: float = operation_time_per_unit.get(action, BUSY_FEEDBACK_MS / estimate_threshold)
+	var show := units * rate >= BUSY_FEEDBACK_MS or units >= estimate_threshold * 2
+	if show:
+		undo_button.stop_hold()
+		show_work_indicator(caption)
+		await presented_project_frame()
+	var started := Time.get_ticks_usec()
+	var result = operation.call()
+	var duration := (Time.get_ticks_usec() - started) / 1000.0
+	if show:
+		await presented_project_frame()
+		if action == "cached_stroke_undo": duration = (Time.get_ticks_usec() - started) / 1000.0
+		project_loading_overlay.hide()
+	operation_time_per_unit[action] = maxf(duration, 0.1) / maxi(1, units)
+	return result
+
+func apply_history_step(forward: bool) -> void:
+	if project_loading_overlay.visible: return
+	canvas.cancel()
+	var stack: Array = document.future if forward else document.history
+	if stack.is_empty(): return
+	var entry: Dictionary = stack.back()
+	var units := maxi(1, ceili(int(entry.get("_cost", 512)) / 128.0))
+	var operation := Callable(document, "redo" if forward else "undo")
+	if not forward and entry.has("append") and canvas.paint_cache:
+		var layer_id: String = document.layers[int(entry.layer)].id
+		var mark: Node2D = canvas.retained_marks.get(entry.append.id, {}).get("mark")
+		if canvas.layer_renderers.get(layer_id) == canvas.paint_cache and not canvas.paint_cache.is_recent_mark(mark):
+			units += int(canvas.layer_cache_costs.get(layer_id, 0))
+			await run_indicated_operation("cached_stroke_undo", "Undoing stroke…", units, 18000, operation)
+			return
+	await run_indicated_operation("history", "Redoing…" if forward else "Undoing…", units, 45000, operation)
+
+func apply_canvas_fill(point: Vector2) -> void:
+	if project_loading_overlay.visible: return
+	var layer: Dictionary = document.layers[document.active]
+	if document.paints_pixels():
+		var canvas_pixels := ceili(document.width * document.height / 128.0)
+		await run_indicated_operation("paint_fill", "Filling area…", canvas_pixels, 12000, canvas.apply_fill.bind(point))
+	else:
+		await run_indicated_operation("vector_fill", "Calculating fill…", layer.objects.size(), 1400, canvas.apply_fill.bind(point))
+
+func presented_project_frame() -> void:
+	await get_tree().process_frame
+	if DisplayServer.get_name() != "headless": await RenderingServer.frame_post_draw
+
+func finish_project_load(success: bool, message := "") -> void:
+	project_loading_overlay.hide()
+	if not message.is_empty(): notify(message)
+	project_load_finished.emit(success)
 
 func preserve_before_switch() -> bool:
 	if not session_active:
@@ -3347,34 +3535,42 @@ func export_document(layer_id: String):
 	return null
 
 func write_export(path: String) -> void:
+	if project_loading_overlay.visible: return
 	if not path.begins_with("content://") and not path.ends_with("." + export_type): path += "." + export_type
 	if export_type == "svg":
-		var file = FileAccess.open(path, FileAccess.WRITE)
-		if file == null: notify("Export failed: " + error_string(FileAccess.get_open_error())); return
-		file.store_string(Art.svg(document))
-		file.flush()
-		var result = file.get_error()
-		file.close()
-		if result != OK: notify("SVG export failed: " + error_string(result)); return
-		notify("SVG exported.")
-	else: await export_png(path)
+		await run_indicated_operation("svg", "Exporting SVG…", document_work_units(), 12000, export_svg_file.bind(path))
+	else:
+		await export_png(path)
+
+func export_svg_file(path: String) -> void:
+	var file = FileAccess.open(path, FileAccess.WRITE)
+	if file == null: notify("Export failed: " + error_string(FileAccess.get_open_error())); return
+	file.store_string(Art.svg(document))
+	file.flush()
+	var result = file.get_error()
+	file.close()
+	if result != OK: notify("SVG export failed: " + error_string(result)); return
+	notify("SVG exported.")
 
 func export_png(path: String) -> void:
-	if exporting_png: return
-	var render_document = export_document(export_layer_id)
-	if not render_document:
-		notify("The layer selected for export is no longer available.")
-		return
+	if exporting_png or project_loading_overlay.visible: return
 	if DisplayServer.get_name() == "headless":
 		notify("PNG export needs a graphics-enabled session.")
 		return
 	exporting_png = true
-	notify("Rendering PNG…")
+	show_work_indicator("Rendering PNG…")
+	await presented_project_frame()
+	var render_document = export_document(export_layer_id)
+	if not render_document:
+		exporting_png = false
+		project_loading_overlay.hide()
+		notify("The layer selected for export is no longer available.")
+		return
 	var viewport = SubViewport.new()
 	var scale_factor = minf(2.0, 4096.0 / maxf(render_document.width, render_document.height))
 	viewport.size = Vector2i(Vector2(render_document.width, render_document.height) * scale_factor)
 	viewport.transparent_bg = true
-	viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	viewport.render_target_update_mode = SubViewport.UPDATE_ONCE
 	var drawing_canvas = Canvas.new()
 	drawing_canvas.exporting = true
 	drawing_canvas.document = render_document
@@ -3400,6 +3596,7 @@ func export_png(path: String) -> void:
 		else: result = FileAccess.get_open_error()
 	viewport.queue_free()
 	exporting_png = false
+	project_loading_overlay.hide()
 	notify("PNG exported." if result == OK else "PNG export failed: " + error_string(result))
 
 func build_new_dialog() -> void:
@@ -3524,19 +3721,23 @@ func popup_canvas_dialog() -> void:
 	new_dialog.popup_centered(Vector2i.ONE)
 
 func resize_current_canvas() -> void:
+	if project_loading_overlay.visible: return
 	var dimensions := new_canvas_dimensions()
 	if dimensions.x == 0 or dimensions.y == 0:
 		refresh_canvas_dimensions()
 		return
-	var result: Error = document.resize_canvas(dimensions, canvas_artwork_mode.get_selected_id())
+	var mode := canvas_artwork_mode.get_selected_id()
+	new_dialog.hide()
+	var result: Error = await run_indicated_operation("resize", "Resizing artwork…", document_work_units(), 23000,
+		document.resize_canvas.bind(dimensions, mode))
 	if result != OK:
+		popup_canvas_dialog()
 		notify("Canvas could not be resized. " + error_string(result))
 		return
 	canvas.cancel()
 	canvas.clear_paint_limit()
 	clip_check.set_pressed_no_signal(false)
 	canvas.fit()
-	new_dialog.hide()
 	notify("Canvas resized to %d × %d" % [dimensions.x, dimensions.y])
 
 func canvas_dimension_field(parent: HBoxContainer, field_name: String) -> Button:
@@ -3639,6 +3840,7 @@ func draw_new_canvas_preview() -> void:
 					new_preview.draw_rect(page.intersection(Rect2(page.position + Vector2(x, y) * 7, Vector2(7, 7))), Color("#d4d1cb"))
 
 func create_document(sample_doc: bool) -> void:
+	if project_loading_overlay.visible: return
 	var dimensions := Vector2i.ZERO
 	if not sample_doc:
 		dimensions = new_canvas_dimensions()
@@ -3685,6 +3887,40 @@ func build_project_home() -> void:
 	add_child(project_home)
 	update_panel_reveal_visibility()
 
+func build_project_loading() -> void:
+	var foreground := CanvasLayer.new()
+	foreground.layer = 12
+	add_child(foreground)
+	project_loading_overlay = ColorRect.new()
+	project_loading_overlay.name = "ProjectLoading"
+	project_loading_overlay.color = Color("#111614c7")
+	project_loading_overlay.focus_mode = Control.FOCUS_ALL
+	project_loading_overlay.hide()
+	foreground.add_child(project_loading_overlay)
+	project_loading_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+	var center := CenterContainer.new()
+	project_loading_overlay.add_child(center)
+	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	var card := PanelContainer.new()
+	card.theme = theme
+	card.add_theme_stylebox_override("panel", style(Color("#1b1b1b"), 12, Color("#3b4b42"), 18))
+	center.add_child(card)
+	var content := VBoxContainer.new()
+	content.custom_minimum_size.x = 208
+	card.add_child(content)
+	project_loading_label = label("Opening project…", 17)
+	project_loading_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	content.add_child(project_loading_label)
+	var progress := ProgressBar.new()
+	progress.accessibility_name = "Operation in progress"
+	progress.indeterminate = true
+	progress.show_percentage = false
+	progress.custom_minimum_size.y = 5
+	progress.add_theme_stylebox_override("background", style(Color("#303a35"), 3, Color.TRANSPARENT, 0))
+	progress.add_theme_stylebox_override("fill", style(ACCENT, 3, Color.TRANSPARENT, 0))
+	content.add_child(progress)
+
 func update_panel_reveal_visibility() -> void:
 	panel_reveal_tabs.visible = workspace_options.panel_reveal_tabs and (
 		not is_instance_valid(project_home) or not project_home.visible)
@@ -3703,15 +3939,11 @@ func show_project_home() -> void:
 	project_home.move_to_front()
 
 func resume_project() -> void:
+	if project_loading_overlay.visible: return
 	if session_active:
 		project_home.hide()
 		return
-	var error = document.load_from(RECOVERY_PATH)
-	if not error.is_empty(): notify(error); return
-	file_path = str(settings.get_value("session", "file_path", ""))
-	document.dirty = bool(settings.get_value("session", "dirty", true))
-	on_document_changed()
-	enter_project()
+	await load_project(RECOVERY_PATH, true)
 
 func project_path_key(path: String) -> String:
 	if not path.begins_with("content://"): return ProjectSettings.globalize_path(path).simplify_path()
@@ -4116,13 +4348,11 @@ func build_input_settings() -> void:
 	content.add_child(HSeparator.new())
 	var pen_row := HBoxContainer.new()
 	content.add_child(pen_row)
-	pen_detect_button = button("Detect pen button", start_pen_detection)
-	pen_row.add_child(pen_detect_button)
+	pen_row.add_child(button("Detect pen button", start_pen_detection))
 	pen_button_selector = OptionButton.new()
 	pen_button_selector.name = "PenButtonSelector"
 	pen_button_selector.accessibility_name = "Pen button"
 	pen_button_selector.add_item("Button 1", 1)
-	pen_button_selector.add_item("Button 2", 2)
 	pen_button_selector.item_selected.connect(func(_index): refresh_pen_button_action())
 	pen_row.add_child(pen_button_selector)
 	pen_action_selector = OptionButton.new()
@@ -4132,16 +4362,13 @@ func build_input_settings() -> void:
 	for caption in ["Off", "Color picker", "Eraser", "Pan canvas"]: pen_action_selector.add_item(caption)
 	pen_action_selector.item_selected.connect(assign_pen_button_action)
 	pen_row.add_child(pen_action_selector)
-	var hint := label("Detect each end of the rocker separately. Hold the assigned button while you tap or drag on the canvas.", 14, MUTED)
+	var hint := label("Hold the assigned pen button while you tap or drag on the canvas.", 14, MUTED)
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	content.add_child(hint)
 
-	pen_detection_timer = Timer.new()
-	pen_detection_timer.wait_time = 0.08
-	pen_detection_timer.timeout.connect(poll_pen_detection)
-	add_child(pen_detection_timer)
+	build_pen_detection_dialog()
 	input_settings_dialog.visibility_changed.connect(func():
-		if not input_settings_dialog.visible: finish_pen_detection())
+		if not input_settings_dialog.visible: pen_detection_dialog.hide())
 
 	var legacy = settings.get_value("input", "pen_button_tool", "")
 	var stored = settings.get_value("input", "pen_button_actions", {1: legacy})
@@ -4149,6 +4376,7 @@ func build_input_settings() -> void:
 		for id in [1, 2]:
 			var assignment = stored.get(id, "")
 			if assignment in PEN_BUTTON_TOOLS and assignment != "": canvas.pen_button_tools[id] = assignment
+	if canvas.pen_button_tools.has(2): pen_button_selector.add_item("Button 2", 2)
 	if configure_pen_bridge() and pen_bridge.isSamsungDevice():
 		var samsung_hint := label(
 			"If the pen button opens Air Command, turn off Open Air command with Pen button in Samsung Settings › Advanced features › S Pen › Air command. This applies across the tablet.",
@@ -4179,42 +4407,83 @@ func configure_pen_bridge(detecting := false) -> bool:
 		pen_bridge = java.wrap("studio.havu.android.HavuStylus")
 		if pen_bridge == null: return false
 		canvas.pen_shortcut_contact = func(): return pen_bridge.takeShortcutContact()
+		pen_detection_contact = func(): return pen_bridge.takeDetectionContact()
 	pen_bridge.configure(activity, detecting or not canvas.pen_button_tools.is_empty())
 	return true
 
-func start_pen_detection() -> void:
-	if not pen_detection_timer.is_stopped():
-		finish_pen_detection()
-		return
-	if not configure_pen_bridge(true):
-		pen_detect_button.text = "Detection unavailable"
-		return
-	pen_bridge.setDetection(true)
-	pen_detection_deadline = Time.get_ticks_msec() + 12000
-	pen_detect_button.text = "Press a pen button…"
-	pen_detection_timer.start()
+func build_pen_detection_dialog() -> void:
+	pen_detection_dialog = ConfirmationDialog.new()
+	pen_detection_dialog.name = "PenButtonDetection"
+	pen_detection_dialog.title = "Detect pen button"
+	pen_detection_dialog.ok_button_text = "Choose shortcut"
+	pen_detection_dialog.dialog_hide_on_ok = false
+	# Keep the native contact and the Godot tap in the same Android window.
+	input_settings_dialog.add_child(pen_detection_dialog)
+	var content := margin(pen_detection_dialog, 16)
+	content.custom_minimum_size.x = 320
+	pen_test_target = PanelContainer.new()
+	pen_test_target.name = "PenTestTarget"
+	pen_test_target.accessibility_name = "Tap here with the pen tip while holding its button"
+	pen_test_target.custom_minimum_size.y = 112
+	pen_test_target.add_theme_stylebox_override("panel", style(Color("#1c2924"), 10, ACCENT, 12))
+	pen_test_target.gui_input.connect(test_pen_button_contact)
+	content.add_child(pen_test_target)
+	var instructions := label("Hold the button you want to map.\nTap here with the pen tip.", 16)
+	instructions.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	instructions.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	pen_test_target.add_child(instructions)
+	pen_test_feedback = label("", 14, MUTED)
+	pen_test_feedback.custom_minimum_size.y = 44
+	pen_test_feedback.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	content.add_child(pen_test_feedback)
+	pen_detection_dialog.confirmed.connect(confirm_pen_detection)
+	pen_detection_dialog.visibility_changed.connect(func():
+		if not pen_detection_dialog.visible and pen_bridge != null:
+			pen_bridge.setDetection(false)
+			configure_pen_bridge())
 
-func poll_pen_detection() -> void:
-	var id: int = pen_bridge.takeDetectedButton()
-	if id in [1, 2]:
-		select_detected_pen_button(id)
-		finish_pen_detection()
-	elif Time.get_ticks_msec() >= pen_detection_deadline:
-		finish_pen_detection()
-		pen_detect_button.text = "Try detecting again"
+func start_pen_detection() -> void:
+	if not configure_pen_bridge(true):
+		notify("Pen button detection is available on Android.")
+		return
+	show_pen_detection_target()
+	pen_bridge.setDetection(true)
+
+func show_pen_detection_target() -> void:
+	detected_pen_slot = 0
+	pen_test_feedback.text = "If two presses report the same number, they share one shortcut."
+	pen_detection_dialog.get_ok_button().disabled = true
+	pen_detection_dialog.popup_centered(Vector2i.ONE)
+
+func test_pen_button_contact(event: InputEvent) -> void:
+	if not pen_detection_dialog.visible or not pen_detection_contact.is_valid(): return
+	if event is InputEventScreenTouch:
+		if not event.pressed or event.canceled: return
+	elif event is InputEventMouseButton:
+		if not event.pressed or event.button_index != MOUSE_BUTTON_LEFT: return
+	else:
+		return
+	pen_test_target.accept_event()
+	var code: int = pen_detection_contact.call()
+	detected_pen_slot = code if code in [1, 2] else 0
+	pen_detection_dialog.get_ok_button().disabled = detected_pen_slot == 0
+	match code:
+		1, 2: pen_test_feedback.text = "Android reported Button %d." % code
+		-1: pen_test_feedback.text = "Pen tip detected. Hold the side button and tap again."
+		_: pen_test_feedback.text = "Use the pen tip on this area while holding its button."
+
+func confirm_pen_detection() -> void:
+	if detected_pen_slot == 0: return
+	pen_detection_dialog.hide()
+	select_detected_pen_button.call_deferred(detected_pen_slot)
 
 func select_detected_pen_button(id: int) -> void:
+	if pen_button_selector.get_item_index(id) == -1:
+		pen_button_selector.add_item("Button %d" % id, id)
 	pen_button_selector.select(pen_button_selector.get_item_index(id))
 	refresh_pen_button_action()
 	pen_action_selector.grab_focus()
 	pen_action_selector.show_popup()
-
-func finish_pen_detection() -> void:
-	if pen_detection_timer.is_stopped(): return
-	pen_detection_timer.stop()
-	pen_bridge.setDetection(false)
-	configure_pen_bridge()
-	pen_detect_button.text = "Detect pen button"
 
 func build_workspace_settings() -> void:
 	workspace_settings_dialog = AcceptDialog.new()
@@ -4323,15 +4592,17 @@ func set_workspace_option(key: String, enabled: bool) -> void:
 		notify("Could not save workspace settings for the next launch.")
 
 func sync_selection_menu() -> void:
-	for id in [8, 9, 11, 12, 14]:
+	for id in [8, 9, 11, 12, 14, 15, 16]:
 		var index := workspace_menu.get_item_index(id)
 		if index >= 0: workspace_menu.remove_item(index)
 	if not workspace_options.contextual_actions:
 		workspace_menu.add_item("Duplicate selection", 8)
 		workspace_menu.add_item("Delete selection", 9)
+		workspace_menu.add_item("Move to layer…", 16)
 		workspace_menu.add_item("Group selection", 11)
 		workspace_menu.add_item("Ungroup selection", 12)
 		workspace_menu.add_item("Transform selection…", 14)
+		workspace_menu.add_item("Merge vectors", 15)
 
 func save_input_preference(key: String, value: Variant) -> void:
 	settings.set_value("input", key, value)
@@ -4418,6 +4689,9 @@ func _process(delta: float) -> void:
 	if show_shortcut_hints: developer_label.text += "\nF12 to close"
 
 func _unhandled_key_input(event: InputEvent) -> void:
+	if project_loading_overlay.visible:
+		get_viewport().set_input_as_handled()
+		return
 	if not event is InputEventKey or not event.pressed or event.echo: return
 	if is_instance_valid(get_started_tour) and get_started_tour.visible: return
 	if project_home.visible:
@@ -4435,11 +4709,8 @@ func _unhandled_key_input(event: InputEvent) -> void:
 	var ctrl = event.ctrl_pressed or event.meta_pressed
 	if ctrl:
 		match event.keycode:
-			KEY_Z:
-				canvas.cancel()
-				if event.shift_pressed: document.redo()
-				else: document.undo()
-			KEY_Y: canvas.cancel(); document.redo()
+			KEY_Z: apply_history_step(event.shift_pressed)
+			KEY_Y: apply_history_step(true)
 			KEY_S:
 				if event.shift_pressed: save_as()
 				else: save_project()
@@ -4633,6 +4904,8 @@ func build_header() -> void:
 			12: change_artwork_group(true)
 			13: show_get_started_tour()
 			14: show_transform_menu.call_deferred()
+			15: union_artwork()
+			16: show_selection_move.call_deferred()
 	)
 	add_child(workspace_menu)
 	var more = icon_button("M5 13h1M12 13h1M19 13h1", func(): pass, "Workspace options")

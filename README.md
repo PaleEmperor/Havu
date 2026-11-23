@@ -2,7 +2,7 @@
 
 **A little illustration studio for Android tablets.**
 
-[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.58/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
+[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.70/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
 
 I wanted my wife to have somewhere of her own to draw. A little studio on her
 tablet, with brushes she could make her own, artwork she could scale into shop
@@ -34,10 +34,12 @@ I’d love for you to use it, share it, or make it your own.
 - **Vector and paint layers.** Use editable vectors for shapes, lettering, and
   artwork you want to resize. Add a paint layer when you want to work with pixels.
   Selection starts on the active layer. Turn on **Select across visible layers**
-  from the Select menu for artwork spread across layers. Use **Union** to join
-  matching solid fills or solid ink on one layer, including separated shapes.
-  Use **Select → Move to layer…** to send selected artwork to a compatible layer
-  or create a new vector layer for it.
+  from the Select menu for artwork spread across layers. Turn on **Keep selecting**
+  to add or remove objects and whole groups by tapping them. **Merge vectors**
+  joins matching solid fills or solid ink on one layer into one editable shape.
+  **Merge vectors on grouping** applies the same operation when you group artwork.
+  In the selection action bar, use **Move to layer…** beside **Duplicate** and
+  **Delete** to send artwork to a compatible layer or create a new vector layer.
 - **Transform and arrange.** Drag the round selection handle to rotate. Open
   **Transform** for flips, quarter turns, and snapping to the canvas or 15°
   angles. **Align & arrange** aligns objects, spaces them evenly, and changes
