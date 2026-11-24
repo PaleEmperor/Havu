@@ -687,6 +687,7 @@ func run() -> void:
 		and app.document.title == "Unsaved artwork", "a failed open dismisses the indicator, preserves the session and ignores a second tap")
 	var legacy_recents: Array = app.recent_projects.duplicate()
 	legacy_recents.append({"path": ProjectSettings.globalize_path("user://home-recent.havu"), "title": "Duplicate bookmark"})
+	legacy_recents.append({"path": "user://missing.havu", "title": "Deleted file"})
 	app.settings.set_value("projects", "recent", legacy_recents)
 	app.settings.save("user://preferences.cfg")
 	app.autosave_timer.stop()
@@ -696,7 +697,8 @@ func run() -> void:
 	app = load("res://main.tscn").instantiate()
 	root.add_child(app)
 	await process_frame
-	check(app.project_home.visible and app.project_home.recent_rows.get_child_count() == 1, "startup collapses legacy recent entries for the same file")
+	check(app.project_home.visible and app.project_home.recent_rows.get_child_count() == 1,
+		"startup removes missing files and collapses duplicate bookmarks")
 	app.project_home.resume_requested.emit()
 	check(app.project_loading_overlay.visible and app.project_loading_label.text == "Restoring project…",
 		"resuming a stored session shows the loading indicator")
@@ -2869,17 +2871,27 @@ func run() -> void:
 	selection_doc.add({"kind": "rect", "pos": [180, 215], "extent": [30, 30], "color": "#c78677", "opacity": 1.0})
 	selection_doc.layers[2].locked = true
 	selection_doc.commit()
+	app.set_tool("hand")
 	app.tool_buttons.select.pressed.emit()
 	check(selection_canvas.tool == app.remembered_selection_tool and not app.selection_menu.visible,
 		"one tap activates the remembered selection tool without opening a menu")
+	await create_timer(0.45).timeout
 	app.tool_buttons.select.pressed.emit()
 	check(app.selection_menu.visible and app.selection_icons[3].tooltip_text == "Freehand selection"
 		and app.selection_icons.all(func(choice): return choice.text.is_empty() and choice.icon != null),
-		"Select opens an icon grid for object and area modes")
+		"tapping Select while active opens the mode grid even after a pause")
 	await process_frame
 	tap_window_control(app.selection_menu, app.select_across_toggle)
 	await process_frame
 	tap_window_control(app.selection_menu, app.selection_icons[1])
+	app.tool_buttons.hand.pressed.emit()
+	app.tool_buttons.select.pressed.emit()
+	check(selection_canvas.tool == "select_rect" and not app.selection_menu.visible,
+		"returning from Hand restores the last area selection mode")
+	app.tool_buttons.select.pressed.emit()
+	check(app.selection_menu.visible and selection_canvas.tool == "select_rect",
+		"tapping Select in an active area mode opens the picker without changing modes")
+	app.selection_menu.hide()
 	var local := func(point: Vector2) -> Vector2: return selection_canvas.origin + point * selection_canvas.zoom
 	touch_press(selection_canvas, 16, local.call(Vector2(125, 125)))
 	touch_move(selection_canvas, 16, local.call(Vector2(315, 260)))
@@ -3409,12 +3421,84 @@ func run() -> void:
 	await brush_performance_regressions(app)
 	editing_scale_regressions()
 	await page_clipping_regressions(app)
+	await working_folder_regressions(app)
 
 	print("RESULT: %d checks, %d failures" % [checks, failures])
 	app.autosave_timer.stop()
 	app.queue_free()
 	await process_frame
 	quit(1 if failures else 0)
+
+func working_folder_regressions(app) -> void:
+	var folder := "user://Polar Fun projects"
+	DirAccess.make_dir_recursive_absolute(folder.path_join("Directory.havu"))
+	var first_path := folder.path_join("Menu 2.havu")
+	var next_path := folder.path_join("Menu 10.HAVU")
+	var source := Document.new()
+	source.blank()
+	source.title = "Menu Two"
+	source.save_to(first_path)
+	source.title = "Menu Ten"
+	source.save_to(next_path)
+	for index in range(3, 9):
+		source.save_to(folder.path_join("Menu %d.havu" % index))
+	var ignored := FileAccess.open(folder.path_join("Proof.png"), FileAccess.WRITE)
+	ignored.close()
+
+	app.show_project_home()
+	check(app.project_home.open_folder_button.is_visible_in_tree(), "Open folder is a visible action when no folder is connected")
+	app.project_folder_dialog.dir_selected.emit(ProjectSettings.globalize_path(folder))
+	var home = app.project_home
+	check(home.folder_panel.visible and home.folder_title.text == "Polar Fun projects"
+		and home.folder_rows.get_child_count() == 8, "working folder lists every immediate Havu file and filters out other files and folders")
+	check(home.folder_rows.get_child(0).text == "Menu 2" and home.folder_rows.get_child(-1).text == "Menu 10",
+		"working folder sorts numbered projects naturally and accepts uppercase extensions")
+	var preferences := ConfigFile.new()
+	check(preferences.load("user://preferences.cfg") == OK
+		and preferences.get_value("projects", "working_folder", "") == ProjectSettings.globalize_path(folder),
+		"working folder survives a preferences reload")
+	home.folder_rows.get_child(0).pressed.emit()
+	var success: bool = await app.project_load_finished
+	check(success and app.document.title == "Menu Two" and not home.visible, "a folder row opens its editable project")
+	app.title_edit.text = "Unsaved folder edit"
+	app.show_project_home()
+	check(home.folder_panel.visible and home.folder_rows.get_child(0).text.ends_with("Open"),
+		"returning to Projects shows the working folder and marks the current project")
+	home.folder_rows.get_child(0).pressed.emit()
+	check(not home.visible and not app.project_loading_overlay.visible and app.document.title == "Unsaved folder edit",
+		"tapping the current project resumes in-memory edits instead of reloading it")
+	app.project_switch_button.pressed.emit()
+	var switcher: PopupMenu = app.project_switch_menu
+	check(app.project_switch_button.is_visible_in_tree() and switcher.visible
+		and switcher.item_count == 11 and switcher.is_item_checked(switcher.get_item_index(1)),
+		"the title dropdown lists folder projects and marks the active one")
+	switcher.hide()
+	switcher.id_pressed.emit(8)
+	success = await app.project_load_finished
+	var recovered: Array = app.recovered_projects
+	check(success and app.document.title == "Menu Ten"
+		and recovered.any(func(entry): return entry.title == "Unsaved folder edit" and FileAccess.file_exists(entry.path)),
+		"switching straight from the canvas preserves unsaved edits in recovery")
+	app.save_project()
+	check(not FileAccess.file_exists(next_path + ".havu"), "saving an uppercase extension keeps the original filename")
+	app.save_as()
+	check(app.save_dialog.current_dir == ProjectSettings.globalize_path(folder), "Save As starts in the working folder")
+	app.save_dialog.hide()
+	app.show_project_home()
+	source.save_to(folder.path_join("Menu 20.havu"))
+	home.folder_refresh.pressed.emit()
+	check(home.folder_rows.get_child_count() == 9, "refresh includes files added after the folder was picked")
+	home.recent_tab.pressed.emit()
+	check(home.recent_rows.visible and not home.folder_panel.visible, "recents remain accessible with a folder connected")
+	home.folder_tab.pressed.emit()
+	home.folder_clear.pressed.emit()
+	check(app.project_folder.is_empty() and home.folder_rows.get_child_count() == 0
+		and not app.project_switch_button.visible and FileAccess.file_exists(first_path),
+		"disconnect removes the workspace from Projects without deleting files")
+	DirAccess.remove_absolute(next_path)
+	app.show_project_home()
+	check(not app.recent_projects.any(func(entry): return entry.path.get_file() == "Menu 10.HAVU"),
+		"returning to Projects clears recents deleted while Havu was running")
 
 func page_clipping_regressions(app) -> void:
 	page_fill_regressions()
@@ -3873,7 +3957,7 @@ func layer_transfer_regressions(app) -> void:
 	check(app.selection_move_button.is_visible_in_tree() and not app.selection_move_button.disabled
 		and app.selection_move_button.get_parent() == app.selection_actions and app.selection_move_button.get_index() == 2,
 		"Move to layer appears beside Duplicate and Delete in the selection action bar")
-	tap_window_control(root, app.selection_move_button)
+	app.selection_move_button.pressed.emit()
 	await process_frame
 	var choices: OptionButton = app.selection_move_targets
 	check(app.selection_move_dialog.visible and choices.item_count == 4 and choices.get_item_metadata(0) == target.id
@@ -4079,6 +4163,7 @@ func brush_performance_regressions(app) -> void:
 	recent_stroke_cache_regression()
 	secondary_stroke_cache_regression()
 	opaque_document_cache_regression()
+	saturated_layer_cache_regression()
 	translucent_background_cache_regression()
 	var tile_writer := PaintTiles.new()
 	tile_writer.prepare_layer({"objects": []}, Vector2i(32, 32))
@@ -4100,10 +4185,57 @@ func brush_performance_regressions(app) -> void:
 				previous = point
 			if absf(actual.get_pixel(x, y).a - (0.5 if inside else 0.0)) > 0.01: differences += 1
 	check(differences == 0, "raster scanlines match half-pixel coverage at clipped and concave edges")
+	staged_paint_regression()
 	if DisplayServer.get_name() != "headless":
 		await wet_rendering_regression()
+		await long_ink_mesh_regression()
 		await recent_cache_rendering_regression()
 		await translucent_background_rendering_regression()
+
+func long_ink_mesh_regression() -> void:
+	var doc := Document.new()
+	doc.blank(680, 320, false)
+	var mark := stroke()
+	mark.points = []
+	for sample in 2800:
+		mark.points.append([30.0 + sample * 0.20, 150.0 + sin(sample * 0.012) * 40.0, 0.55, "#226451"])
+	doc.append_with_history(mark)
+	var canvas := Canvas.new()
+	canvas.size = Vector2(680, 320)
+	canvas.document = doc
+	root.add_child(canvas)
+	await RenderingServer.frame_post_draw
+	var retained: Node2D = canvas.retained_marks[mark.id].mark
+	var mesh: Variant = retained.get_meta(Art.WET_MESH, null)
+	retained.queue_redraw()
+	await RenderingServer.frame_post_draw
+	check(mesh is ArrayMesh and retained.get_meta(Art.WET_MESH, null) == mesh and canvas.ink_mesh_bytes > 0,
+		"a long ink path reuses retained geometry on redraw")
+	doc.undo()
+	check(canvas.ink_mesh_bytes == 0, "removing a long ink path releases its cache budget")
+	canvas.queue_free()
+
+func staged_paint_regression() -> void:
+	var mark := stroke()
+	mark.brush = "soft"
+	mark.size = 190.0
+	mark.opacity = 0.47
+	mark.points = []
+	var complete_points := []
+	for sample in 50:
+		complete_points.append([sample * 13.0, 185.0 + sin(sample * 0.18) * 45.0,
+			0.82, "#cc654c" if sample % 3 == 0 else "#256d55"])
+	var layer := {"objects": []}
+	var page := Vector2i(811, 307)
+	var staged := PaintTiles.new()
+	staged.prepare_layer(layer, page)
+	for count in range(3, complete_points.size(), 3):
+		mark.points = complete_points.slice(0, count)
+		staged.stage_stroke(mark, 1000)
+	mark.points = complete_points
+	staged.stage_stroke(mark, -1)
+	var reference := PaintTiles.new().apply(layer, page, mark, false)
+	check(reference == staged.encode_result(layer), "staged paint commits identical tiles to the one-shot rasterizer")
 
 func translucent_cache_fixture() -> Document:
 	var doc := Document.new()
@@ -4184,6 +4316,7 @@ func translucent_background_rendering_regression() -> void:
 		canvas.position.x = index * 400
 		canvas.zoom = 1.0
 		canvas.cache_completed_paint = index == 1
+		canvas.cache_recent_strokes = index == 1
 		viewport.add_child(canvas)
 		canvases.append(canvas)
 	await RenderingServer.frame_post_draw
@@ -4208,6 +4341,27 @@ func translucent_background_rendering_regression() -> void:
 	var cached := image.get_pixel(485, 50)
 	check(absf(live.a - cached.a) < 0.02 and Vector3(live.r, live.g, live.b).distance_to(Vector3(cached.r, cached.g, cached.b)) < 0.035,
 		"live ink on a cached translucent layer composites with the same color and opacity")
+	for canvas in canvases: canvas.finish()
+	var layer: IsolatedOpacity = canvases[1].paint_cache
+	check(layer.recent != null and layer.recent.get_parent() == layer.preview_group,
+		"recent translucent marks share the opacity group with the finished layer")
+	await RenderingServer.frame_post_draw
+	await RenderingServer.frame_post_draw
+	image = viewport.get_texture().get_image()
+	live = image.get_pixel(85, 50)
+	cached = image.get_pixel(485, 50)
+	check(absf(live.a - cached.a) < 0.02 and Vector3(live.r, live.g, live.b).distance_to(Vector3(cached.r, cached.g, cached.b)) < 0.035,
+		"committed recent ink preserves translucent overlap colors")
+	for canvas in canvases: canvas.document.undo()
+	check(layer.recent.rebuild_pending and not layer.rebuild_pending,
+		"undoing recent translucent ink redraws only the recent surface")
+	await RenderingServer.frame_post_draw
+	await RenderingServer.frame_post_draw
+	image = viewport.get_texture().get_image()
+	live = image.get_pixel(85, 50)
+	cached = image.get_pixel(485, 50)
+	check(absf(live.a - cached.a) < 0.02 and Vector3(live.r, live.g, live.b).distance_to(Vector3(cached.r, cached.g, cached.b)) < 0.035,
+		"undoing the recent stroke restores the original translucent colors")
 	viewport.queue_free()
 
 func recent_cache_rendering_regression() -> void:
@@ -4339,7 +4493,7 @@ func opaque_document_cache_regression() -> void:
 	ink.points = []
 	for index in 96:
 		ink.points.append([float(index), 8.0 + sin(index * 0.1), 0.6, "#226451"])
-	for index in 54:
+	for index in 26:
 		var mark := ink.duplicate(true)
 		mark.pos = [200.0, index * 16.0]
 		doc.add(mark)
@@ -4379,6 +4533,42 @@ func opaque_document_cache_regression() -> void:
 	check(prepared.rectangle and Art.clipped_polygon(clipped, inside, [], prepared) == [inside]
 		and Art.clipped_polygon(clipped, corner, [], prepared) == reference,
 		"prepared rectangular clips skip enclosed paint and still cut boundary dabs exactly")
+
+func saturated_layer_cache_regression() -> void:
+	var doc := Document.new()
+	doc.blank(1600, 1600, false)
+	var ink := stroke()
+	ink.points = []
+	for sample in 96:
+		ink.points.append([float(sample), 8.0 + sin(sample * 0.1), 0.6, "#226451"])
+	for layer in 5:
+		if layer > 0: doc.layers.append(doc.new_layer())
+		doc.active = layer
+		for index in 23:
+			var mark := ink.duplicate(true)
+			mark.pos = [200.0, index * 16.0]
+			doc.add(mark)
+	var canvas := Canvas.new()
+	canvas.document = doc
+	canvas.size = Vector2(900, 650)
+	canvas.view_fitted = false
+	canvas.zoom = 0.4
+	canvas.cache_completed_paint = true
+	canvas.cache_recent_strokes = true
+	canvas.cache_extra_layers = true
+	root.add_child(canvas)
+	var uncached_id: String = doc.layers[4].id
+	doc.active = 0
+	var cache: IsolatedOpacity = canvas.paint_cache
+	cache.finish_cache_frame()
+	canvas.begin(Vector2(180, 180), 0.7)
+	canvas.finish()
+	var last: Dictionary = doc.layers[0].objects.back()
+	var mark: Node2D = canvas.retained_marks[last.id].mark
+	canvas.refresh_background_cache(uncached_id)
+	check(cache.is_recent_mark(mark) and not canvas.is_artwork_cache(canvas.layer_renderers[uncached_id]),
+		"leaving an uncached layer at capacity preserves the current caches and recent ink")
+	canvas.free()
 
 func editing_scale_regressions() -> void:
 	var doc := Document.new()

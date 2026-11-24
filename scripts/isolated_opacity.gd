@@ -55,21 +55,26 @@ func set_opacity(value: float) -> void:
 	if live_move: live_move.self_modulate.a = value
 
 func preview_parent() -> Node2D:
+	if preview_group: return preview_group
 	if opacity >= 1.0: return self
-	if not preview_group:
-		preview_group = CanvasGroup.new()
-		var position_in_layer := display.get_index()
-		add_child(preview_group)
-		move_child(preview_group, position_in_layer)
-		display.reparent(preview_group, false)
-		set_opacity(opacity)
+	preview_group = CanvasGroup.new()
+	var position_in_layer := display.get_index()
+	add_child(preview_group)
+	move_child(preview_group, position_in_layer)
+	display.reparent(preview_group, false)
+	if recent: recent.reparent(preview_group, false)
+	set_opacity(opacity)
 	return preview_group
 
 func release_preview() -> void:
 	if not preview_group: return
+	if recent and recent.visible: return
 	var position_in_layer := preview_group.get_index()
 	display.reparent(self, false)
 	move_child(display, position_in_layer)
+	if recent and recent.get_parent() == preview_group:
+		recent.reparent(self, false)
+		move_child(recent, display.get_index() + 1)
 	remove_child(preview_group)
 	preview_group.queue_free()
 	preview_group = null
@@ -169,13 +174,14 @@ func invalidate_cache() -> void:
 
 func append_mark(mark: Node2D) -> void:
 	if keep_recent_marks:
+		var parent := preview_parent()
 		if not recent:
 			recent = get_script().new()
 			recent.cache_finished_marks = true
 			recent.overview = overview
 			recent.hide()
-			add_child(recent)
-			move_child(recent, display.get_index() + 1)
+			parent.add_child(recent)
+			parent.move_child(recent, display.get_index() + 1)
 		if recent.artwork.get_child_count() >= RECENT_MARK_LIMIT: flush_recent()
 		if not recent.visible:
 			recent.show()

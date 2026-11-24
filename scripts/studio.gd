@@ -18,6 +18,7 @@ const MyPaintBrush = preload("res://scripts/mypaint_brush.gd")
 const MAX_BRUSH_FILE_BYTES := 256 * 1024
 const Sample = preload("res://scripts/sample.gd")
 const ProjectHome = preload("res://scripts/project_home.gd")
+const ProjectFolder = preload("res://scripts/project_folder.gd")
 const GetStartedTour = preload("res://scripts/get_started_tour.gd")
 const PanelRevealTabs = preload("res://scripts/panel_reveal_tabs.gd")
 const LayerThumbnail = preload("res://scripts/layer_thumbnail.gd")
@@ -54,6 +55,9 @@ var layer_icons := {}
 var layer_row_styles: Array[StyleBoxFlat] = []
 var layer_preview_refresh_queued := false
 var title_edit: LineEdit
+var project_title_group: HBoxContainer
+var project_switch_button: Button
+var project_switch_menu: PopupMenu
 var text_entry: TouchTextEntry
 var save_label: Label
 var status_label: Label
@@ -80,7 +84,6 @@ var close_path_button: Button
 var shape_menu: PopupPanel
 var selection_menu: PopupPanel
 var remembered_selection_tool := "select"
-var selection_pressed_at := -1000
 var shape_icons: Array[Button] = []
 var selection_icons: Array[Button] = []
 var select_across_toggle: CheckButton
@@ -267,6 +270,7 @@ var alpha_lock_button: Button
 var layer_solo_button: Button
 var opacity_drag_layer := ""
 var open_dialog: FileDialog
+var project_folder_dialog: FileDialog
 var export_dialog: FileDialog
 var export_menu: PopupMenu
 var undo_button: UndoButton
@@ -306,6 +310,8 @@ var session_active = false
 var recovered_revision := -1
 var recent_projects: Array = []
 var recovered_projects: Array = []
+var project_folder := ""
+var project_folder_title := ""
 
 func _ready() -> void:
 	name = "HavuStudio"
@@ -2101,7 +2107,7 @@ func update_workspace_chrome() -> void:
 	brand_button.custom_minimum_size.x = 44 if tight else 102
 	brand_button.add_theme_constant_override("icon_max_width", 28 if tight else 90)
 	title_edit.custom_minimum_size.x = 74 if tight else (108 if narrow else 240)
-	title_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL if narrow else Control.SIZE_FILL
+	project_title_group.size_flags_horizontal = Control.SIZE_EXPAND_FILL if narrow else Control.SIZE_FILL
 	save_label.visible = not narrow
 	brush_library_button.custom_minimum_size.x = 54 if tight else (72 if narrow else 112)
 	header_tools.add_theme_constant_override("separation", 4 if tight else 8)
@@ -2217,17 +2223,11 @@ func restore_layout() -> void:
 
 func press_tool(key: String) -> void:
 	if reject_unavailable_tool(key): return
-	if key != "select": selection_pressed_at = -1000
 	if key == "brush" and canvas.tool == "brush": toggle_brush_panel(active_brush_tab)
 	elif key == "shapes": show_shape_menu()
 	elif key == "select":
-		var now := Time.get_ticks_msec()
-		if now - selection_pressed_at <= 360:
-			selection_pressed_at = -1000
-			show_selection_menu()
-		else:
-			selection_pressed_at = now
-			set_tool(remembered_selection_tool)
+		if canvas.tool == "select" or canvas.tool in Canvas.AREA_TOOLS: show_selection_menu()
+		else: set_tool(remembered_selection_tool)
 	else: set_tool(key)
 
 func reject_unavailable_tool(key: String) -> bool:
@@ -2266,7 +2266,7 @@ func activate_tool(next: String) -> void:
 func build_selection_menu() -> void:
 	var saved: String = str(settings.get_value("input", "selection_tool", "select"))
 	if saved == "select" or saved in Canvas.AREA_TOOLS: remembered_selection_tool = saved
-	tool_buttons.select.tooltip_text = "Select · Double-tap to choose the selection tool"
+	tool_buttons.select.tooltip_text = "Select · Tap again while active to choose a selection mode"
 	selection_menu = PopupPanel.new()
 	selection_menu.name = "SelectionMenu"
 	add_child(selection_menu)
@@ -3330,6 +3330,13 @@ func build_file_dialogs() -> void:
 	open_dialog.use_native_dialog = true
 	open_dialog.file_selected.connect(open_project)
 	add_child(open_dialog)
+	project_folder_dialog = FileDialog.new()
+	project_folder_dialog.title = "Choose a working folder"
+	project_folder_dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+	project_folder_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	project_folder_dialog.use_native_dialog = true
+	project_folder_dialog.dir_selected.connect(set_project_folder)
+	add_child(project_folder_dialog)
 	export_dialog = FileDialog.new()
 	export_dialog.file_mode = FileDialog.FILE_MODE_SAVE_FILE
 	export_dialog.access = FileDialog.ACCESS_FILESYSTEM
@@ -3349,7 +3356,19 @@ func save_project() -> void:
 func save_as() -> void:
 	canvas.finish()
 	rename_document()
-	save_dialog.current_file = safe_name() + ".havu"
+	var filename := safe_name() + ".havu"
+	if project_folder.begins_with("content://") and OS.has_feature("android"):
+		# The embedded FileDialog cannot set current_dir to a SAF URI.
+		var directory := project_folder.path_join("document").path_join(project_folder.get_file())
+		var result := DisplayServer.file_dialog_show(save_dialog.title, directory, filename, false,
+			DisplayServer.FILE_DIALOG_MODE_SAVE_FILE, save_dialog.filters,
+			func(accepted: bool, paths: PackedStringArray, _filter: int):
+				if accepted and not paths.is_empty(): write_project(paths[0]),
+			get_window().get_window_id())
+		if result == OK: return
+	elif not project_folder.is_empty() and DirAccess.dir_exists_absolute(project_folder):
+		save_dialog.current_dir = project_folder
+	save_dialog.current_file = filename
 	save_dialog.popup_centered_ratio(0.75)
 
 func write_project(path: String) -> void:
@@ -3357,7 +3376,7 @@ func write_project(path: String) -> void:
 	await run_indicated_operation("save", "Saving project…", document_work_units(), 18000, save_project_file.bind(path))
 
 func save_project_file(path: String) -> void:
-	if not path.begins_with("content://") and not path.ends_with(".havu"): path += ".havu"
+	if not path.begins_with("content://") and not path.to_lower().ends_with(".havu"): path += ".havu"
 	var encoded: PackedByteArray = document.encode_for_save()
 	var result = document.save_encoded_to(path, encoded)
 	if result != OK: notify("Save failed: %s. Your artwork remains open; try Save as." % error_string(result)); return
@@ -3408,8 +3427,13 @@ func load_project(path: String, resuming: bool) -> void:
 	await presented_project_frame()
 
 	# Keep Android file access and project validation on the engine's main thread.
-	var result := Document.read_project(path)
+	var result := Document.read_project(path, true)
 	if result.has("error"):
+		if not resuming and project_home.visible:
+			var missing_key := project_path_key(path)
+			if recent_projects.any(func(entry): return project_path_key(entry.path) == missing_key) and prune_missing_recents():
+				update_home_sessions()
+			if not project_folder.is_empty(): refresh_project_folder()
 		finish_project_load(false, result.error)
 		return
 	if not resuming and not preserve_before_switch():
@@ -3429,7 +3453,7 @@ func load_project(path: String, resuming: bool) -> void:
 		if not archived: remember_project(path)
 	canvas.sync_artwork()
 	on_document_changed()
-	enter_project()
+	enter_project(result.source)
 	await presented_project_frame()
 	finish_project_load(true, "" if resuming else "Opened “%s”" % document.title)
 
@@ -3904,7 +3928,7 @@ func create_document(sample_doc: bool) -> void:
 	if not sample_doc and not settings.get_value("onboarding", "tour_shown", false):
 		show_get_started_tour()
 
-func enter_project() -> void:
+func enter_project(recovery_source := PackedByteArray()) -> void:
 	session_active = true
 	canvas.set_add_node_mode(false)
 	canvas.set_solo_layer("")
@@ -3914,16 +3938,23 @@ func enter_project() -> void:
 	canvas.clear_paint_limit()
 	update_selection_actions()
 	canvas.fit()
-	preserve_recovery()
+	preserve_recovery(recovery_source)
 
 func build_project_home() -> void:
 	load_project_lists()
+	project_folder = str(settings.get_value("projects", "working_folder", ""))
+	project_folder_title = str(settings.get_value("projects", "working_folder_title", ""))
+	project_switch_button.visible = not project_folder.is_empty()
 	project_home = ProjectHome.new()
 	project_home.new_requested.connect(show_new_canvas)
 	project_home.open_requested.connect(func(): open_dialog.popup_centered_ratio(0.75))
 	project_home.sample_requested.connect(func(): create_document(true))
 	project_home.resume_requested.connect(resume_project)
 	project_home.project_requested.connect(open_project)
+	project_home.folder_project_requested.connect(open_folder_project)
+	project_home.folder_picker_requested.connect(choose_project_folder)
+	project_home.folder_refresh_requested.connect(refresh_project_folder)
+	project_home.folder_clear_requested.connect(set_project_folder.bind(""))
 	project_home.visibility_changed.connect(func():
 		queue_layer_preview_refresh()
 		update_panel_reveal_visibility()
@@ -3978,12 +4009,90 @@ func show_project_home() -> void:
 	if session_active and not preserve_recovery(): return
 	var focus = get_viewport().gui_get_focus_owner()
 	if focus: focus.release_focus()
+	prune_missing_recents()
+	update_home_sessions()
+	refresh_project_folder()
+	project_home.show()
+	project_home.move_to_front()
+	project_home.show_folder_tab(not project_folder.is_empty() or recent_projects.is_empty())
+
+func update_home_sessions() -> void:
 	project_home.update_projects(
 		recent_projects, recovered_projects,
 		document.title if session_active else str(settings.get_value("session", "title", "")),
 		session_active or FileAccess.file_exists(RECOVERY_PATH))
-	project_home.show()
-	project_home.move_to_front()
+
+func choose_project_folder() -> void:
+	if not project_folder.is_empty() and not project_folder.begins_with("content://"):
+		project_folder_dialog.current_dir = project_folder
+	project_folder_dialog.popup_centered_ratio(0.75)
+
+func set_project_folder(path: String) -> void:
+	var result := ProjectFolder.scan(path) if not path.is_empty() else {}
+	if result.has("error"):
+		notify(result.error)
+		return
+	if not path.is_empty() and not ProjectFolder.persist(path):
+		notify("Havu could not keep access to that folder. Choose it again to grant access.")
+		return
+	var title := str(result.get("title", ""))
+	settings.set_value("projects", "working_folder", path)
+	settings.set_value("projects", "working_folder_title", title)
+	if settings.save("user://preferences.cfg") != OK:
+		settings.set_value("projects", "working_folder", project_folder)
+		settings.set_value("projects", "working_folder_title", project_folder_title)
+		notify("Could not save the working folder.")
+		return
+	project_folder = path
+	project_folder_title = title
+	project_switch_button.visible = not project_folder.is_empty()
+	present_project_folder(result)
+	project_home.show_folder_tab(true)
+
+func refresh_project_folder() -> void:
+	present_project_folder(ProjectFolder.scan(project_folder) if not project_folder.is_empty() else {})
+
+func present_project_folder(result: Dictionary) -> void:
+	if not result.has("title"): result["title"] = project_folder_title
+	project_home.update_folder(project_folder, result, current_folder_project(result.get("entries", [])))
+
+func current_folder_project(entries: Array) -> String:
+	if not session_active or file_path.is_empty(): return ""
+	var current := project_path_key(file_path)
+	for entry in entries:
+		if project_path_key(entry.path) == current: return entry.path
+	return ""
+
+func show_project_switch_menu() -> void:
+	if project_folder.is_empty() or project_loading_overlay.visible: return
+	var result := ProjectFolder.scan(project_folder)
+	var entries: Array = result.get("entries", [])
+	var current := current_folder_project(entries)
+	project_switch_menu.clear()
+	project_switch_menu.add_separator(short_project_menu_label(result.get("title", project_folder_title)))
+	for index in entries.size():
+		var entry: Dictionary = entries[index]
+		project_switch_menu.add_radio_check_item(short_project_menu_label(entry.name.get_basename()), index + 1)
+		project_switch_menu.set_item_metadata(-1, entry.path)
+		project_switch_menu.set_item_checked(-1, entry.path == current)
+	if entries.is_empty():
+		project_switch_menu.add_item("Folder unavailable" if result.has("error") else "No Havu projects")
+		project_switch_menu.set_item_disabled(-1, true)
+	project_switch_menu.add_separator()
+	project_switch_menu.add_item("Browse Projects…", 0)
+	project_switch_menu.reset_size()
+	var anchor := project_title_group.get_screen_position() + Vector2(0, project_title_group.size.y + 4)
+	project_switch_menu.popup(Rect2i(Vector2i(anchor), Vector2i(ceili(project_title_group.size.x), 0)))
+
+func short_project_menu_label(value: String) -> String:
+	return value.left(55) + "…" if value.length() > 56 else value
+
+func open_folder_project(path: String) -> void:
+	if project_loading_overlay.visible: return
+	if session_active and not file_path.is_empty() and project_path_key(path) == project_path_key(file_path):
+		resume_project()
+		return
+	await open_project(path)
 
 func resume_project() -> void:
 	if project_loading_overlay.visible: return
@@ -4021,7 +4130,7 @@ func load_project_lists() -> void:
 	if stored_recent is Array: entries.append_array(stored_recent)
 	for entry in entries:
 		if not entry is Dictionary or not entry.get("path") is String or not entry.get("title") is String: continue
-		if entry.path.is_empty(): continue
+		if entry.path.is_empty() or not FileAccess.file_exists(entry.path): continue
 		var key := project_path_key(entry.path)
 		if seen.has(key): continue
 		seen[key] = true
@@ -4040,6 +4149,13 @@ func load_project_lists() -> void:
 	if recent_projects.size() > 6: recent_projects.resize(6)
 	if stored_recent != recent_projects or stored_recovered != recovered_projects: save_project_lists()
 
+func prune_missing_recents() -> bool:
+	var available := recent_projects.filter(func(entry): return FileAccess.file_exists(entry.path))
+	if available.size() == recent_projects.size(): return false
+	recent_projects = available
+	save_project_lists()
+	return true
+
 func save_project_lists() -> bool:
 	settings.set_value("projects", "recent", recent_projects.duplicate())
 	settings.set_value("projects", "recovered", recovered_projects.duplicate())
@@ -4049,7 +4165,9 @@ func save_project_lists() -> bool:
 
 func remember_project(path: String) -> void:
 	if path.begins_with("content://") and Engine.has_singleton("AndroidRuntime"):
-		Engine.get_singleton("AndroidRuntime").updatePersistableUriPermission(path, true)
+		# A document selected through a working folder inherits the tree grant.
+		if path.get_slice("/", 3) != "tree":
+			Engine.get_singleton("AndroidRuntime").updatePersistableUriPermission(path, true)
 	var key := project_path_key(path)
 	for index in range(recent_projects.size() - 1, -1, -1):
 		if project_path_key(recent_projects[index].path) == key: recent_projects.remove_at(index)
@@ -4853,7 +4971,7 @@ func build_header() -> void:
 	brand_button.add_theme_stylebox_override("normal", style(Color.TRANSPARENT, 7, Color.TRANSPARENT, 6))
 	row.add_child(brand_button)
 	file_menu = PopupMenu.new()
-	for entry in [["Projects", 6], ["New illustration", 0], ["Open…", 1], ["Save", 2], ["Save as…", 3], ["Resize canvas…", 10], ["Import image as layer…", 7], ["Export SVG…", 4], ["Export PNG…", 5], ["Export active layer as PNG…", 8]]:
+	for entry in [["Switch project…", 6], ["New illustration", 0], ["Open…", 1], ["Save", 2], ["Save as…", 3], ["Resize canvas…", 10], ["Import image as layer…", 7], ["Export SVG…", 4], ["Export PNG…", 5], ["Export active layer as PNG…", 8]]:
 		file_menu.add_item(entry[0], entry[1])
 	file_menu.add_separator()
 	file_menu.add_check_item("Show canvas background", 9)
@@ -4884,8 +5002,12 @@ func build_header() -> void:
 	save_button.name = "QuickSave"
 	row.add_child(save_button)
 	row.add_child(VSeparator.new())
+	project_title_group = HBoxContainer.new()
+	project_title_group.add_theme_constant_override("separation", 0)
+	row.add_child(project_title_group)
 	title_edit = LineEdit.new()
 	title_edit.custom_minimum_size.x = 240
+	title_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	title_edit.max_length = 200
 	title_edit.placeholder_text = "Untitled illustration"
 	title_edit.tooltip_text = "Tap to rename the illustration"
@@ -4895,7 +5017,19 @@ func build_header() -> void:
 	title_edit.add_theme_stylebox_override("normal", style(Color.TRANSPARENT, 5, Color.TRANSPARENT, 8))
 	title_edit.text_submitted.connect(func(_value): title_edit.release_focus())
 	title_edit.focus_exited.connect(rename_document)
-	row.add_child(title_edit)
+	project_title_group.add_child(title_edit)
+	project_switch_button = icon_button("M6 10L13 17L20 10", show_project_switch_menu, "Switch project in working folder")
+	project_switch_button.name = "ProjectSwitch"
+	project_switch_button.accessibility_name = "Switch project in working folder"
+	project_switch_button.hide()
+	project_title_group.add_child(project_switch_button)
+	project_switch_menu = PopupMenu.new()
+	project_switch_menu.add_theme_constant_override("v_separation", 14)
+	project_switch_menu.id_pressed.connect(func(id: int):
+		if id == 0: show_project_home()
+		else: open_folder_project(project_switch_menu.get_item_metadata(project_switch_menu.get_item_index(id))))
+	add_child(project_switch_menu)
+	PopupTouch.watch_launcher(project_switch_button, project_switch_menu)
 	save_label = label("Saved locally", 11, MUTED)
 	save_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	save_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS

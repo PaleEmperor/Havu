@@ -4,6 +4,9 @@ extends RefCounted
 const Art = preload("res://scripts/artwork.gd")
 const Raster = preload("res://scripts/raster_asset.gd")
 const TILE_SIZE := 128
+const MAX_STAGED_TILES := 160
+static var raster: Variant
+static var raster_checked := false
 
 var tiles := {}
 var changed := {}
@@ -11,6 +14,13 @@ var page_size: Vector2i
 var erasing: bool
 var alpha_locked: bool
 var scanline := Image.create_empty(TILE_SIZE, 1, false, Image.FORMAT_RGBA8)
+var first_crossings := PackedFloat64Array()
+var second_crossings := PackedFloat64Array()
+var staged_samples := 0
+var pending_dabs: Array = []
+var next_dab := 0
+var native_stroke := 0
+var seeded_tiles := {}
 
 func apply(layer: Dictionary, page: Vector2i, stroke: Dictionary, erase: bool) -> Dictionary:
 	prepare_layer(layer, page)
@@ -19,6 +29,118 @@ func apply(layer: Dictionary, page: Vector2i, stroke: Dictionary, erase: bool) -
 	for footprint in Art.paint_footprints(stroke):
 		paint_polygon(footprint.polygon, footprint.color)
 	return encode_result(layer)
+
+func begin_android_stage() -> void:
+	if not raster_checked:
+		raster_checked = true
+		if Engine.has_singleton("JavaClassWrapper"):
+			raster = Engine.get_singleton("JavaClassWrapper").wrap("studio.havu.android.HavuPaintRaster")
+	if raster == null: return
+	native_stroke = raster.begin()
+
+func cancel_stage() -> void:
+	if native_stroke > 0: raster.discard(native_stroke)
+	native_stroke = 0
+
+func submit_android(stroke: Dictionary, count: int) -> bool:
+	if count <= staged_samples: return true
+	var footprints := Art.paint_footprints(stroke, staged_samples, count)
+	if footprints.size() > 1024: return false
+	var payload := PackedByteArray()
+	var touched := {}
+	var page := Rect2i(Vector2i.ZERO, page_size)
+	for dab in footprints:
+		var points: PackedVector2Array = dab.polygon
+		if points.size() > 64: return false
+		var bounds := Art.polygon_bounds(points)
+		var start := Vector2i(bounds.position.floor())
+		var stop := Vector2i(bounds.end.ceil())
+		var visible := Rect2i(start, stop - start).intersection(page)
+		if not visible.has_area(): continue
+		var origin := tile_origin(visible.position)
+		for y in range(origin.y, visible.end.y, TILE_SIZE):
+			for x in range(origin.x, visible.end.x, TILE_SIZE):
+				touched[Vector2i(x, y)] = true
+		scanline.fill(dab.color)
+		var offset := payload.size()
+		payload.resize(offset + 24 + points.size() * 8)
+		payload.encode_float(offset, bounds.position.x)
+		payload.encode_float(offset + 4, bounds.position.y)
+		payload.encode_float(offset + 8, bounds.end.x)
+		payload.encode_float(offset + 12, bounds.end.y)
+		payload.encode_u32(offset + 16, scanline.get_data().decode_u32(0))
+		payload.encode_s32(offset + 20, points.size())
+		offset += 24
+		for point in points:
+			payload.encode_float(offset, point.x)
+			payload.encode_float(offset + 4, point.y)
+			offset += 8
+	var seeds := PackedByteArray()
+	for origin: Vector2i in touched:
+		var extent := (page_size - origin).min(Vector2i.ONE * TILE_SIZE)
+		var data := PackedByteArray()
+		if not seeded_tiles.has(origin):
+			seeded_tiles[origin] = true
+			if seeded_tiles.size() > MAX_STAGED_TILES: return false
+			var image := writable_tile(origin)
+			if not image: return false
+			data = image.get_data()
+		var offset := seeds.size()
+		seeds.resize(offset + 20)
+		seeds.encode_s32(offset, origin.x)
+		seeds.encode_s32(offset + 4, origin.y)
+		seeds.encode_s32(offset + 8, extent.x)
+		seeds.encode_s32(offset + 12, extent.y)
+		seeds.encode_s32(offset + 16, data.size())
+		seeds.append_array(data)
+	# Godot exposes this Java boolean as an integer on Android.
+	if not seeds.is_empty() and not bool(raster.submit(native_stroke, payload, seeds)): return false
+	staged_samples = count
+	return true
+
+func collect_android() -> bool:
+	var output: Variant = raster.finish(native_stroke)
+	native_stroke = 0
+	if not output is PackedByteArray or (output.is_empty() and not seeded_tiles.is_empty()): return false
+	var offset := 0
+	while offset < output.size():
+		if offset + 16 > output.size(): return false
+		var origin := Vector2i(output.decode_s32(offset), output.decode_s32(offset + 4))
+		var extent := Vector2i(output.decode_s32(offset + 8), output.decode_s32(offset + 12))
+		var tile: Image = changed.get(origin)
+		if not tile or tile.get_size() != extent: return false
+		var length := extent.x * extent.y * 4
+		offset += 16
+		if offset + length > output.size(): return false
+		tile.set_data(extent.x, extent.y, false, Image.FORMAT_RGBA8, output.slice(offset, offset+length))
+		offset += length
+	return true
+
+func stage_stroke(stroke: Dictionary, budget_usec: int) -> void:
+	# The join on a wet ribbon depends on the following sample.
+	var sample_count: int = stroke.points.size()
+	if budget_usec >= 0 and stroke.get("continuous_edges", false): sample_count -= 1
+	if native_stroke > 0:
+		if submit_android(stroke, sample_count):
+			if budget_usec >= 0 or collect_android(): return
+		cancel_stage()
+		changed.clear()
+		staged_samples = 0
+
+	var deadline := Time.get_ticks_usec() + budget_usec
+	while staged_samples < sample_count or not pending_dabs.is_empty():
+		if pending_dabs.is_empty():
+			var next := sample_count if budget_usec < 0 else mini(sample_count, staged_samples + 3)
+			pending_dabs = Art.paint_footprints(stroke, staged_samples, next)
+			staged_samples = next
+		while next_dab < pending_dabs.size():
+			var dab: Dictionary = pending_dabs[next_dab]
+			paint_polygon(dab.polygon, dab.color)
+			next_dab += 1
+			if budget_usec >= 0 and Time.get_ticks_usec() >= deadline: return
+		pending_dabs.clear()
+		next_dab = 0
+		if budget_usec >= 0 and Time.get_ticks_usec() >= deadline: break
 
 func prepare_layer(layer: Dictionary, page: Vector2i) -> void:
 	page_size = page
@@ -243,8 +365,12 @@ func paint_polygon(polygon: PackedVector2Array, color: Color) -> void:
 	var first_y := maxi(0, floori(bounds.position.y))
 	var stop_y := mini(page_size.y, ceili(bounds.end.y))
 	if first_y >= stop_y: return
-	var rows: Array[Array] = []
-	for index in range(stop_y - first_y): rows.append([])
+	var row_count := stop_y - first_y
+	first_crossings.resize(row_count)
+	second_crossings.resize(row_count)
+	first_crossings.fill(INF)
+	second_crossings.fill(INF)
+	var extra_crossings := {}
 	var previous := polygon[-1]
 	# Visit each edge only on rows that cross it. The same half-pixel rule
 	# governs horizontal edges and coincident vertices as in span filling.
@@ -252,16 +378,27 @@ func paint_polygon(polygon: PackedVector2Array, color: Color) -> void:
 		var from_y := maxi(first_y, ceili(minf(previous.y, point.y) - 0.5))
 		var to_y := mini(stop_y, ceili(maxf(previous.y, point.y) - 0.5))
 		for y in range(from_y, to_y):
-			rows[y - first_y].append(lerpf(previous.x, point.x, (float(y) + 0.5 - previous.y) / (point.y - previous.y)))
+			var row := y - first_y
+			var crossing := lerpf(previous.x, point.x, (float(y) + 0.5 - previous.y) / (point.y - previous.y))
+			if first_crossings[row] == INF: first_crossings[row] = crossing
+			elif second_crossings[row] == INF: second_crossings[row] = crossing
+			elif extra_crossings.has(row): extra_crossings[row].append(crossing)
+			else: extra_crossings[row] = [first_crossings[row], second_crossings[row], crossing]
 		previous = point
 	if not erasing and not alpha_locked and color.a < 1.0: scanline.fill(color)
-	for index_y in rows.size():
-		var crossings: Array = rows[index_y]
-		crossings.sort()
-		for index in range(0, crossings.size() - 1, 2):
-			var start := maxi(0, ceili(crossings[index] - 0.5))
-			var stop := mini(page_size.x, ceili(crossings[index + 1] - 0.5))
-			paint_span(first_y + index_y, start, stop, color)
+	for row in row_count:
+		if second_crossings[row] == INF: continue
+		var y := first_y + row
+		if extra_crossings.has(row):
+			var crossings: Array = extra_crossings[row]
+			crossings.sort()
+			for index in range(0, crossings.size() - 1, 2):
+				paint_span(y, maxi(0, ceili(crossings[index] - 0.5)),
+					mini(page_size.x, ceili(crossings[index + 1] - 0.5)), color)
+		else:
+			var left := minf(first_crossings[row], second_crossings[row])
+			var right := maxf(first_crossings[row], second_crossings[row])
+			paint_span(y, maxi(0, ceili(left - 0.5)), mini(page_size.x, ceili(right - 0.5)), color)
 
 func paint_span(y: int, start: int, stop: int, ink: Color) -> void:
 	var x := start

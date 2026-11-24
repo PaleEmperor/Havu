@@ -553,7 +553,7 @@ static func use_screen_edges(target: CanvasItem, object: Dictionary) -> void:
 		target.material = grain_material
 		return
 	if object.kind not in SHAPES and not (object.kind == "stroke" and (
-			uses_ink_outline(object) or uses_wet_batches(object))): return
+			uses_stroke_mesh(object))): return
 	if edge_material == null:
 		edge_material = ShaderMaterial.new()
 		edge_material.shader = VECTOR_EDGE_SHADER
@@ -683,28 +683,40 @@ static func stroke_batch_size(object: Dictionary) -> int:
 static func uses_ink_outline(object: Dictionary) -> bool:
 	return object.brush == "ink" and float(object.get("opacity_pressure", 0.0)) == 0.0
 
-static func uses_wet_batches(object: Dictionary) -> bool:
-	return object.get("brush") in ["paint", "mix", "soft"] and not object.has("clip") and not object.has("paint_mask")
+static func uses_stroke_mesh(object: Dictionary) -> bool:
+	return uses_ink_outline(object) or object.get("brush") in ["paint", "mix", "soft"]
 
 static func wet_batch_geometry(object: Dictionary, first: int, end: int) -> Dictionary:
 	var vertices := PackedVector2Array()
 	var colors := PackedColorArray()
 	var uv := PackedVector2Array()
 	var indices := PackedInt32Array()
-	for dab in segments(object, first, end):
+	var antialias := not object.has("paint_mask")
+	for dab in paint_footprints(object, first, end):
 		var polygon: PackedVector2Array = dab.polygon
 		var triangles := Geometry2D.triangulate_polygon(polygon)
 		if triangles.is_empty(): continue
-		var geometry := screen_edge_geometry(polygon, triangles, dab.color)
 		var offset := vertices.size()
-		for index in geometry.indices: indices.append(offset + index)
-		vertices.append_array(geometry.vertices)
-		colors.append_array(geometry.colors)
-		uv.append_array(geometry.uv)
+		if antialias:
+			var geometry := screen_edge_geometry(polygon, triangles, dab.color)
+			for index in geometry.indices: indices.append(offset + index)
+			vertices.append_array(geometry.vertices)
+			colors.append_array(geometry.colors)
+			uv.append_array(geometry.uv)
+		else:
+			for index in triangles: indices.append(offset + index)
+			vertices.append_array(polygon)
+			uv.resize(vertices.size())
+			var next_colors := PackedColorArray()
+			next_colors.resize(polygon.size())
+			next_colors.fill(dab.color)
+			colors.append_array(next_colors)
 	return {"vertices": vertices, "colors": colors, "indices": indices, "uv": uv}
 
 static func build_wet_mesh(object: Dictionary, first: int, end: int) -> ArrayMesh:
-	var geometry := wet_batch_geometry(object, first, end)
+	return stroke_mesh_from_geometry(wet_batch_geometry(object, first, end))
+
+static func stroke_mesh_from_geometry(geometry: Dictionary) -> ArrayMesh:
 	if geometry.indices.is_empty(): return null
 	var arrays := []
 	arrays.resize(Mesh.ARRAY_MAX)
@@ -740,7 +752,7 @@ static func draw_stroke_range(target: CanvasItem, object: Dictionary, first: int
 	if grain_material != null and target.material == grain_material and uses_grain_instances(object):
 		draw_grain(target, object, first, end, batch_index)
 		return
-	if edge_material != null and target.material == edge_material and uses_wet_batches(object):
+	if edge_material != null and target.material == edge_material and uses_stroke_mesh(object):
 		# One GPU polygon buffer per batch, with source-over order preserved.
 		var batch := wet_batch_geometry(object, first, end)
 		if not batch.indices.is_empty():
@@ -878,22 +890,24 @@ static func clipped_stroke_has_paint(object: Dictionary) -> bool:
 			if not clipped_polygon(object, segment.polygon, mask).is_empty(): return true
 	return false
 
-static func paint_footprints(object: Dictionary) -> Array:
+static func paint_footprints(object: Dictionary, first := 0, end := -1) -> Array:
 	var footprints := []
 	var mask := prepare_paint_mask(object)
+	var clip := prepare_polygon_clip(object)
 	var batch := stroke_batch_size(object)
-	for first in range(0, object.points.size(), batch):
-		var end := mini(first + batch, object.points.size())
+	var limit: int = object.points.size() if end < 0 else mini(end, object.points.size())
+	for offset in range(first, limit, batch):
+		var stop := mini(offset + batch, limit)
 		if uses_ink_outline(object):
-			var outline := ink_outline(object, first, end)
+			var outline := ink_outline(object, offset, stop)
 			if not Geometry2D.triangulate_polygon(outline).is_empty():
 				var color := Color(object.color)
 				color.a *= object.opacity
-				for piece in clipped_polygon(object, outline, mask):
+				for piece in clipped_polygon(object, outline, mask, clip):
 					footprints.append({"polygon": piece, "color": color})
 				continue
-		for dab in segments(object, first, end):
-			for piece in clipped_polygon(object, dab.polygon, mask):
+		for dab in segments(object, offset, stop):
+			for piece in clipped_polygon(object, dab.polygon, mask, clip):
 				footprints.append({"polygon": piece, "color": dab.color})
 	return footprints
 
@@ -1079,7 +1093,7 @@ static func svg(document, embed_fonts = true) -> String:
 							[y, family.xml_escape(true), font_attributes, object.font_size, object.color, object.opacity, line.xml_escape()])
 						y += object.font_size * 1.35
 				"stroke":
-					if object.points.size() < 64:
+					if object.points.size() < 32:
 						output.append(svg_stroke(object))
 					else:
 						var local := local_stroke_style(object)
@@ -1118,6 +1132,12 @@ static func svg_stroke(object: Dictionary) -> String:
 	return "\n".join(output)
 
 static func svg_shape(object: Dictionary) -> String:
+	if object.kind == "ellipse" and object.extent[0] >= 0.0 and object.extent[1] >= 0.0 \
+			and not object.has("outline_width"):
+		var radii := v(object.extent) * 0.5
+		var color := Color(object.color)
+		return '<ellipse cx="%s" cy="%s" rx="%s" ry="%s" fill="#%s" fill-opacity="%s"/>' % [
+			radii.x, radii.y, radii.x, radii.y, color.to_html(false), color.a * object.opacity]
 	var points := polygon(object)
 	if not object.get("compound_disjoint", false) and not object.has("fill_enabled") and not object.has("outline_width") and not object.has("corner_radius"):
 		return svg_polygon(points, Color(object.color), object.opacity)

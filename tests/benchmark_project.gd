@@ -84,12 +84,17 @@ func run() -> void:
 	for index in 4:
 		await measure("Select dense layer", app.select_layer.bind(dense_id))
 		await measure("Select drawing layer", app.select_layer.bind(initial_id))
+	app.set_tool("brush")
 	for engine in ["ink", "mix"]:
 		canvas.brush = engine
 		canvas.brush_size = 12.0
 		for index in 4:
 			var point := Vector2(doc.width * 0.22, doc.height * (0.22 + index * 0.05))
 			await measure(engine + " down", canvas.begin.bind(canvas.origin + point * canvas.zoom, 0.62))
+			if not canvas.drawing or canvas.current.get("brush") != engine:
+				printerr("HAVU_PROJECT_ERROR expected %s stroke on the active layer" % engine)
+				get_tree().quit(1)
+				return
 			for sample in 12:
 				var next := point + Vector2(doc.width * (sample + 1) * 0.042, sin(sample * 0.52) * 22)
 				await measure(engine + " move", canvas.update_stroke.bind(canvas.origin + next * canvas.zoom, 0.7))
@@ -103,17 +108,9 @@ func run() -> void:
 		await measure("Object miss", canvas.hit.bind(Vector2(-50 - index, 20), true), false)
 	doc.select_objects(ids)
 	if not ids.is_empty():
-		var grouped := doc.group_selected()
-		await frame()
-		canvas.tool = "select"
-		canvas.start = canvas.items_bounds(canvas.transformable_items()).get_center()
-		if canvas.begin_selection_move(canvas.start):
-			for index in 12:
-				await measure("Move 30 selected", canvas.update_selection_move.bind(canvas.start + Vector2(10 + index * 4, 12)))
-			await measure("Commit move", canvas.finish)
-			await measure("Undo move", doc.undo)
-		if grouped: doc.undo()
-		canvas.tool = "brush"
+		await measure_transform(ids.slice(0, 1), 4)
+		if ids.size() > 1: await measure_transform(ids, 2)
+		app.set_tool("brush")
 	app.select_layer(initial_id)
 	for index in 3:
 		await measure("Serialize and save", doc.save_to.bind(SAVE), false)
@@ -132,3 +129,18 @@ func run() -> void:
 			values[1][ceili(n * 0.95) - 1], values[1][-1]])
 	print("HAVU_PROJECT_DONE")
 	get_tree().quit()
+
+func measure_transform(ids: Array[String], repeats: int) -> void:
+	app.set_tool("select")
+	for repeat in repeats:
+		doc.select_objects(ids)
+		var grouped := ids.size() > 1 and doc.group_selected()
+		await frame()
+		canvas.start = canvas.items_bounds(canvas.transformable_items()).get_center()
+		if canvas.begin_selection_move(canvas.start):
+			for index in 12:
+				await measure("Move %d selected" % ids.size(),
+					canvas.update_selection_move.bind(canvas.start + Vector2(10 + index * 4, 12)))
+			await measure("Commit move %d" % ids.size(), canvas.finish)
+			await measure("Undo move %d" % ids.size(), doc.undo)
+		if grouped: doc.undo()

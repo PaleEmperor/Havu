@@ -2,7 +2,7 @@
 
 **A little illustration studio for Android tablets.**
 
-[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.73/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
+[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.74/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
 
 I wanted my wife to have somewhere of her own to draw. A little studio on her
 tablet, with brushes she could make her own, artwork she could scale into shop
@@ -51,6 +51,10 @@ I’d love for you to use it, share it, or make it your own.
   **Input settings** to assign the eraser, color picker, or pan.
 
 ## Save and share
+
+Use **Open folder…** on the Projects screen to keep a folder of illustrations
+together. Tap the arrow beside the canvas title to switch to another project
+in that folder while you work.
 
 Tap **Save** to keep an editable `.havu` project. Use **File** to export SVG or
 PNG, or choose **Resume last session** on the Projects screen to pick up where

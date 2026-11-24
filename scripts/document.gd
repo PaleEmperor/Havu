@@ -134,9 +134,12 @@ func append_with_history(object: Dictionary) -> void:
 func paints_pixels() -> bool:
 	return not layers.is_empty() and layers[active].get("type", "vector") == "paint"
 
-func commit_paint(stroke: Dictionary, erasing: bool) -> Error:
+func commit_paint(stroke: Dictionary, erasing: bool, staged: PaintTiles = null) -> Error:
 	if not editable() or not paints_pixels(): return ERR_UNAVAILABLE
 	var layer: Dictionary = layers[active]
+	if staged:
+		staged.stage_stroke(stroke, -1)
+		return record_paint_result(layer, staged.encode_result(layer))
 	var result := PaintTiles.new().apply(layer, Vector2i(ceili(width), ceili(height)), stroke, erasing)
 	return record_paint_result(layer, result)
 
@@ -1320,18 +1323,22 @@ func load_from(path: String) -> String:
 	changed.emit()
 	return ""
 
-static func read_project(path: String) -> Dictionary:
+static func read_project(path: String, include_source := false) -> Dictionary:
 	var file := FileAccess.open(path, FileAccess.READ)
 	if file == null: return {"error": "Project could not be opened: " + error_string(FileAccess.get_open_error())}
-	if file.get_length() > MAX_PROJECT_BYTES:
+	var length := file.get_length()
+	if length > MAX_PROJECT_BYTES:
 		file.close()
 		return {"error": "Project exceeds the 64 MB beta limit."}
-	var contents := file.get_as_text()
+	var source := file.get_buffer(length)
 	file.close()
 	var parser := JSON.new()
-	if parser.parse(contents) != OK: return {"error": "This is not a valid Havu project."}
+	if parser.parse(source.get_string_from_utf8()) != OK: return {"error": "This is not a valid Havu project."}
 	var error := validate(parser.data)
-	return {"project": parser.data} if error.is_empty() else {"error": error}
+	if not error.is_empty(): return {"error": error}
+	var validated := {"project": parser.data}
+	if include_source: validated.source = source
+	return validated
 
 static func validate(data) -> String:
 	if not data is Dictionary or data.get("format") != "havu" or (data.get("version") != VERSION and data.get("version") != DISJOINT_COMPOUND_VERSION and data.get("version") != ORIENTED_OBJECT_VERSION):

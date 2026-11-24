@@ -14,7 +14,7 @@ const ROTATION_HANDLE_GAP := 26.0
 const ROTATION_HANDLE_RADIUS := 14.0
 const SNAP_DISTANCE := 8.0
 const PAINT_CACHE_THRESHOLD := 1200
-const DOCUMENT_CACHE_THRESHOLD := 4800
+const DOCUMENT_CACHE_THRESHOLD := 2000
 const MAX_PAINT_CACHES := 4
 const CACHE_NAVIGATION_SETTLE := 0.12
 const PICK_GRID_THRESHOLD := 160
@@ -22,10 +22,15 @@ const PICK_CELL_SIZE := 96.0
 const MAX_PICK_CELLS := 64
 const WET_MESH_SAMPLE_BUDGET := 26000
 const MAX_WET_MESH_SAMPLES := 2048
+const INK_MESH_BYTE_BUDGET := 64 * 1024 * 1024
+const DENSE_INK_MESH_THRESHOLD := 50000
+const MAX_CACHED_INK_POINTS := 8192
+const INK_MESH_BYTES := &"_ink_mesh_bytes"
 const STROKE_REDO_MESH_LIMIT := 6
 const STROKE_REDO_SAMPLE_LIMIT := 900
 const WET_PIGMENT_SPACING := 0.26
 const INK_SAMPLES_PER_MOTION := 16
+const PAINT_STAGING_USEC := 4500
 const ANDROID_POINTER_IDLE := 0.18
 const DEFAULT_STROKE_NODE_SPREAD := 0.25
 const SHAPE_TOOLS := {
@@ -103,6 +108,9 @@ var raw_point := Vector2.ZERO
 var raw_pressure := 0.55
 var input_was_accumulated := true
 var last_brush_activity := -10000
+var staged_paint: Document.PaintTiles
+var staged_paint_layer := ""
+var staged_paint_revision := -1
 var last_pressure = 0.55
 var metrics_pointer := Vector2.INF
 var metrics_pressure := -1.0
@@ -142,6 +150,7 @@ var cache_recent_strokes := OS.has_feature("android")
 var paint_cache: IsolatedOpacity
 var layer_cache_costs := {}
 var wet_mesh_samples := 0
+var ink_mesh_bytes := 0
 var stroke_redo_meshes := {}
 var overview_cache := false
 var opacity_preview_layer := ""
@@ -167,6 +176,7 @@ func _ready() -> void:
 	mouse_filter = Control.MOUSE_FILTER_STOP
 	mouse_default_cursor_shape = Control.CURSOR_CROSS
 	set_process_input(false)
+	set_process(false)
 	mouse_exited.connect(clear_pointer_metrics)
 	resized.connect(resize_view)
 	page_clip = Control.new()
@@ -192,6 +202,30 @@ func _ready() -> void:
 		selection_overlay.draw.connect(draw_selection)
 		add_child(selection_overlay)
 	sync_artwork()
+
+func _process(_delta: float) -> void:
+	if staged_paint: staged_paint.stage_stroke(current, PAINT_STAGING_USEC)
+
+func _exit_tree() -> void:
+	end_paint_staging()
+
+func stage_wide_paint(layer: Dictionary) -> void:
+	# Stage final brush footprints in private tiles. The document receives
+	# one edit when the pen lifts.
+	if layer.get("type", "vector") != "paint" or current.brush not in ["soft", "paint", "mix"] or current.size < 96.0 \
+			or current.get("taper_start", 0.0) > 0.0 or current.get("taper_end", 0.0) > 0.0 \
+			or current.get("erasing", false) or layer.get("alpha_locked", false): return
+	staged_paint = Document.PaintTiles.new()
+	staged_paint.prepare_layer(layer, Vector2i(ceili(document.width), ceili(document.height)))
+	staged_paint.begin_android_stage()
+	staged_paint_layer = layer.id
+	staged_paint_revision = document.revision
+	set_process(true)
+
+func end_paint_staging() -> void:
+	if staged_paint: staged_paint.cancel_stage()
+	staged_paint = null
+	set_process(false)
 
 func resize_view() -> void:
 	if exporting: return
@@ -877,6 +911,7 @@ func should_promote_cache(layer: Dictionary, object: Dictionary) -> bool:
 
 func remember_redo_mesh(entry: Dictionary) -> void:
 	var mark: Node2D = entry.mark
+	if mark.has_meta(INK_MESH_BYTES): return
 	if not mark.has_meta(Art.WET_MESH) or int(mark.get_meta(Art.WET_MESH_SAMPLES, 0)) > STROKE_REDO_SAMPLE_LIMIT: return
 	if stroke_redo_meshes.size() >= STROKE_REDO_MESH_LIMIT:
 		stroke_redo_meshes.erase(stroke_redo_meshes.keys()[0])
@@ -893,7 +928,10 @@ func mount_mark(holder: Node2D, object: Dictionary, layer_id: String) -> Diction
 	var mark := Node2D.new()
 	if object.kind == "image": mark.texture_filter = CanvasItem.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
 	Art.use_screen_edges(mark, object)
-	if not exporting and object.kind == "stroke" and Art.uses_wet_batches(object):
+	var cache_ink: bool = not exporting and object.kind == "stroke" and Art.uses_ink_outline(object) \
+		and object.points.size() <= MAX_CACHED_INK_POINTS and (object.points.size() > MAX_WET_MESH_SAMPLES \
+		or (object.points.size() >= 128 and layer_cache_costs.get(layer_id, 0) >= DENSE_INK_MESH_THRESHOLD))
+	if not cache_ink and not exporting and object.kind == "stroke" and Art.uses_stroke_mesh(object):
 		var samples: int = object.points.size()
 		# Soft dabs carry several feather rings, unlike the wet ribbon brushes.
 		var cost := samples * (4 if object.brush == "soft" else 1)
@@ -901,10 +939,33 @@ func mount_mark(holder: Node2D, object: Dictionary, layer_id: String) -> Diction
 			wet_mesh_samples += cost
 			mark.set_meta(Art.WET_MESH_SAMPLES, cost)
 			inherit_wet_geometry(mark, object)
-	mark.draw.connect(Art.draw_object.bind(mark, object, Vector2.ZERO, 1.0, true))
+	if cache_ink: mark.draw.connect(draw_cached_ink.bind(mark, object))
+	else: mark.draw.connect(Art.draw_object.bind(mark, object, Vector2.ZERO, 1.0, true))
 	mark.transform = Art.object_transform(object)
 	holder.add_child(mark)
 	return {"mark": mark, "object": object, "appearance": object.duplicate(), "layer": layer_id}
+
+func draw_cached_ink(mark: Node2D, object: Dictionary) -> void:
+	if not mark.has_meta(INK_MESH_BYTES) and ink_mesh_bytes < INK_MESH_BYTE_BUDGET:
+		var geometry := Art.wet_batch_geometry(object, 0, object.points.size())
+		# Positions and UVs are vec2, colors are RGBA8, and indices are 32-bit.
+		var bytes: int = geometry.vertices.size() * 20 + geometry.indices.size() * 4
+		if bytes > 0 and ink_mesh_bytes + bytes <= INK_MESH_BYTE_BUDGET:
+			var mesh := Art.stroke_mesh_from_geometry(geometry)
+			if mesh:
+				ink_mesh_bytes += bytes
+				mark.set_meta(INK_MESH_BYTES, bytes)
+				mark.set_meta(Art.WET_MESH, mesh)
+	if mark.has_meta(INK_MESH_BYTES):
+		mark.draw_mesh(mark.get_meta(Art.WET_MESH), null)
+	else:
+		Art.draw_object(mark, object, Vector2.ZERO, 1.0, true)
+
+func invalidate_stroke_mesh(mark: Node2D) -> void:
+	if mark.has_meta(INK_MESH_BYTES):
+		ink_mesh_bytes -= int(mark.get_meta(INK_MESH_BYTES))
+		mark.remove_meta(INK_MESH_BYTES)
+	if mark.has_meta(Art.WET_MESH): mark.remove_meta(Art.WET_MESH)
 
 func update_mark_pose(object: Dictionary) -> Node2D:
 	var entry: Dictionary = retained_marks.get(object.id, {})
@@ -992,7 +1053,7 @@ func sync_artwork(only_layer_id := "") -> void:
 			if full_sync and layer.id == cache_layers[0]: paint_cache = holder
 			holder.allow_overview = holder == paint_cache
 			holder.document_bounds = page_bounds().grow(4.0) if use_document_cache else Rect2()
-			holder.keep_recent_marks = not use_group and holder == paint_cache and cache_recent_strokes \
+			holder.keep_recent_marks = holder == paint_cache and cache_recent_strokes \
 				and (not overview_cache or use_document_cache) and cost >= PAINT_CACHE_THRESHOLD
 		if use_group: set_holder_opacity(holder, layer_alpha)
 		if holder.get_index() != layer_index: artwork_root.move_child(holder, layer_index)
@@ -1080,8 +1141,12 @@ func sync_artwork(only_layer_id := "") -> void:
 	else: redraw_view()
 
 func cache_sample_cost(object: Dictionary) -> int:
-	if object.kind != "stroke": return 0
-	return object.points.size() * (5 if object.brush in ["soft", "pencil", "chalk"] else 1)
+	match object.kind:
+		"stroke": return object.points.size() * (5 if object.brush in ["soft", "pencil", "chalk"] else 1)
+		"ellipse": return 16
+		"polygon", "path": return maxi(4, object.vertices.size() / 4)
+		"rect": return 4
+	return 0
 
 func is_artwork_cache(holder: Node2D) -> bool:
 	return holder is IsolatedOpacity and holder.cache_finished_marks
@@ -1118,9 +1183,15 @@ func refresh_background_cache(previous_layer_id: String) -> void:
 	var index: int = document.layer_index(previous_layer_id)
 	if index < 0 or int(layer_cache_costs.get(previous_layer_id, 0)) < PAINT_CACHE_THRESHOLD: return
 	var layer: Dictionary = document.layers[index]
-	if float(layer.get("opacity", 1.0)) > 0.0 and layer_is_visible(layer) \
-			and not is_artwork_cache(layer_renderers.get(previous_layer_id)):
-		sync_artwork()
+	if float(layer.get("opacity", 1.0)) <= 0.0 or not layer_is_visible(layer) \
+			or is_artwork_cache(layer_renderers.get(previous_layer_id)): return
+	var capacity := MAX_PAINT_CACHES if cache_extra_layers else 1
+	var occupied := 0
+	for holder in layer_renderers.values():
+		if is_artwork_cache(holder) and holder.visible:
+			occupied += 1
+			if occupied >= capacity: return
+	sync_artwork()
 
 func scope_key(layer_id: String, object_id: String, depth: int) -> String:
 	return "%s:%s:%d" % [layer_id, object_id, depth]
@@ -1155,6 +1226,7 @@ func holder_artwork(holder: Node2D) -> Node2D:
 
 func remove_mark(mark: Node2D) -> void:
 	wet_mesh_samples -= int(mark.get_meta(Art.WET_MESH_SAMPLES, 0))
+	ink_mesh_bytes -= int(mark.get_meta(INK_MESH_BYTES, 0))
 	mark.get_parent().remove_child(mark)
 	mark.queue_free()
 
@@ -1970,6 +2042,7 @@ func begin(screen: Vector2, pressure: float, shortcut: String = "") -> void:
 		if not mask.is_empty(): current.paint_mask = mask.duplicate(true)
 		raw_pressure = BrushLibrary.map_pressure(pressure, current)
 		append_point(point, raw_pressure, true)
+		stage_wide_paint(layer)
 	elif action in SHAPE_TOOLS:
 		current = new_shape(SHAPE_TOOLS[action], point)
 		update_drag_shape(point)
@@ -2087,7 +2160,7 @@ func update_stroke(screen: Vector2, pressure: float) -> void:
 		var entry: Dictionary = retained_marks.get(object.id, {})
 		if not entry.is_empty():
 			entry.erase("bounds")
-			entry.mark.remove_meta(Art.WET_MESH)
+			invalidate_stroke_mesh(entry.mark)
 			entry.mark.queue_redraw()
 		if not entry.is_empty():
 			var holder: Node2D = layer_renderers.get(entry.layer)
@@ -2154,7 +2227,9 @@ func finish() -> void:
 		if document.editable():
 			if current.kind == "stroke" and document.paints_pixels():
 				var erasing: bool = current.get("erasing", false)
-				if document.commit_paint(current, erasing) != OK:
+				var stable: bool = staged_paint != null and staged_paint_revision == document.revision \
+					and staged_paint_layer == document.layers[document.active].id
+				if document.commit_paint(current, erasing, staged_paint if stable else null) != OK:
 					status.emit("The project has reached its embedded paint size limit.")
 				elif not erasing: color_used.emit(stroke_pigment)
 			else:
@@ -2169,6 +2244,7 @@ func finish() -> void:
 	elif edit_started:
 		if not moving_selection.is_empty(): document.record_transform(moving_selection)
 		else: document.commit()
+	end_paint_staging()
 	refresh_transform_cache()
 	edit_started = false
 	end_preview()
@@ -2184,6 +2260,7 @@ func finish() -> void:
 	refresh_selection()
 
 func cancel(keep_picks := false) -> void:
+	end_paint_staging()
 	clear_path()
 	if document != null and not keep_picks and not marquee_active and (not selected_area.is_empty() or not document.area_selection.is_empty()):
 		clear_selection()
