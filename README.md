@@ -2,7 +2,7 @@
 
 **A little illustration studio for Android tablets.**
 
-[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.70/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
+[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.73/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
 
 I wanted my wife to have somewhere of her own to draw. A little studio on her
 tablet, with brushes she could make her own, artwork she could scale into shop

@@ -499,8 +499,35 @@ static func polygon_bounds(points: PackedVector2Array) -> Rect2:
 	for point in points: bounds = bounds.expand(point)
 	return bounds
 
-static func clipped_polygon(object: Dictionary, points: PackedVector2Array, paint_mask := []) -> Array:
-	var pieces: Array = Geometry2D.intersect_polygons(points, unpack_polygon(object.clip)) if object.has("clip") else [points]
+static func prepare_polygon_clip(object: Dictionary) -> Dictionary:
+	if not object.has("clip"): return {}
+	var outline := unpack_polygon(object.clip)
+	var bounds := polygon_bounds(outline)
+	var rectangle := outline.size() == 4 and bounds.has_area()
+	if rectangle:
+		# Every corner must appear in perimeter order. Concave or rotated
+		# selections still use the polygon clipper.
+		for index in outline.size():
+			var point := outline[index]
+			var edge := outline[(index + 1) % outline.size()] - point
+			if (point.x != bounds.position.x and point.x != bounds.end.x) \
+					or (point.y != bounds.position.y and point.y != bounds.end.y) \
+					or (edge.x == 0.0) == (edge.y == 0.0):
+				rectangle = false
+				break
+		rectangle = rectangle and absf(Compound.signed_area(outline)) == bounds.get_area()
+	return {"outline": outline, "bounds": bounds, "rectangle": rectangle}
+
+static func clipped_polygon(object: Dictionary, points: PackedVector2Array, paint_mask := [],
+		prepared_clip := {}) -> Array:
+	var pieces: Array = [points]
+	if object.has("clip"):
+		if points.size() < 3: return []
+		var clip: Dictionary = prepared_clip if not prepared_clip.is_empty() else prepare_polygon_clip(object)
+		var bounds := polygon_bounds(points)
+		if not bounds.intersects(clip.bounds, true): return []
+		if prepared_clip.is_empty() or not clip.rectangle or not clip.bounds.encloses(bounds):
+			pieces = Geometry2D.intersect_polygons(points, clip.outline)
 	if paint_mask.is_empty(): return pieces
 	var clipped := []
 	for piece in pieces:
@@ -510,9 +537,10 @@ static func clipped_polygon(object: Dictionary, points: PackedVector2Array, pain
 				clipped.append_array(Compound.filled_outlines(Geometry2D.intersect_polygons(piece, region[0])))
 	return clipped
 
-static func paint_polygon(target: CanvasItem, object: Dictionary, points: PackedVector2Array, color: Color, paint_mask := []) -> void:
+static func paint_polygon(target: CanvasItem, object: Dictionary, points: PackedVector2Array, color: Color,
+		paint_mask := [], prepared_clip := {}) -> void:
 	if points.size() < 3: return
-	for piece in clipped_polygon(object, points, paint_mask):
+	for piece in clipped_polygon(object, points, paint_mask, prepared_clip):
 		if piece.size() < 3: continue
 		var triangles := Geometry2D.triangulate_polygon(piece)
 		if not triangles.is_empty(): paint_triangles(target, piece, triangles, color, paint_mask.is_empty(), object.get("compound", false))
@@ -720,6 +748,7 @@ static func draw_stroke_range(target: CanvasItem, object: Dictionary, first: int
 				target.get_canvas_item(), batch.indices, batch.vertices, batch.colors, batch.uv)
 		return
 	var mask := prepare_paint_mask(object) if object.has("paint_mask") else []
+	var clip := prepare_polygon_clip(object)
 	if uses_ink_outline(object):
 		var outline := ink_outline(object, first, end)
 		var triangles := Geometry2D.triangulate_polygon(outline)
@@ -727,13 +756,13 @@ static func draw_stroke_range(target: CanvasItem, object: Dictionary, first: int
 			var color := Color(object.color)
 			color.a *= object.opacity
 			if object.has("clip") or not mask.is_empty():
-				paint_polygon(target, object, outline, color, mask)
+				paint_polygon(target, object, outline, color, mask, clip)
 			else:
 				paint_triangles(target, outline, triangles, color, true)
 			return
 	# Tight curves and self-crossings can produce an invalid single outline.
 	for segment in segments(object, first, end):
-		paint_polygon(target, object, segment.polygon, segment.color, mask)
+		paint_polygon(target, object, segment.polygon, segment.color, mask, clip)
 
 static func is_grain(object: Dictionary) -> bool:
 	return object.get("brush") in ["pencil", "chalk"]

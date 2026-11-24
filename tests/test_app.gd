@@ -37,6 +37,7 @@ func run() -> void:
 		await layer_editing_regressions(app)
 		await brush_performance_regressions(app)
 		editing_scale_regressions()
+		await page_clipping_regressions(app)
 		app.autosave_timer.stop()
 		app.queue_free()
 		await process_frame
@@ -2869,6 +2870,9 @@ func run() -> void:
 	selection_doc.layers[2].locked = true
 	selection_doc.commit()
 	app.tool_buttons.select.pressed.emit()
+	check(selection_canvas.tool == app.remembered_selection_tool and not app.selection_menu.visible,
+		"one tap activates the remembered selection tool without opening a menu")
+	app.tool_buttons.select.pressed.emit()
 	check(app.selection_menu.visible and app.selection_icons[3].tooltip_text == "Freehand selection"
 		and app.selection_icons.all(func(choice): return choice.text.is_empty() and choice.icon != null),
 		"Select opens an icon grid for object and area modes")
@@ -3404,12 +3408,154 @@ func run() -> void:
 	await layer_editing_regressions(app)
 	await brush_performance_regressions(app)
 	editing_scale_regressions()
+	await page_clipping_regressions(app)
 
 	print("RESULT: %d checks, %d failures" % [checks, failures])
 	app.autosave_timer.stop()
 	app.queue_free()
 	await process_frame
 	quit(1 if failures else 0)
+
+func page_clipping_regressions(app) -> void:
+	page_fill_regressions()
+	var viewport := SubViewport.new()
+	viewport.size = Vector2i(256, 190)
+	viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	root.add_child(viewport)
+	var graphics := DisplayServer.get_name() != "headless"
+	for cached in [false, true]:
+		var doc := Document.new()
+		doc.blank(128, 100, false)
+		var edge_shape := test_rect(doc, -22, 24, 46, 24, "#e36248")
+		test_rect(doc, -24, 15, 10, 45)
+		var hidden_stroke := stroke()
+		hidden_stroke.pos = [-7, 0]
+		hidden_stroke.size = 6.0
+		hidden_stroke.points = [[0, 15, 1.0, "#226451"], [0, 47, 1.0, "#226451"]]
+		doc.add(hidden_stroke)
+		if cached:
+			var background := stroke()
+			background.points = []
+			for index in Canvas.PAINT_CACHE_THRESHOLD:
+				background.points.append([20.0 + index % 40, 12.0 + index / 100.0, 0.7, "#226451"])
+			doc.add(background)
+			doc.layers[0].opacity = 0.7
+		var canvas := Canvas.new()
+		canvas.document = doc
+		canvas.size = Vector2(viewport.size)
+		canvas.view_fitted = false
+		canvas.origin = Vector2(62, 36)
+		canvas.zoom = 1.0
+		canvas.cache_completed_paint = cached
+		viewport.add_child(canvas)
+		check(canvas.hit(Vector2(-5, 33), true).is_empty() and canvas.hit(Vector2(0.5, 33), true).id == edge_shape.id,
+			"selection only picks the part of a shape on the page")
+		doc.selection = ""
+		canvas.tool = "select_rect"
+		canvas.begin(canvas.origin + Vector2(-30, 10), 0.7)
+		canvas.update_marquee(Vector2(28, 51))
+		canvas.finish()
+		check(doc.selection == edge_shape.id, "marquee can select cropped artwork and skips fully off-page objects")
+		canvas.tool = "brush"
+		canvas.smoothing = 0.0
+		canvas.brush_size = 24.0
+		canvas.color = Color("#29be71")
+		canvas.begin(canvas.origin + Vector2(108, 72), 0.9)
+		canvas.update_stroke(canvas.origin + Vector2(162, 72), 0.9)
+		if graphics:
+			await RenderingServer.frame_post_draw
+			await RenderingServer.frame_post_draw
+			var preview := viewport.get_texture().get_image()
+			check(preview.get_pixel(64, 70).r > 0.5 and preview.get_pixel(58, 70).r < 0.16
+				and preview.get_pixel(186, 108).g > 0.4 and preview.get_pixel(194, 108).g < 0.16,
+				"the page edge clips stored vectors and the live Ink preview")
+		canvas.finish()
+		check(edge_shape.pos[0] == -22, "cropping to the page leaves vector coordinates editable")
+		canvas.pan_by(Vector2(13, 9))
+		canvas.zoom_at(1.2, canvas.origin)
+		if graphics:
+			await RenderingServer.frame_post_draw
+			await RenderingServer.frame_post_draw
+			var committed := viewport.get_texture().get_image()
+			var tip: Vector2i = Vector2i(canvas.origin + Vector2(128, 72) * canvas.zoom)
+			check(committed.get_pixelv(tip - Vector2i(4, 0)).g > 0.4
+				and committed.get_pixelv(tip + Vector2i(4, 0)).g < 0.16,
+				"completed Ink remains clipped after panning and zooming")
+		var svg := Image.new()
+		check(svg.load_svg_from_string(Art.svg(doc, false)) == OK and svg.get_size() == Vector2i(128, 100)
+			and svg.get_pixel(1, 33).r > 0.5 and svg.get_pixel(125, 72).g > 0.4,
+			"SVG includes the visible parts up to the page edges at the document size")
+		if graphics and cached:
+			app.document.restore(doc.snapshot())
+			app.export_layer_id = ""
+			await app.export_png("user://page-edge.png")
+			var png := Image.load_from_file("user://page-edge.png")
+			check(png != null and png.get_size() == Vector2i(256, 200)
+				and png.get_pixel(2, 66).r > 0.5 and png.get_pixel(250, 144).g > 0.4,
+				"PNG exports the same page-edge contents at its requested scale")
+		canvas.free()
+	viewport.queue_free()
+
+func page_fill_regressions() -> void:
+	var doc := Document.new()
+	doc.blank(160, 120, false)
+	var canvas := Canvas.new()
+	canvas.document = doc
+	canvas.size = Vector2(200, 160)
+	canvas.zoom = 1.0
+	root.add_child(canvas)
+	canvas.brush_size = 8.0
+	canvas.begin(canvas.origin + Vector2(0, 60) * canvas.zoom, 0.9)
+	canvas.update_stroke(canvas.origin + Vector2(175, 60) * canvas.zoom, 0.9)
+	canvas.finish()
+	canvas.tool = "fill"
+	canvas.color = Color("#da6848")
+	canvas.begin(canvas.origin + Vector2(80, 30) * canvas.zoom, 0.6)
+	var above := doc.find_object(doc.selection)
+	check(above.get("kind") == "polygon" and Art.contains(above, Vector2(1, 1))
+		and not Art.contains(above, Vector2(80, 95)), "a drawn edge-to-edge stroke fills only the tapped side")
+	canvas.color = Color("#3f759e")
+	canvas.fill_at(Vector2(80, 95))
+	var below := doc.find_object(doc.selection)
+	check(below.get("kind") == "polygon" and Art.contains(below, Vector2(159, 119))
+		and not Art.contains(below, Vector2(80, 30)), "both sides can be filled independently")
+	doc.undo()
+	check(doc.layers[0].objects.size() == 2, "undo removes only the second page-edge fill")
+	doc.redo()
+	var svg := Image.new()
+	check(Document.validate(doc.snapshot()).is_empty() and svg.load_svg_from_string(Art.svg(doc, false)) == OK
+		and svg.get_pixel(1, 1).is_equal_approx(Color("#da6848"))
+		and svg.get_pixel(158, 118).is_equal_approx(Color("#3f759e")), "page-edge fills survive history and export as editable vectors")
+
+	doc.blank(160, 120, false)
+	var open := stroke()
+	open.pos = [0, 0]
+	open.size = 8.0
+	open.points = [[0, 58, 1.0, "#226451"], [141, 58, 1.0, "#226451"]]
+	doc.add(open)
+	canvas.fill_at(Vector2(80, 30))
+	check(doc.layers[0].objects.size() == 1, "a stroke with a gap at the far edge does not divide the page")
+
+	doc.blank(160, 120, false)
+	for vertices in [[[0, 74], [52, 70]], [[52, 70], [73, 35]], [[73, 35], [76, 0]]]:
+		doc.add({"kind": "path", "vertices": vertices, "color": "#226451", "outline_color": "#226451",
+			"outline_width": 6.0, "opacity": 1.0})
+	canvas.fill_at(Vector2(25, 25))
+	var corner := doc.find_object(doc.selection)
+	check(corner.get("kind") == "polygon" and Art.contains(corner, Vector2(1, 1))
+		and not Art.contains(corner, Vector2(130, 100)), "touching paths split off a corner using two adjacent edges")
+
+	doc.blank(160, 120, false)
+	for vertices in [[[0, 60], [160, 60]], [[80, 0], [80, 120]], [[22, 20], [42, 20]]]:
+		doc.add({"kind": "path", "vertices": vertices, "color": "#226451", "outline_color": "#226451",
+			"outline_width": 6.0, "opacity": 1.0})
+	canvas.fill_at(Vector2(52, 42))
+	var quadrant := doc.find_object(doc.selection)
+	check(quadrant.get("compound", false) and Art.contains(quadrant, Vector2(52, 42))
+		and not Art.contains(quadrant, Vector2(30, 20)) and not Art.contains(quadrant, Vector2(105, 42))
+		and not Art.contains(quadrant, Vector2(52, 96)) and Document.validate(doc.snapshot()).is_empty(),
+		"crossing lines fill just one quadrant and preserve holes around isolated ink")
+	canvas.free()
 
 func test_rect(doc: Document, x: int, y: int, w: int, h: int, ink := "#226451") -> Dictionary:
 	var shape := {"kind": "rect", "pos": [x, y], "extent": [w, h], "color": ink, "opacity": 1.0}
@@ -3932,6 +4078,7 @@ func brush_performance_regressions(app) -> void:
 	check(outcome == false, "small operations complete without covering the canvas")
 	recent_stroke_cache_regression()
 	secondary_stroke_cache_regression()
+	opaque_document_cache_regression()
 	translucent_background_cache_regression()
 	var tile_writer := PaintTiles.new()
 	tile_writer.prepare_layer({"objects": []}, Vector2i(32, 32))
@@ -4185,6 +4332,54 @@ func secondary_stroke_cache_regression() -> void:
 		"resuming the secondary cache keeps artwork and drawing order intact")
 	canvas.free()
 
+func opaque_document_cache_regression() -> void:
+	var doc := Document.new()
+	doc.blank(1600, 1600, false)
+	var ink := stroke()
+	ink.points = []
+	for index in 96:
+		ink.points.append([float(index), 8.0 + sin(index * 0.1), 0.6, "#226451"])
+	for index in 54:
+		var mark := ink.duplicate(true)
+		mark.pos = [200.0, index * 16.0]
+		doc.add(mark)
+	var canvas := Canvas.new()
+	canvas.document = doc
+	canvas.size = Vector2(900, 650)
+	canvas.view_fitted = false
+	canvas.zoom = 0.4
+	canvas.cache_completed_paint = true
+	canvas.cache_recent_strokes = true
+	canvas.cache_extra_layers = true
+	root.add_child(canvas)
+	var cache: IsolatedOpacity = canvas.paint_cache
+	cache.finish_cache_frame()
+	var offset := cache.artwork.position
+	var resolution := cache.surface.size
+	canvas.begin(Vector2(180, 180), 0.7)
+	canvas.update_stroke(Vector2(215, 183), 0.6)
+	canvas.finish()
+	var recent_offset: Vector2 = cache.recent.artwork.position
+	canvas.pan_by(Vector2(22, 18))
+	canvas.zoom_at(1.08, Vector2(300, 270))
+	check(cache.artwork.position == offset and cache.surface.size == resolution and not cache.rebuild_pending
+		and cache.recent.artwork.position != recent_offset, "opaque dense artwork stays cached while recent marks follow pan and zoom")
+	doc.undo()
+	check(not cache.rebuild_pending and cache.recent.rebuild_pending,
+		"undo at overview zoom only redraws the recent stroke cache on a dense opaque layer")
+	doc.resize_canvas(Vector2i(1200, 1400))
+	check(cache.document_bounds == Rect2(-4, -4, 1208, 1408), "resizing the page refreshes the document cache bounds")
+	canvas.free()
+
+	var clipped := {"clip": [[0, 0], [20, 0], [20, 20], [0, 20]]}
+	var inside := PackedVector2Array([Vector2(2, 2), Vector2(6, 2), Vector2(2, 6)])
+	var corner := PackedVector2Array([Vector2(16, 16), Vector2(24, 16), Vector2(16, 24)])
+	var prepared := Art.prepare_polygon_clip(clipped)
+	var reference := Geometry2D.intersect_polygons(corner, prepared.outline)
+	check(prepared.rectangle and Art.clipped_polygon(clipped, inside, [], prepared) == [inside]
+		and Art.clipped_polygon(clipped, corner, [], prepared) == reference,
+		"prepared rectangular clips skip enclosed paint and still cut boundary dabs exactly")
+
 func editing_scale_regressions() -> void:
 	var doc := Document.new()
 	doc.blank(1400, 1200, false)
@@ -4248,6 +4443,16 @@ func editing_scale_regressions() -> void:
 	check(doc.snapshot() == before_resize and canvas.last_page_size == Vector2(1400, 1200)
 		and canvas.retained_marks[cover.id].mark == cover_mark,
 		"vector resize undo restores exact dimensions and poses without rebuilding artwork")
+	doc.select_objects([under.id])
+	canvas.apply_precise_transform(Vector2(5000, 5000), 1.0, 0.0)
+	check(Art.bounds(under).end.is_equal_approx(Vector2(1400, 1200)),
+		"precise movement stops at the canvas corner")
+	doc.select_objects([under.id])
+	canvas.place_selection(false)
+	check(Art.bounds(under).get_center().is_equal_approx(Vector2(700, 600)),
+		"the dedicated transform action centers selected artwork")
+	check(canvas.bounded_node_position(Transform2D.IDENTITY, Vector2(1396, 1194), Vector2(30, 40)) == Vector2(1400, 1200),
+		"node deformation stops at the canvas edge")
 	canvas.free()
 
 func wet_rendering_regression() -> void:

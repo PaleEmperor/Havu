@@ -4,7 +4,7 @@ const Art = preload("res://scripts/artwork.gd")
 const MAX_SAMPLES := 12000
 const MAX_FOOTPRINTS := 2400
 
-static func find_region(objects: Array, seed: Vector2) -> Dictionary:
+static func find_region(objects: Array, seed: Vector2, page := Rect2()) -> Dictionary:
 	var footprints: Array[Dictionary] = []
 	var enclosed: Array[Dictionary] = []
 	var samples := 0
@@ -76,7 +76,50 @@ static func find_region(objects: Array, seed: Vector2) -> Dictionary:
 			shells.remove_at(index)
 			index = 0
 		shells.append({"outline": merged, "bounds": bounds, "index": insertion})
-	return {}
+	if not page.has_point(seed): return {}
+	return find_page_region(page, footprints, seed)
+
+# Subtract the ink from the page and follow only the connected piece at the
+# tap. An internal loop alone must not make the entire outside fillable.
+static func find_page_region(page: Rect2, footprints: Array[Dictionary], seed: Vector2) -> Dictionary:
+	if not footprints.any(func(footprint): return footprint.bounds.intersects(page, true) and touches_page(footprint.bounds, page)):
+		return {}
+	var region := Art.AreaSelection.corners(page)
+	var bounds := page
+	var divided_page := false
+	for footprint in footprints:
+		if not bounds.intersects(footprint.bounds): continue
+		var contours := Geometry2D.clip_polygons(region, footprint.outline)
+		var next := seed_component(contours, seed)
+		if next.is_empty() or next.size() > 8192: return {}
+		if not divided_page:
+			var edge_pieces := 0
+			for contour in contours:
+				if Geometry2D.is_polygon_clockwise(contour) or not touches_page(Art.polygon_bounds(contour), page): continue
+				edge_pieces += 1
+			divided_page = edge_pieces > 1
+		region = next
+		bounds = Art.polygon_bounds(region)
+	if not divided_page or Geometry2D.triangulate_polygon(region).is_empty(): return {}
+	var compound := not Art.Compound.bridge_edges(region).is_empty()
+	if not compound:
+		# Blend under the brush antialiasing while keeping the exact page edge.
+		var expanded := Geometry2D.offset_polygon(region, 0.3)
+		if expanded.size() == 1:
+			var clipped := seed_component(Geometry2D.intersect_polygons(expanded[0], Art.AreaSelection.corners(page)), seed)
+			if not clipped.is_empty() and clipped.size() <= 8192 and not Geometry2D.triangulate_polygon(clipped).is_empty():
+				region = clipped
+	return {"vertices": region, "index": 0, "compound": compound}
+
+static func seed_component(contours: Array[PackedVector2Array], seed: Vector2) -> PackedVector2Array:
+	for piece in Art.Compound.filled_outlines(contours):
+		if Art.Compound.contains(piece, seed): return piece
+	return PackedVector2Array()
+
+static func touches_page(bounds: Rect2, page: Rect2) -> bool:
+	const EDGE_EPSILON := 0.001
+	return bounds.position.x <= page.position.x + EDGE_EPSILON or bounds.position.y <= page.position.y + EDGE_EPSILON \
+		or bounds.end.x >= page.end.x - EDGE_EPSILON or bounds.end.y >= page.end.y - EDGE_EPSILON
 
 static func brush_polygons(object: Dictionary) -> Array:
 	var footprints := Art.paint_footprints(object)

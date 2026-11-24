@@ -79,6 +79,8 @@ var finish_path_button: Button
 var close_path_button: Button
 var shape_menu: PopupPanel
 var selection_menu: PopupPanel
+var remembered_selection_tool := "select"
+var selection_pressed_at := -1000
 var shape_icons: Array[Button] = []
 var selection_icons: Array[Button] = []
 var select_across_toggle: CheckButton
@@ -2215,9 +2217,17 @@ func restore_layout() -> void:
 
 func press_tool(key: String) -> void:
 	if reject_unavailable_tool(key): return
+	if key != "select": selection_pressed_at = -1000
 	if key == "brush" and canvas.tool == "brush": toggle_brush_panel(active_brush_tab)
 	elif key == "shapes": show_shape_menu()
-	elif key == "select": show_selection_menu()
+	elif key == "select":
+		var now := Time.get_ticks_msec()
+		if now - selection_pressed_at <= 360:
+			selection_pressed_at = -1000
+			show_selection_menu()
+		else:
+			selection_pressed_at = now
+			set_tool(remembered_selection_tool)
 	else: set_tool(key)
 
 func reject_unavailable_tool(key: String) -> bool:
@@ -2254,6 +2264,9 @@ func activate_tool(next: String) -> void:
 	canvas.refresh_selection()
 
 func build_selection_menu() -> void:
+	var saved: String = str(settings.get_value("input", "selection_tool", "select"))
+	if saved == "select" or saved in Canvas.AREA_TOOLS: remembered_selection_tool = saved
+	tool_buttons.select.tooltip_text = "Select · Double-tap to choose the selection tool"
 	selection_menu = PopupPanel.new()
 	selection_menu.name = "SelectionMenu"
 	add_child(selection_menu)
@@ -2369,6 +2382,9 @@ func build_tool_picker(menu: PopupPanel, options: Array, icons: Array[Button], c
 		var mode: String = entry[0]
 		var choice := icon_button(entry[2], func():
 			menu.hide()
+			if menu == selection_menu and remembered_selection_tool != mode:
+				remembered_selection_tool = mode
+				save_input_preference("selection_tool", mode)
 			set_tool(mode), entry[1])
 		choice.set_meta("tool", mode)
 		choice.accessibility_name = entry[1]
@@ -2510,9 +2526,10 @@ func build_selection_tray() -> void:
 	union_button.custom_minimum_size.y = 44
 	selection_actions.add_child(union_button)
 	build_transform_menus()
-	transform_button = button("Transform", show_transform_menu, "Rotate, mirror, align, space, or reorder the selection")
+	transform_button = icon_button("M3 10V4H9M17 4H23V10M23 18V24H17M9 24H3V18M9 14L13 10L17 14L13 18Z",
+		show_transform_menu, "Transform · Rotate, mirror, position and size")
 	transform_button.custom_minimum_size.y = 44
-	selection_actions.add_child(transform_button)
+	header_tools.add_child(transform_button)
 	PopupTouch.watch_launcher(transform_button)
 	selected_shape_style = button("Style", open_shape_style, "Edit the selected shape’s fill, outline, and opacity")
 	selection_actions.add_child(selected_shape_style)
@@ -2615,7 +2632,8 @@ func build_transform_menus() -> void:
 	transform_menu = PopupMenu.new()
 	transform_menu.name = "TransformMenu"
 	for entry in [["Rotate 90° clockwise", 0], ["Rotate 90° counterclockwise", 1],
-		["Flip horizontally", 2], ["Flip vertically", 3]]:
+		["Rotate 180°", 7], ["Flip horizontally", 2], ["Flip vertically", 3],
+		["Center on canvas", 8], ["Fit to canvas", 9], ["Precise transform…", 10]]:
 		transform_menu.add_item(entry[0], entry[1])
 	transform_menu.add_separator()
 	transform_menu.add_check_item("Snap rotation to 15°", 4)
@@ -2650,7 +2668,7 @@ func show_edit_popup(menu: PopupMenu) -> void:
 	menu.reset_size()
 	var anchor := transform_button.get_screen_position() if transform_button.is_visible_in_tree() else get_screen_position() + Vector2(20, 75)
 	if transform_button.is_visible_in_tree():
-		anchor += Vector2(0.0, transform_button.size.y + 4) if tools_horizontal else Vector2(transform_button.size.x + 4, 0.0)
+		anchor += Vector2(0.0, transform_button.size.y + 4)
 	menu.position = Vector2i(anchor)
 	menu.popup()
 
@@ -2668,6 +2686,35 @@ func transform_action(id: int) -> void:
 		6:
 			canvas.snap_to_canvas = not canvas.snap_to_canvas
 			save_input_preference("snap_to_canvas", canvas.snap_to_canvas)
+		7: canvas.turn_selection(PI)
+		8: canvas.place_selection(false)
+		9: canvas.place_selection(true)
+		10: show_precise_transform.call_deferred()
+
+func show_precise_transform() -> void:
+	if canvas.transformable_items().is_empty(): return
+	var dialog := ConfirmationDialog.new()
+	dialog.title = "Precise transform"
+	dialog.ok_button_text = "Apply"
+	add_child(dialog)
+	var content := margin(dialog, 16)
+	var fields: Array[SpinBox] = []
+	for specification in [["Move X (px)", -10000.0, 10000.0, 0.0], ["Move Y (px)", -10000.0, 10000.0, 0.0],
+			["Scale (%)", 1.0, 1000.0, 100.0], ["Rotate (°)", -360.0, 360.0, 0.0]]:
+		content.add_child(label(specification[0], 14))
+		var field := SpinBox.new()
+		field.custom_minimum_size = Vector2(230, 44)
+		field.min_value = specification[1]
+		field.max_value = specification[2]
+		field.step = 0.1
+		field.value = specification[3]
+		content.add_child(field)
+		fields.append(field)
+	dialog.confirmed.connect(func():
+		canvas.apply_precise_transform(Vector2(fields[0].value, fields[1].value), fields[2].value / 100.0, deg_to_rad(fields[3].value))
+		dialog.queue_free())
+	dialog.canceled.connect(dialog.queue_free)
+	dialog.popup_centered()
 
 func update_arrange_actions() -> void:
 	var units := {}

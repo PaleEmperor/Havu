@@ -87,6 +87,7 @@ func update_view(view_size: Vector2, view_origin: Vector2, zoom: float, density:
 		material.set_shader_parameter("filter_overview", sampling > zoom * density * 1.05)
 		set_surface_view(document_bounds.size * sampling, -document_bounds.position * sampling,
 			sampling, document_bounds.position)
+		update_recent_view()
 		return
 	var largest_edge := maxf(1.0, maxf(view_size.x, view_size.y))
 	var sampling := minf(density, 4096.0 / largest_edge)
@@ -99,11 +100,16 @@ func update_view(view_size: Vector2, view_origin: Vector2, zoom: float, density:
 		var material := display.material as ShaderMaterial
 		material.set_shader_parameter("filter_overview", overview and sampling > density * 1.05)
 	set_surface_view(view_size * sampling, view_origin * sampling, zoom * sampling, -view_origin / zoom)
-	if recent and recent.visible: recent.update_view(view_size, view_origin, zoom, density)
+	update_recent_view()
+
+func update_recent_view() -> void:
+	if recent and recent.visible:
+		recent.allow_overview = not document_bounds.has_area()
+		recent.update_view(current_view_size, current_view_origin, current_zoom, current_density)
 
 func set_surface_view(extent: Vector2, offset: Vector2, scale_factor: float, placement: Vector2) -> void:
 	var pixels := Vector2i(extent.ceil()).max(Vector2i(2, 2))
-	if surface.size != pixels or artwork.position != offset or artwork.scale.x != scale_factor:
+	if surface.size != pixels or not artwork.position.is_equal_approx(offset) or not is_equal_approx(artwork.scale.x, scale_factor):
 		invalidate_cache()
 	surface.size = pixels
 	artwork.position = offset
@@ -172,9 +178,9 @@ func append_mark(mark: Node2D) -> void:
 			move_child(recent, display.get_index() + 1)
 		if recent.artwork.get_child_count() >= RECENT_MARK_LIMIT: flush_recent()
 		if not recent.visible:
-			recent.update_view(current_view_size, current_view_origin, current_zoom, current_density)
-			recent.invalidate_cache()
 			recent.show()
+			update_recent_view()
+			recent.invalidate_cache()
 		mark.reparent(recent.artwork, false)
 		recent.append_mark(mark)
 		return

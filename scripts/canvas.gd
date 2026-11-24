@@ -14,6 +14,7 @@ const ROTATION_HANDLE_GAP := 26.0
 const ROTATION_HANDLE_RADIUS := 14.0
 const SNAP_DISTANCE := 8.0
 const PAINT_CACHE_THRESHOLD := 1200
+const DOCUMENT_CACHE_THRESHOLD := 4800
 const MAX_PAINT_CACHES := 4
 const CACHE_NAVIGATION_SETTLE := 0.12
 const PICK_GRID_THRESHOLD := 160
@@ -125,6 +126,7 @@ var node_reach := 0.0
 var original: Dictionary = {}
 var edit_started = false
 var edit_future: Array = []
+var page_clip: Control
 var artwork_root: Node2D
 var preview_root: Node2D
 var preview_surface: IsolatedOpacity
@@ -167,8 +169,12 @@ func _ready() -> void:
 	set_process_input(false)
 	mouse_exited.connect(clear_pointer_metrics)
 	resized.connect(resize_view)
+	page_clip = Control.new()
+	page_clip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	page_clip.clip_contents = true
+	add_child(page_clip)
 	artwork_root = Node2D.new()
-	add_child(artwork_root)
+	page_clip.add_child(artwork_root)
 	if not exporting and cache_extra_layers:
 		cache_navigation_timer = Timer.new()
 		cache_navigation_timer.one_shot = true
@@ -181,7 +187,7 @@ func _ready() -> void:
 		add_child(android_pointer_idle)
 	if not exporting:
 		preview_root = Node2D.new()
-		add_child(preview_root)
+		page_clip.add_child(preview_root)
 		selection_overlay = Node2D.new()
 		selection_overlay.draw.connect(draw_selection)
 		add_child(selection_overlay)
@@ -247,6 +253,9 @@ func pan_by(delta: Vector2) -> void:
 func to_document(point: Vector2) -> Vector2:
 	return (point - origin) / zoom
 
+func page_bounds() -> Rect2:
+	return Rect2(0, 0, document.width, document.height)
+
 func _draw() -> void:
 	if document == null: return
 	if not exporting:
@@ -257,7 +266,7 @@ func _draw() -> void:
 			grid_texture = ImageTexture.create_from_image(tile)
 		draw_texture_rect(grid_texture, Rect2(Vector2.ZERO, size), true)
 		draw_rect(Rect2(origin + Vector2(6, 9), Vector2(document.width, document.height) * zoom), Color(0, 0, 0, 0.24))
-	var page := Rect2(origin, Vector2(document.width, document.height) * zoom)
+	var page := Rect2(origin, page_bounds().size * zoom)
 	if document.paper_visible:
 		draw_rect(page, Color(document.paper))
 	elif not exporting:
@@ -433,12 +442,14 @@ func finish_marquee() -> void:
 		for item in transformable_items():
 			ids.append(item.object.id)
 			previously_selected[item.object.id] = true
+	var page := page_bounds()
 	for layer_index in document.layers.size():
 		var layer: Dictionary = document.layers[layer_index]
 		if not selectable_layer(layer_index): continue
 		for object in layer.objects:
 			if object.get("paint_tile", false): continue
-			if AreaSelection.encloses(tool, region, bounds, pick_bounds(object)):
+			var visible_bounds := pick_bounds(object).intersection(page)
+			if visible_bounds.has_area() and AreaSelection.encloses(tool, region, bounds, visible_bounds):
 				if not previously_selected.has(object.id): ids.append(object.id)
 				if select_across_layers: document.active = layer_index
 	var blocked: bool = document.select_artwork(ids, solo_layer_id)
@@ -505,9 +516,63 @@ func turn_selection(radians: float, flip := 0) -> bool:
 		var captured := Document.capture_transform_item(item)
 		Document.turn_object(captured, center, radians, flip)
 		changes.append(captured)
+	keep_transformed_items_on_page(changes)
 	selected_area.clear()
 	document.record_transform(changes)
 	return true
+
+func place_selection(fit_page: bool) -> void:
+	var items := transformable_items()
+	if items.is_empty(): return
+	var bounds := exact_selection_bounds(items)
+	var page := page_bounds()
+	var ratio := 1.0
+	if fit_page and bounds.has_area():
+		ratio = minf(page.size.x / bounds.size.x, page.size.y / bounds.size.y)
+	apply_precise_transform(page.get_center() - bounds.get_center(), ratio, 0.0)
+
+func apply_precise_transform(offset: Vector2, ratio: float, radians: float) -> void:
+	var items := transformable_items()
+	if items.is_empty(): return
+	var pivot := exact_selection_bounds(items).get_center()
+	var minimum := 0.0
+	var maximum := INF
+	for item in items:
+		var scale: float = item.object.scale
+		minimum = maxf(minimum, minf(1.0, 0.02 / scale))
+		maximum = minf(maximum, 1000.0 / scale)
+	var rotated_bounds := Transform2D(radians, Vector2.ZERO) * Rect2(Vector2.ZERO, exact_selection_bounds(items).size)
+	var page := page_bounds()
+	for axis in 2:
+		if rotated_bounds.size[axis] > 0.0:
+			maximum = minf(maximum, maxf(1.0, page.size[axis] / rotated_bounds.size[axis]))
+	ratio = clampf(ratio, minimum, maximum)
+	var changes: Array[Dictionary] = []
+	for item in items:
+		var captured := Document.capture_transform_item(item)
+		Document.turn_object(captured, pivot, radians, 0)
+		var object: Dictionary = item.object
+		var position := pivot + (Art.v(object.pos) - pivot) * ratio + offset
+		object.pos = [position.x, position.y]
+		object.scale *= ratio
+		changes.append(captured)
+	keep_transformed_items_on_page(changes)
+	selected_area.clear()
+	document.record_transform(changes)
+
+func keep_transformed_items_on_page(items: Array[Dictionary], bounds := Rect2()) -> void:
+	if not bounds.has_area(): bounds = exact_selection_bounds(items)
+	var page := page_bounds()
+	var shift := Vector2.ZERO
+	for axis in 2:
+		if bounds.size[axis] <= page.size[axis]:
+			shift[axis] = clampf(0.0, -bounds.position[axis], page.end[axis] - bounds.end[axis])
+		else:
+			shift[axis] = page.get_center()[axis] - bounds.get_center()[axis]
+	if shift.is_zero_approx(): return
+	for item in items:
+		var position := Art.v(item.object.pos) + shift
+		item.object.pos = [position.x, position.y]
 
 func exact_selection_bounds(items: Array[Dictionary]) -> Rect2:
 	var bounds := Art.bounds(items[0].object)
@@ -567,6 +632,9 @@ func update_selection_move(point: Vector2) -> void:
 		selection_rotation_delta = delta
 		for item in moving_selection:
 			Document.turn_object(item, center, delta, 0)
+		var rotated_bounds := Transform2D(delta, center) * Rect2(selection_move_bounds.position - center, selection_move_bounds.size)
+		keep_transformed_items_on_page(moving_selection, rotated_bounds)
+		for item in moving_selection:
 			update_mark_pose(item.object)
 		refresh_selection()
 		return
@@ -580,9 +648,19 @@ func update_selection_move(point: Vector2) -> void:
 			var diagonal := selection_move_bounds.size
 			ratio = 1.0 + offset.dot(diagonal) / diagonal.length_squared()
 		ratio = clampf(ratio, selection_scale_min, selection_scale_max)
+		var relative_start := selection_move_bounds.position - pivot
+		var relative_end := selection_move_bounds.end - pivot
+		for axis in 2:
+			if relative_start[axis] < 0.0:
+				ratio = minf(ratio, maxf(1.0, pivot[axis] / -relative_start[axis]))
+			if relative_end[axis] > 0.0:
+				ratio = minf(ratio, maxf(1.0, (page_bounds().end[axis] - pivot[axis]) / relative_end[axis]))
 		offset = Vector2.ZERO
 	elif snap_to_canvas:
 		offset = snap_canvas_move(offset)
+	if not resizing:
+		offset = offset.clamp((-selection_move_bounds.position).min(Vector2.ZERO),
+			(page_bounds().end - selection_move_bounds.end).max(Vector2.ZERO))
 	selection_preview_bounds = Rect2(pivot + (selection_move_bounds.position - pivot) * ratio + offset,
 		selection_move_bounds.size * ratio)
 	for item in moving_selection:
@@ -618,7 +696,7 @@ func finish_cache_navigation() -> void:
 	navigation_caches.clear()
 
 func redraw_view() -> void:
-	if artwork_root:
+	if artwork_root and document != null:
 		var density := 1.0 if exporting else maxf(0.01, get_screen_transform().get_scale().x)
 		var overview := cache_completed_paint and not exporting and IsolatedOpacity.use_overview(size, zoom, density, overview_cache)
 		if overview != overview_cache:
@@ -626,10 +704,10 @@ func redraw_view() -> void:
 			if not drawing: # Switch once when crossing the zoom band.
 				sync_artwork()
 				return
-		artwork_root.position = origin
+		page_clip.position = origin
+		page_clip.size = page_bounds().size * zoom
 		artwork_root.scale = Vector2.ONE * zoom
-		if preview_root and preview_root.get_parent() == self:
-			preview_root.position = origin
+		if preview_root and preview_root.get_parent() == page_clip:
 			preview_root.scale = Vector2.ONE * zoom
 		for holder in layer_renderers.values():
 			if holder is IsolatedOpacity and holder.visible: holder.update_view(size, origin, zoom, density)
@@ -744,21 +822,17 @@ func on_artwork_changed() -> void:
 	var page_resize: bool = document.content_on_commit.get("page_resize", false)
 	if page_resize or not document.transformed_on_commit.is_empty():
 		for layer_id in document.content_on_commit.get("layers", []): pick_grids.erase(layer_id)
-		var resized_holders := {}
 		for transformed in document.transformed_on_commit:
 			var mark := update_mark_pose(transformed)
 			if mark:
 				var holder: Node2D = layer_renderers.get(retained_marks[transformed.id].layer)
-				if is_artwork_cache(holder):
-					holder.invalidate_mark(mark)
-					if holder.document_bounds.has_area():
-						holder.document_bounds = holder.document_bounds.merge(pick_bounds(transformed).grow(4.0))
-						resized_holders[holder] = true
-		var density := maxf(0.01, get_screen_transform().get_scale().x)
-		for holder in resized_holders: holder.update_view(size, origin, zoom, density)
+				if is_artwork_cache(holder): holder.invalidate_mark(mark)
 		pigment_dirty = true
 		if page_resize:
 			last_page_size = Vector2(document.width, document.height)
+			for holder in layer_renderers.values():
+				if is_artwork_cache(holder) and holder.document_bounds.has_area():
+					holder.document_bounds = page_bounds().grow(4.0)
 			if view_fitted and not exporting: fit()
 			else: redraw_view()
 		else:
@@ -784,13 +858,7 @@ func on_artwork_changed() -> void:
 		var entry := mount_mark(holder_artwork(holder), object, layer.id)
 		retained_marks[object.id] = entry
 		if pick_grids.has(layer.id): index_pick_bounds(pick_grids[layer.id], layer.objects.size() - 1, object)
-		if is_artwork_cache(holder):
-			if holder.document_bounds.has_area():
-				var bounds := pick_bounds(object).grow(4.0)
-				if not holder.document_bounds.encloses(bounds):
-					holder.document_bounds = holder.document_bounds.merge(bounds)
-					holder.update_view(size, origin, zoom, maxf(0.01, get_screen_transform().get_scale().x))
-			holder.append_mark(entry.mark)
+		if is_artwork_cache(holder): holder.append_mark(entry.mark)
 		if not pigment_dirty and layer_is_visible(layer):
 			pigment_dirty = not pigment.append_latest(layer, document.active, object)
 		refresh_selection()
@@ -918,12 +986,14 @@ func sync_artwork(only_layer_id := "") -> void:
 				holder.overview = cache_layer_marks and overview_cache
 			artwork_root.add_child(holder)
 		holder.visible = shown
-		var cached_area := Rect2(Vector2.ZERO, Vector2(document.width, document.height)) if cache_layer_marks and use_group else Rect2()
 		if cache_layer_marks:
+			var cost: int = layer_cache_costs.get(layer.id, 0)
+			var use_document_cache := use_group or cost >= DOCUMENT_CACHE_THRESHOLD
 			if full_sync and layer.id == cache_layers[0]: paint_cache = holder
 			holder.allow_overview = holder == paint_cache
-			holder.keep_recent_marks = not use_group and holder == paint_cache and cache_recent_strokes and not overview_cache \
-				and int(layer_cache_costs.get(layer.id, 0)) >= PAINT_CACHE_THRESHOLD
+			holder.document_bounds = page_bounds().grow(4.0) if use_document_cache else Rect2()
+			holder.keep_recent_marks = not use_group and holder == paint_cache and cache_recent_strokes \
+				and (not overview_cache or use_document_cache) and cost >= PAINT_CACHE_THRESHOLD
 		if use_group: set_holder_opacity(holder, layer_alpha)
 		if holder.get_index() != layer_index: artwork_root.move_child(holder, layer_index)
 		layer_index += 1
@@ -978,12 +1048,9 @@ func sync_artwork(only_layer_id := "") -> void:
 				mark_holder.move_child(mark, object_index)
 				cache_changed = true
 			next_marks[object.id] = entry
-			if cached_area.has_area(): cached_area = cached_area.merge(pick_bounds(object))
 			previous_marks.erase(object.id)
 			positions[-1] += 1
-		if cache_layer_marks:
-			holder.document_bounds = cached_area.grow(4.0) if cached_area.has_area() else Rect2()
-			if cache_changed: holder.invalidate_cache()
+		if cache_layer_marks and cache_changed: holder.invalidate_cache()
 
 	if full_sync:
 		for id in retained_marks:
@@ -1185,7 +1252,10 @@ func clear_preview() -> void:
 	live_first = 0
 
 func detach_preview() -> void:
-	if preview_root and preview_root.get_parent() != self: preview_root.reparent(self, false)
+	if preview_root and preview_root.get_parent() != page_clip:
+		preview_root.reparent(page_clip, false)
+		preview_root.position = Vector2.ZERO
+		preview_root.scale = Vector2.ONE * zoom
 	if is_instance_valid(preview_surface): preview_surface.release_preview()
 	preview_surface = null
 
@@ -1398,23 +1468,24 @@ func node_influence_radius(object: Dictionary, length: float) -> float:
 func deform_node(object: Dictionary, point: Vector2) -> void:
 	var points := node_points(object)
 	var delta := Art.local_point(object, point) - Art.local_point(object, start)
+	var pose := Art.object_transform(object)
 	var center := node_arc[node_index]
 	# The range is set by Spread and the original curve, independent of drag distance.
 	var span := maxf(node_reach, 0.0001)
 	if node_cycle > 0.0 and span >= node_cycle * 0.5:
-		deform_node_span(points, 0.0, node_arc[-1], delta)
+		deform_node_span(points, 0.0, node_arc[-1], delta, pose)
 	else:
-		deform_node_span(points, center - span, center + span, delta)
+		deform_node_span(points, center - span, center + span, delta, pose)
 		if node_cycle > 0.0:
 			if center - span < 0.0:
-				deform_node_span(points, node_cycle + center - span, node_arc[-1], delta)
+				deform_node_span(points, node_cycle + center - span, node_arc[-1], delta, pose)
 			if center + span > node_cycle:
-				deform_node_span(points, 0.0, center + span - node_cycle, delta)
+				deform_node_span(points, 0.0, center + span - node_cycle, delta, pose)
 	# Both ends of each artificial seam must keep their paired vertices.
 	for copies in node_twins:
 		var weight := 0.0
 		for index in copies: weight = maxf(weight, node_weight(index))
-		var moved := Art.v(original.vertices[copies[0]]) + delta * weight
+		var moved := bounded_node_position(pose, Art.v(original.vertices[copies[0]]), delta * weight)
 		for index in copies: points[index] = [moved.x, moved.y]
 
 func node_weight(index: int) -> float:
@@ -1424,14 +1495,20 @@ func node_weight(index: int) -> float:
 	if node_reach <= 0.0: return 1.0 if distance <= 0.0001 else 0.0
 	return 1.0 - smoothstep(0.0, node_reach, distance)
 
-func deform_node_span(points: Array, low: float, high: float, delta: Vector2) -> void:
+func deform_node_span(points: Array, low: float, high: float, delta: Vector2, pose: Transform2D) -> void:
 	var first := node_arc.bsearch(low)
 	var stop := node_arc.bsearch(high, false)
 	var previous := node_points(original)
 	for index in range(first, stop):
-		var place := Art.v(previous[index]) + delta * node_weight(index)
+		var place := bounded_node_position(pose, Art.v(previous[index]), delta * node_weight(index))
 		points[index][0] = place.x
 		points[index][1] = place.y
+
+func bounded_node_position(pose: Transform2D, local: Vector2, delta: Vector2) -> Vector2:
+	var from := pose * local
+	var moved := pose * (local + delta)
+	var clamped := moved.clamp(Vector2.ZERO.min(from), page_bounds().end.max(from))
+	return local + delta if clamped == moved else pose.affine_inverse() * clamped
 
 func selectable_layer(index: int) -> bool:
 	var layer: Dictionary = document.layers[index]
@@ -1477,6 +1554,8 @@ func pick_candidate_indices(layer: Dictionary, point: Vector2, tolerance: float)
 	return ordered
 
 func hit(point: Vector2, include_interior: bool) -> Dictionary:
+	var page := page_bounds()
+	if not page.has_point(point): return {}
 	var tolerance: float = 6.0 / zoom
 	var top: int = document.layers.size() - 1 if select_across_layers and include_interior else document.active
 	var bottom: int = -1 if select_across_layers and include_interior else document.active - 1
@@ -1487,7 +1566,9 @@ func hit(point: Vector2, include_interior: bool) -> Dictionary:
 			else range(layer.objects.size() - 1, -1, -1)
 		for i in indices:
 			var object: Dictionary = layer.objects[i]
-			if object.get("paint_tile", false) or not pick_bounds(object).grow(tolerance).has_point(point): continue
+			if object.get("paint_tile", false): continue
+			var bounds := pick_bounds(object)
+			if not bounds.grow(tolerance).has_point(point) or not bounds.intersects(page): continue
 			if Art.contains(object, point, tolerance) or (include_interior and contains_selectable_interior(object, point)):
 				document.active = layer_index
 				return object
@@ -1521,12 +1602,16 @@ func tool_unavailable_reason(name: String) -> String:
 	return ""
 
 func fill_at(point: Vector2) -> void:
+	var page := page_bounds()
+	if not page.has_point(point): return
 	var layer_index: int = document.active
 	var layer: Dictionary = document.layers[layer_index]
 	if not layer_is_visible(layer) or layer.get("opacity", 1.0) <= 0.0: return
 	for index in range(layer.objects.size() - 1, -1, -1):
 		var object: Dictionary = layer.objects[index]
-		if object.opacity <= 0.0 or not pick_bounds(object).grow(2.0 / zoom).has_point(point): continue
+		if object.opacity <= 0.0: continue
+		var bounds := pick_bounds(object)
+		if not bounds.grow(2.0 / zoom).has_point(point) or not bounds.intersects(page): continue
 		var outline := PackedVector2Array()
 		if object.kind == "stroke":
 			var local := Art.local_point(object, point)
@@ -1542,13 +1627,14 @@ func fill_at(point: Vector2) -> void:
 		var target := object if outline.is_empty() else outline_fill(layer, index, outline)
 		apply_vector_fill(layer_index, index, target)
 		return
-	var region := VectorFill.find_region(layer.objects, point)
+	var region := VectorFill.find_region(layer.objects, point, page)
 	if not region.is_empty():
 		var target := {"kind": "polygon", "vertices": Art.pack_contours([region.vertices])[0],
 			"opacity": 1.0, "pos": [0.0, 0.0], "scale": 1.0}
+		if region.get("compound", false): target.compound = true
 		apply_vector_fill(layer_index, region.index, target)
 		return
-	status.emit("Tap inside a closed shape or where lines meet to enclose an area.")
+	status.emit("Tap inside an area enclosed by lines or by lines and the page edge.")
 
 func apply_vector_fill(layer_index: int, index: int, target: Dictionary) -> void:
 	var layer: Dictionary = document.layers[layer_index]
@@ -1770,7 +1856,7 @@ func begin(screen: Vector2, pressure: float, shortcut: String = "") -> void:
 			lasso_points = PackedVector2Array([point])
 			refresh_selection()
 			return
-	if not Rect2(0, 0, document.width, document.height).has_point(point): return
+	if not page_bounds().has_point(point): return
 	if action == "select" and keep_selecting:
 		toggle_object_pick(point)
 		return
