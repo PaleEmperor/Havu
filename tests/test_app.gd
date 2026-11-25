@@ -27,6 +27,13 @@ func stroke(color = "#226451") -> Dictionary:
 	return {"kind": "stroke", "brush": "ink", "size": 20.0, "color": color, "opacity": 1.0, "points": [[10.0, 10.0, 0.1, color], [100.0, 20.0, 1.0, color], [150.0, 100.0, 0.5, color]]}
 
 func run() -> void:
+	if "--vector-fill" in OS.get_cmdline_user_args():
+		await vector_shape_fill_regressions()
+		page_fill_regressions()
+		await process_frame
+		print("RESULT: %d checks, %d failures" % [checks, failures])
+		quit(1 if failures else 0)
+		return
 	if "--symmetry" in OS.get_cmdline_user_args():
 		var app = load("res://main.tscn").instantiate()
 		root.add_child(app)
@@ -3438,6 +3445,7 @@ func run() -> void:
 	await working_folder_regressions(app)
 	await symmetry_and_cut_regressions(app)
 	await outside_cut_and_symmetry_copies(app)
+	await vector_shape_fill_regressions()
 
 	print("RESULT: %d checks, %d failures" % [checks, failures])
 	app.autosave_timer.stop()
@@ -3684,6 +3692,104 @@ func outside_cut_and_symmetry_copies(app) -> void:
 	canvas.end_contact(0, screen.call(full_loop[0]), false)
 	check(canvas.cut_target.is_empty() and doc.find_object(shape.id).is_empty() and layer.objects.size() == 4,
 		"cutting the whole shape ends the mode and leaves the other artwork alone")
+
+func vector_shape_fill_regressions() -> void:
+	var doc := Document.new()
+	var canvas := Canvas.new()
+	canvas.document = doc
+	root.add_child(canvas)
+	canvas.color = Color("#ed7e44")
+	var left := func() -> Dictionary:
+		return {"kind": "polygon", "pos": [40, 40], "color": "#141414", "opacity": 1.0,
+			"vertices": [[0, 0], [180, 0], [180, 20], [20, 20], [20, 160], [180, 160], [180, 180], [0, 180]]}
+	var right := func() -> Dictionary:
+		return {"kind": "rect", "pos": [205, 50], "extent": [25, 155], "color": "#141414", "opacity": 1.0}
+	var seed := Vector2(130, 110)
+	doc.blank(1000, 1000, false)
+	var wall: Dictionary = left.call()
+	var door: Dictionary = right.call()
+	doc.add(wall)
+	doc.add(door)
+	canvas.fill_at(seed)
+	var fill := doc.find_object(doc.selection)
+	check(doc.layers[0].objects.size() == 3 and fill.get("kind") == "polygon" and Art.contains(fill, seed)
+		and not Art.contains(fill, Vector2(240, 110)) and is_same(doc.layers[0].objects[1], wall)
+		and is_same(doc.layers[0].objects[2], door), "two filled shapes can enclose a new editable fill")
+	doc.undo()
+	check(doc.layers[0].objects.size() == 2, "one undo removes the region and preserves both enclosing shapes")
+	doc.redo()
+	check(doc.layers[0].objects.size() == 3 and Document.validate(doc.snapshot()).is_empty()
+		and Art.svg(doc, false).contains("#ed7e44"), "redo and SVG preserve the vector region")
+
+	doc.blank(1000, 1000, false)
+	doc.add(left.call())
+	door = right.call()
+	door.extent = [25, 120]
+	doc.add(door)
+	canvas.fill_at(seed)
+	check(doc.layers[0].objects.size() == 2, "a gap still open to the outside stays unfilled")
+	door.extent = [25, 155]
+	door.color = "#14141400"
+	canvas.fill_at(seed)
+	check(doc.layers[0].objects.size() == 2, "an invisible shape does not close a compartment")
+
+	doc.blank(1000, 1000, false)
+	doc.add(left.call())
+	doc.add(right.call())
+	doc.add({"kind": "ellipse", "pos": [118, 118], "extent": [45, 30], "color": "#408065", "opacity": 0.65})
+	canvas.fill_at(seed)
+	fill = doc.find_object(doc.selection)
+	check(doc.layers[0].objects.size() == 4 and fill.get("compound", false)
+		and Art.contains(fill, seed) and not Art.contains(fill, Vector2(140, 132)),
+		"filling a compartment leaves a hole around an island shape")
+
+	doc.blank(1000, 1000, false)
+	var hollow := {"kind": "rect", "pos": [30, 30], "extent": [260, 190], "color": "#141414",
+		"opacity": 1.0, "fill_enabled": false, "outline_width": 10.0, "outline_color": "#141414"}
+	doc.add(hollow)
+	canvas.fill_at(seed)
+	check(doc.layers[0].objects.size() == 1 and Art.has_fill(hollow), "a lone hollow shape still gets filled in place")
+	doc.undo()
+	doc.add({"kind": "rect", "pos": [148, 28], "extent": [18, 196], "color": "#141414", "opacity": 1.0})
+	canvas.fill_at(seed)
+	fill = doc.find_object(doc.selection)
+	check(doc.layers[0].objects.size() == 3 and not Art.has_fill(hollow)
+		and fill.get("kind") == "polygon" and Art.contains(fill, seed)
+		and not Art.contains(fill, Vector2(210, 110)), "a solid divider inside an outlined shape limits the fill")
+
+	doc.blank(1000, 1000, false)
+	doc.add(left.call())
+	door = right.call()
+	door.pos = [218, 51]
+	door.mirrored = true
+	door.angle = 0.08
+	doc.add(door)
+	for index in 200:
+		doc.add({"kind": "ellipse", "pos": [600 + (index % 20) * 16, 600 + (index / 20) * 18],
+			"extent": [10, 10], "color": "#408065", "opacity": 1.0})
+	canvas.fill_at(seed)
+	fill = doc.find_object(doc.selection)
+	check(doc.layers[0].objects.size() == 203 and fill.get("kind") == "polygon" and Art.contains(fill, seed),
+		"a transformed boundary fills correctly despite distant objects exceeding the outline budget")
+	doc.blank(320, 320, false)
+	doc.add(left.call())
+	doc.add({"kind": "path", "vertices": [[216, 48], [216, 212]], "color": "#141414", "opacity": 1.0,
+		"outline_width": 12.0, "outline_color": "#141414"})
+	canvas.fill_at(seed)
+	fill = doc.find_object(doc.selection)
+	check(doc.layers[0].objects.size() == 3 and fill.get("kind") == "polygon" and Art.contains(fill, seed),
+		"a shape and an open vector line can enclose a compartment together")
+	doc.blank(320, 320, false)
+	for rect in [Rect2(40, 40, 180, 20), Rect2(40, 60, 20, 140),
+			Rect2(200, 60, 20, 140), Rect2(40, 200, 180, 20)]:
+		doc.add({"kind": "rect", "pos": [rect.position.x, rect.position.y],
+			"extent": [rect.size.x, rect.size.y], "color": "#141414", "opacity": 1.0})
+	canvas.fill_at(seed)
+	fill = doc.find_object(doc.selection)
+	check(doc.layers[0].objects.size() == 5 and fill.get("kind") == "polygon" and Art.contains(fill, seed),
+		"edges that meet exactly can close a compartment without overlapping")
+	canvas.queue_free()
+	await process_frame
 
 func working_folder_regressions(app) -> void:
 	var folder := "user://Polar Fun projects"

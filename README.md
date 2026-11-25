@@ -2,7 +2,7 @@
 
 **A little illustration studio for Android tablets.**
 
-[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.77/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
+[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.78/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
 
 I wanted my wife to have somewhere of her own to draw. A little studio on her
 tablet, with brushes she could make her own, artwork she could scale into shop
@@ -40,6 +40,8 @@ I’d love for you to use it, share it, or make it your own.
   **Merge vectors on grouping** applies the same operation when you group artwork.
   In the selection action bar, use **Move to layer…** beside **Duplicate** and
   **Delete** to send artwork to a compatible layer or create a new vector layer.
+  Tap a gap enclosed by shapes or lines on the active vector layer with **Fill**
+  to turn the gap into its own editable shape.
 - **Transform and arrange.** Drag the round selection handle to rotate. Open
   **Transform** for flips, quarter turns, and snapping to the canvas or 15°
   angles. **Align & arrange** aligns objects, spaces them evenly, and changes

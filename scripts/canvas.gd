@@ -1819,9 +1819,11 @@ func fill_at(point: Vector2) -> void:
 	var layer_index: int = document.active
 	var layer: Dictionary = document.layers[layer_index]
 	if not layer_is_visible(layer) or layer.get("opacity", 1.0) <= 0.0: return
+	var hollow_index := -1
 	for index in range(layer.objects.size() - 1, -1, -1):
 		var object: Dictionary = layer.objects[index]
 		if object.opacity <= 0.0: continue
+		if object.kind not in ["rect", "ellipse", "polygon", "stroke"]: continue
 		var bounds := pick_bounds(object)
 		if not bounds.grow(2.0 / zoom).has_point(point) or not bounds.intersects(page): continue
 		var outline := PackedVector2Array()
@@ -1833,20 +1835,28 @@ func fill_at(point: Vector2) -> void:
 			if not Geometry2D.is_point_in_polygon(local, outline) and not Art.contains(object, point, 2.0 / zoom): continue
 			if Geometry2D.triangulate_polygon(outline).is_empty(): continue
 		elif object.kind in ["rect", "ellipse", "polygon"]:
-			if not Art.shape_interior_contains(object, point) and not Art.contains(object, point, 2.0 / zoom): continue
+			var interior := Art.shape_interior_contains(object, point)
+			var hits_outline := Art.contains(object, point, 2.0 / zoom)
+			if not interior and not hits_outline: continue
+			if interior and (not Art.has_fill(object) or Color(object.color).a <= 0.0):
+				if hollow_index < 0: hollow_index = index
+				continue
 		else:
 			continue
 		var target := object if outline.is_empty() else outline_fill(layer, index, outline)
 		apply_vector_fill(layer_index, index, target)
 		return
-	var region := VectorFill.find_region(layer.objects, point, page)
+	var region := VectorFill.find_region(layer.objects, point, page, pick_bounds)
+	if hollow_index >= 0 and (region.is_empty() or region.get("single_boundary", -1) == hollow_index):
+		apply_vector_fill(layer_index, hollow_index, layer.objects[hollow_index])
+		return
 	if not region.is_empty():
 		var target := {"kind": "polygon", "vertices": Art.pack_contours([region.vertices])[0],
 			"opacity": 1.0, "pos": [0.0, 0.0], "scale": 1.0}
 		if region.get("compound", false): target.compound = true
 		apply_vector_fill(layer_index, region.index, target)
 		return
-	status.emit("Tap inside an area enclosed by lines or by lines and the page edge.")
+	status.emit("Tap inside an area enclosed by shapes, lines, or the canvas edge.")
 
 func apply_vector_fill(layer_index: int, index: int, target: Dictionary) -> void:
 	var layer: Dictionary = document.layers[layer_index]
