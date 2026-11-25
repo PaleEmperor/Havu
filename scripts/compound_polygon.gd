@@ -88,7 +88,9 @@ static func filled_outlines(contours: Array[PackedVector2Array]) -> Array[Packed
 	return pieces
 
 static func joined_outline(contours: Array[PackedVector2Array]) -> PackedVector2Array:
-	var pieces := filled_outlines(contours)
+	return join_components(filled_outlines(contours))
+
+static func join_components(pieces: Array[PackedVector2Array]) -> PackedVector2Array:
 	if pieces.is_empty(): return PackedVector2Array()
 	var result := pieces[0].duplicate()
 	for index in range(1, pieces.size()):

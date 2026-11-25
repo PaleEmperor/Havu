@@ -108,9 +108,13 @@ static func get_asset(object: Dictionary) -> Dictionary:
 	return remember(key, image) if image else {}
 
 static func encode_png(image: Image) -> Dictionary:
+	var encoded := serialize_png(image)
+	remember(encoded.image_key, image)
+	return encoded
+
+static func serialize_png(image: Image) -> Dictionary:
 	var payload := Marshalls.raw_to_base64(image.save_png_to_buffer())
 	var key := payload.sha256_text()
-	remember(key, image)
 	return {"image_data": payload, "image_key": key, "image_format": "png",
 		"extent": [image.get_width(), image.get_height()]}
 

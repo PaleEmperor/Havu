@@ -257,6 +257,66 @@ static func shape_point_inside(object: Dictionary, points: PackedVector2Array, l
 	if object.get("compound", false): return Compound.contains(points, local)
 	return Geometry2D.is_point_in_polygon(local, points)
 
+static func subtract_from_shape(object: Dictionary, world_loop: PackedVector2Array) -> Dictionary:
+	if world_loop.size() < 3 or world_loop.size() > 512:
+		return {"error": "Draw a simple loop to cut out."}
+	var loop := object_transform(object).affine_inverse() * world_loop
+	if Geometry2D.triangulate_polygon(loop).is_empty() or cut_loop_crosses_itself(loop):
+		return {"error": "Draw a loop that doesn’t cross itself."}
+	var original := polygon(object)
+	var remains := Geometry2D.clip_polygons(original, loop)
+	if remains.is_empty(): return {"objects": []}
+	var area := 0.0
+	var shells := 0
+	for contour in remains:
+		var size := Compound.signed_area(contour)
+		area += size
+		if not Geometry2D.is_polygon_clockwise(contour): shells += 1
+	if is_equal_approx(absf(area), absf(Compound.signed_area(original))):
+		return {"error": "The loop did not overlap the selected shape."}
+	var pieces := Compound.filled_outlines(remains)
+	if pieces.size() != shells or pieces.is_empty() or pieces.any(func(piece):
+			return Geometry2D.triangulate_polygon(piece).is_empty()):
+		return {"error": "This cut could not be applied to the shape."}
+	if not is_equal_approx(absf(area), absf(pieces.reduce(func(total, piece):
+			return total + Compound.signed_area(piece), 0.0))):
+		return {"error": "This cut could not be applied to the shape."}
+	var joined := Compound.join_components(pieces)
+	if joined.size() < 3 or joined.size() > 8192:
+		return {"error": "The cut is too detailed. Try a simpler loop."}
+	var replacement := object.duplicate()
+	replacement.kind = "polygon"
+	replacement.vertices = pack_contours([joined])[0]
+	for property in ["extent", "corner_radius", "node_anchors", "compound", "compound_disjoint"]:
+		replacement.erase(property)
+	if remains.size() > 1: replacement.compound = true
+	if shells > 1: replacement.compound_disjoint = true
+	return {"objects": [replacement]}
+
+static func cut_loop_crosses_itself(loop: PackedVector2Array) -> bool:
+	var count := loop.size()
+	var bounds := PackedVector4Array()
+	var edges: Array[int] = []
+	for index in count:
+		var a := loop[index]
+		var b := loop[(index + 1) % count]
+		bounds.append(Vector4(minf(a.x, b.x), maxf(a.x, b.x), minf(a.y, b.y), maxf(a.y, b.y)))
+		edges.append(index)
+	edges.sort_custom(func(a: int, b: int): return bounds[a].x < bounds[b].x)
+	for slot in count:
+		var index := edges[slot]
+		var a := bounds[index]
+		for next in range(slot + 1, count):
+			var other := edges[next]
+			var b := bounds[other]
+			if b.x > a.y: break
+			var separation := absi(index - other)
+			if separation == 1 or separation == count - 1 or a.w < b.z or b.w < a.z: continue
+			if Geometry2D.segment_intersects_segment(loop[index], loop[(index + 1) % count],
+					loop[other], loop[(other + 1) % count]) != null:
+				return true
+	return false
+
 static func shape_outline_contains(object: Dictionary, points: PackedVector2Array, local: Vector2,
 		radius: float, arrow: PackedVector2Array) -> bool:
 	if not object.get("compound", false):
@@ -858,12 +918,19 @@ static func make_grain_tip() -> ArrayMesh:
 
 static func draw_grain(target: CanvasItem, object: Dictionary, first: int, end: int, batch_index: int) -> void:
 	if first >= end: return
-	var data := grain_buffer(object, first, end)
-	var count := data.size() / GRAIN_STRIDE
-	if count == 0: return
 	var batches: Array = target.get_meta(GRAIN_BATCHES, [])
 	if batches.size() <= batch_index: batches.resize(batch_index + 1)
-	var batch: MultiMesh = batches[batch_index]
+	var batch := update_grain_multimesh(object, first, end, batches[batch_index])
+	if not batch: return
+	if batches[batch_index] != batch:
+		batches[batch_index] = batch
+		target.set_meta(GRAIN_BATCHES, batches)
+	target.draw_multimesh(batch, null)
+
+static func update_grain_multimesh(object: Dictionary, first: int, end: int, batch: MultiMesh = null) -> MultiMesh:
+	var data := grain_buffer(object, first, end)
+	var count := data.size() / GRAIN_STRIDE
+	if count == 0: return null
 	if batch == null:
 		if grain_tip == null: grain_tip = make_grain_tip()
 		batch = MultiMesh.new()
@@ -871,12 +938,9 @@ static func draw_grain(target: CanvasItem, object: Dictionary, first: int, end: 
 		batch.use_colors = true
 		batch.use_custom_data = true
 		batch.mesh = grain_tip
-		batches[batch_index] = batch
-		# Draw commands retain RIDs, so keep the resources with their canvas item.
-		target.set_meta(GRAIN_BATCHES, batches)
 	if batch.instance_count != count: batch.instance_count = count
 	batch.buffer = data
-	target.draw_multimesh(batch, null)
+	return batch
 
 static func clipped_stroke_has_paint(object: Dictionary) -> bool:
 	var mask := prepare_paint_mask(object)
@@ -1139,7 +1203,7 @@ static func svg_shape(object: Dictionary) -> String:
 		return '<ellipse cx="%s" cy="%s" rx="%s" ry="%s" fill="#%s" fill-opacity="%s"/>' % [
 			radii.x, radii.y, radii.x, radii.y, color.to_html(false), color.a * object.opacity]
 	var points := polygon(object)
-	if not object.get("compound_disjoint", false) and not object.has("fill_enabled") and not object.has("outline_width") and not object.has("corner_radius"):
+	if not object.get("compound", false) and not object.has("fill_enabled") and not object.has("outline_width") and not object.has("corner_radius"):
 		return svg_polygon(points, Color(object.color), object.opacity)
 	var fill := Color(object.color)
 	var fill_value := 'fill="#%s" fill-opacity="%s"' % [fill.to_html(false), fill.a * object.opacity] if has_fill(object) else 'fill="none"'
@@ -1150,7 +1214,7 @@ static func svg_shape(object: Dictionary) -> String:
 		stroke_value = ' stroke="#%s" stroke-opacity="%s" stroke-width="%s" stroke-linejoin="round"' % [
 			ink.to_html(false), ink.a * object.opacity, width]
 	var paint := fill_value + stroke_value
-	if object.get("compound_disjoint", false) or (object.get("compound", false) and width > 0):
+	if object.get("compound", false):
 		var contours := PackedStringArray()
 		for contour in Compound.boundary_loops(points):
 			contours.append("M" + points_string(contour) + "Z")

@@ -7,6 +7,7 @@ const BrushLibrary = preload("res://scripts/brush_library.gd")
 const OpacityStack = preload("res://scripts/opacity_stack.gd")
 const IsolatedOpacity = preload("res://scripts/isolated_opacity.gd")
 const AreaSelection = preload("res://scripts/area_selection.gd")
+const Symmetry = preload("res://scripts/drawing_symmetry.gd")
 const AREA_TOOLS := AreaSelection.TOOLS
 const SELECTION_PADDING := 5.0
 const RESIZE_HIT_RADIUS := 16.0
@@ -158,7 +159,16 @@ var opacity_preview_value := 1.0
 static var checker_texture: ImageTexture
 static var grid_texture: ImageTexture
 var live_batch: Node2D
+var live_symmetry_batches: Array[Node2D] = []
 var live_first := 0
+var symmetry_mode := Symmetry.Mode.OFF
+var symmetry_arms := 6
+var symmetry_guides := true
+var symmetry_anchor := Vector2(0.5, 0.5)
+var placing_symmetry_center := false
+var symmetry_instances: Array[Dictionary] = []
+var cut_target := ""
+var cut_points := PackedVector2Array()
 var pigment := PigmentIndex.new()
 var pigment_dirty := true
 var touch_points: Dictionary = {}
@@ -315,9 +325,24 @@ func _draw() -> void:
 
 func draw_selection() -> void:
 	if document == null: return
+	if symmetry_mode != Symmetry.Mode.OFF and (placing_symmetry_center or (symmetry_guides and tool in ["brush", "erase"])):
+		draw_symmetry_guides()
+	if not cut_points.is_empty():
+		var trace := PackedVector2Array()
+		for point in cut_points: trace.append(origin + point * zoom)
+		if trace.size() >= 2:
+			selection_overlay.draw_polyline(trace, Color("#172b28"), 3.5, true)
+			selection_overlay.draw_polyline(trace, Color("#a4f0d2"), 1.5, true)
+		if trace.size() >= 3:
+			selection_overlay.draw_dashed_line(trace[-1], trace[0], Color("#a4f0d2"), 1.3, 6.0)
+		return
 	if drawing and current.get("erasing", false):
 		var radius := maxf(1.5, float(current.size) * zoom * 0.5)
 		selection_overlay.draw_circle(origin + raw_point * zoom, radius, Color("#a4f0d2"), false, 1.2, true)
+		for copy in symmetry_instances:
+			var point := Art.object_transform(copy) * raw_point
+			if page_bounds().has_point(point):
+				selection_overlay.draw_circle(origin + point * zoom, radius, Color("#a4f0d2"), false, 1.2, true)
 	if clip_enabled and tool == "brush":
 		for region in clip_regions:
 			var border := PackedVector2Array()
@@ -753,6 +778,50 @@ func redraw_view() -> void:
 func refresh_selection() -> void:
 	if selection_overlay: selection_overlay.queue_redraw()
 
+func symmetry_center() -> Vector2:
+	return symmetry_anchor * page_bounds().size
+
+func configure_symmetry(mode: int, arms: int, show_guides: bool) -> void:
+	finish()
+	symmetry_mode = mode
+	symmetry_arms = clampi(arms, 2, 12)
+	symmetry_guides = show_guides
+	placing_symmetry_center = false
+	refresh_selection()
+
+func draw_symmetry_guides() -> void:
+	var center: Vector2 = origin + symmetry_center() * zoom
+	var visible := Rect2(origin, page_bounds().size * zoom).intersection(Rect2(Vector2.ZERO, size))
+	if not visible.has_area(): return
+	if symmetry_mode == Symmetry.Mode.RADIAL:
+		for arm in symmetry_arms:
+			draw_symmetry_line(center, Vector2.from_angle(TAU * arm / symmetry_arms), visible, true)
+	else:
+		if symmetry_mode in [Symmetry.Mode.VERTICAL, Symmetry.Mode.FOUR_WAY]:
+			draw_symmetry_line(center, Vector2.DOWN, visible, false)
+		if symmetry_mode in [Symmetry.Mode.HORIZONTAL, Symmetry.Mode.FOUR_WAY]:
+			draw_symmetry_line(center, Vector2.RIGHT, visible, false)
+	if visible.has_point(center):
+		selection_overlay.draw_circle(center, 5.0, Color("#175343"))
+		selection_overlay.draw_circle(center, 3.0, Color("#bbf1dd"))
+
+func draw_symmetry_line(center: Vector2, direction: Vector2, box: Rect2, ray: bool) -> void:
+	var first := 0.0 if ray else -INF
+	var last := INF
+	for axis in 2:
+		if absf(direction[axis]) < 0.00001:
+			if center[axis] < box.position[axis] or center[axis] > box.end[axis]: return
+			continue
+		var left := (box.position[axis] - center[axis]) / direction[axis]
+		var right := (box.end[axis] - center[axis]) / direction[axis]
+		first = maxf(first, minf(left, right))
+		last = minf(last, maxf(left, right))
+	if first >= last: return
+	var a := center + direction * first
+	var b := center + direction * last
+	selection_overlay.draw_dashed_line(a, b, Color(0.09, 0.35, 0.28, 0.62), 2.2, 8.0, true, true)
+	selection_overlay.draw_dashed_line(a, b, Color(0.53, 0.91, 0.76, 0.78), 1.0, 8.0, true, true)
+
 func validate_solo_layer() -> void:
 	if solo_layer_id.is_empty(): return
 	var index: int = document.layer_index(solo_layer_id)
@@ -794,6 +863,7 @@ func update_content_marks(change: Dictionary) -> bool:
 		var entry: Dictionary = retained_marks.get(object.id, {})
 		if not entry.is_empty():
 			entry.appearance = object.duplicate()
+			if change.get("geometry", false): entry.erase("bounds")
 			entry.mark.queue_redraw()
 			if is_artwork_cache(holder): holder.invalidate_mark(entry.mark)
 		return true
@@ -873,6 +943,8 @@ func on_artwork_changed() -> void:
 			refresh_selection()
 		return
 	var content: Dictionary = document.content_on_commit
+	if content.has("append_set") and append_symmetry_marks(content.layer, content.append_set):
+		return
 	if not content.is_empty() and update_content_marks(content):
 		pick_grids.erase(content.layer)
 		if not pigment_dirty and content.has("remove") and content.get("add", []).is_empty():
@@ -898,6 +970,37 @@ func on_artwork_changed() -> void:
 		refresh_selection()
 		return
 	sync_artwork()
+
+func append_symmetry_marks(layer_id: String, strokes: Array) -> bool:
+	var holder: Node2D = layer_renderers.get(layer_id)
+	if not holder: return false
+	if strokes.any(func(stroke): return stroke.has("opacity_groups")): return false
+	var layer: Dictionary = document.layers[document.active]
+	for stroke in strokes:
+		if should_promote_cache(layer, stroke):
+			sync_artwork()
+			return true
+	var first: int = layer.objects.size() - strokes.size()
+	var shared_mesh: ArrayMesh
+	var shared_style := {}
+	if (not strokes.is_empty() and not strokes[0].has("clip") and not strokes[0].has("paint_mask")
+			and Art.uses_stroke_mesh(strokes[0])):
+		shared_style = Art.local_stroke_style(strokes[0])
+	for index in strokes.size():
+		var stroke: Dictionary = strokes[index]
+		var entry := mount_mark(holder_artwork(holder), stroke, layer_id)
+		var mark: Node2D = entry.mark
+		if (not shared_style.is_empty() and mark.has_meta(Art.WET_MESH_SAMPLES)
+				and Art.local_stroke_style(stroke) == shared_style):
+			if not shared_mesh:
+				shared_mesh = mark.get_meta(Art.WET_MESH) if mark.has_meta(Art.WET_MESH) else Art.build_wet_mesh(stroke, 0, stroke.points.size())
+			if shared_mesh: mark.set_meta(Art.WET_MESH, shared_mesh)
+		retained_marks[stroke.id] = entry
+		if is_artwork_cache(holder): holder.append_mark(entry.mark)
+		if pick_grids.has(layer_id): index_pick_bounds(pick_grids[layer_id], first + index, stroke)
+	pigment_dirty = true
+	refresh_selection()
+	return true
 
 func should_promote_cache(layer: Dictionary, object: Dictionary) -> bool:
 	var layer_id: String = layer.id
@@ -1321,6 +1424,7 @@ func clear_preview() -> void:
 		batch.queue_free()
 	detach_preview()
 	live_batch = null
+	live_symmetry_batches.clear()
 	live_first = 0
 
 func detach_preview() -> void:
@@ -1355,18 +1459,51 @@ func redraw_preview() -> void:
 			preview_root.remove_child(live_batch)
 			live_batch.queue_free()
 			live_batch = null
-		var completed := Node2D.new()
-		Art.use_screen_edges(completed, current)
-		completed.draw.connect(Art.draw_stroke_range.bind(completed, current, live_first, live_first + batch_size))
-		preview_root.add_child(completed)
+		for instance in live_symmetry_batches:
+			preview_root.remove_child(instance)
+			instance.queue_free()
+		live_symmetry_batches.clear()
+		mount_stroke_preview_batch(live_first, live_first + batch_size)
 		live_first += batch_size
 	if live_first >= end: return
 	if not live_batch:
-		live_batch = Node2D.new()
-		Art.use_screen_edges(live_batch, current)
-		live_batch.draw.connect(draw_live_batch.bind(live_batch, current, live_first))
-		preview_root.add_child(live_batch)
+		live_batch = mount_stroke_preview_batch(live_first, -1)
 	live_batch.queue_redraw()
+	for instance in live_symmetry_batches: instance.queue_redraw()
+
+func mount_stroke_preview_batch(first: int, end: int) -> Node2D:
+	# Unclipped arms differ only by pose. Keep one buffer for all of their
+	# draw commands; masks stay in document space and need separate geometry.
+	var shared := {}
+	if (not symmetry_instances.is_empty() and not current.has("clip") and not current.has("paint_mask")
+			and (Art.uses_stroke_mesh(current) or Art.uses_grain_instances(current))):
+		shared = {"end": -1, "resource": null, "grain": Art.uses_grain_instances(current)}
+	var mark := add_stroke_preview(current, first, end, shared)
+	for copy in symmetry_instances:
+		var arm := add_stroke_preview(copy, first, end, shared)
+		if end < 0: live_symmetry_batches.append(arm)
+	return mark
+
+func add_stroke_preview(stroke: Dictionary, first: int, end: int, shared: Dictionary) -> Node2D:
+	var mark := Node2D.new()
+	mark.transform = Art.object_transform(stroke)
+	Art.use_screen_edges(mark, stroke)
+	if not shared.is_empty(): mark.draw.connect(draw_shared_preview.bind(mark, stroke, first, end, shared))
+	elif end < 0: mark.draw.connect(draw_live_batch.bind(mark, stroke, first))
+	else: mark.draw.connect(Art.draw_stroke_range.bind(mark, stroke, first, end))
+	preview_root.add_child(mark)
+	return mark
+
+func draw_shared_preview(mark: Node2D, stroke: Dictionary, first: int, end: int, shared: Dictionary) -> void:
+	var limit: int = stroke.points.size() if end < 0 else end
+	if shared.end != limit:
+		shared.end = limit
+		if shared.grain:
+			shared.resource = Art.update_grain_multimesh(stroke, first, limit, shared.resource)
+		else:
+			shared.resource = Art.build_wet_mesh(stroke, first, limit)
+	if shared.resource is MultiMesh: mark.draw_multimesh(shared.resource, null)
+	elif shared.resource is ArrayMesh: mark.draw_mesh(shared.resource, null)
 
 func draw_live_batch(batch: Node2D, stroke: Dictionary, first: int) -> void:
 	Art.draw_stroke_range(batch, stroke, first, stroke.points.size())
@@ -1776,7 +1913,7 @@ func _gui_input(event: InputEvent) -> void:
 		else: last_pressure = 0.55
 		if dragging:
 			pan_by(event.relative)
-		elif drawing or moving or resizing or node_index >= 0 or marquee_active:
+		elif drawing or moving or resizing or node_index >= 0 or marquee_active or not cut_points.is_empty():
 			update_stroke(event.position, event.pressure if event.pressure > 0 else 0.55)
 	elif event is InputEventScreenTouch and event.pressed and not event.canceled:
 		begin_contact(event.index, event.position)
@@ -1786,7 +1923,8 @@ func begin_pointer(event: InputEventMouseButton) -> void:
 	var shortcut := ""
 	if not pen_button_tools.is_empty() and event.device != InputEvent.DEVICE_ID_EMULATION and pen_shortcut_contact.is_valid():
 		shortcut = pen_button_tools.get(int(pen_shortcut_contact.call()), "")
-	if Input.is_physical_key_pressed(KEY_SPACE) or shortcut == "hand" or (shortcut.is_empty() and tool == "hand"):
+	if not placing_symmetry_center and cut_target.is_empty() and (
+			Input.is_physical_key_pressed(KEY_SPACE) or shortcut == "hand" or (shortcut.is_empty() and tool == "hand")):
 		dragging = true
 		return
 	begin(event.position, last_pressure, shortcut)
@@ -1811,6 +1949,12 @@ func begin_contact(index: int, point: Vector2) -> void:
 	set_process_input(true)
 	if touch_points.size() == 1:
 		clear_pointer_metrics()
+		if placing_symmetry_center or not cut_target.is_empty():
+			touch_navigating = false
+			touch_start = point
+			touch_tap_moved = false
+			begin(point, 0.55)
+			return
 		var node_touch := false
 		var adding_with_touch := tool == "nodes" and adding_node
 		if tool == "nodes" and not adding_with_touch:
@@ -1920,6 +2064,18 @@ func begin(screen: Vector2, pressure: float, shortcut: String = "") -> void:
 	var action: String = tool if shortcut.is_empty() else shortcut
 	var point = to_document(screen)
 	start = point
+	if placing_symmetry_center:
+		if not page_bounds().has_point(point): return
+		symmetry_anchor = point / page_bounds().size
+		placing_symmetry_center = false
+		refresh_selection()
+		status.emit("Symmetry center placed.")
+		return
+	if not cut_target.is_empty():
+		if page_bounds().has_point(point):
+			cut_points = PackedVector2Array([point])
+			refresh_selection()
+		return
 	if action == "select" or action in AREA_TOOLS:
 		if not keep_selecting and begin_selection_transform(point): return
 		if action in AREA_TOOLS:
@@ -2042,7 +2198,10 @@ func begin(screen: Vector2, pressure: float, shortcut: String = "") -> void:
 		if not mask.is_empty(): current.paint_mask = mask.duplicate(true)
 		raw_pressure = BrushLibrary.map_pressure(pressure, current)
 		append_point(point, raw_pressure, true)
-		stage_wide_paint(layer)
+		if symmetry_mode != Symmetry.Mode.OFF:
+			for pose in Symmetry.poses(symmetry_mode, symmetry_arms, symmetry_center()):
+				symmetry_instances.append(Symmetry.stroke_instance(current, pose))
+		if symmetry_instances.is_empty(): stage_wide_paint(layer)
 	elif action in SHAPE_TOOLS:
 		current = new_shape(SHAPE_TOOLS[action], point)
 		update_drag_shape(point)
@@ -2142,6 +2301,9 @@ func append_point(point: Vector2, pressure: float, first := false) -> void:
 
 func update_stroke(screen: Vector2, pressure: float) -> void:
 	var point = to_document(screen)
+	if not cut_points.is_empty():
+		update_cut_trace(point)
+		return
 	if marquee_active:
 		update_marquee(point)
 		return
@@ -2213,19 +2375,25 @@ func apply_fill(point: Vector2) -> void:
 
 func finish_at(screen: Vector2) -> void:
 	var point := to_document(screen)
+	if not cut_points.is_empty():
+		update_cut_trace(point)
+		finish_cut_trace()
 	if marquee_active: update_marquee(point)
 	if drawing and current.get("brush") == "ink":
 		raw_point = point.clamp(Vector2.ZERO, Vector2(document.width, document.height))
 	finish()
 
 func finish() -> void:
+	cut_points.clear()
 	if marquee_active: finish_marquee()
 	if drawing and not current.is_empty():
 		if current.kind == "stroke":
 			append_motion(raw_point, raw_pressure, true)
 			current.erase("live_stroke")
 		if document.editable():
-			if current.kind == "stroke" and document.paints_pixels():
+			if not symmetry_instances.is_empty():
+				commit_symmetric_stroke()
+			elif current.kind == "stroke" and document.paints_pixels():
 				var erasing: bool = current.get("erasing", false)
 				var stable: bool = staged_paint != null and staged_paint_revision == document.revision \
 					and staged_paint_layer == document.layers[document.active].id
@@ -2248,6 +2416,7 @@ func finish() -> void:
 	refresh_transform_cache()
 	edit_started = false
 	end_preview()
+	symmetry_instances.clear()
 	current = {}
 	drawing = false
 	moving = false
@@ -2261,6 +2430,7 @@ func finish() -> void:
 
 func cancel(keep_picks := false) -> void:
 	end_paint_staging()
+	cancel_drawing_actions()
 	clear_path()
 	if document != null and not keep_picks and not marquee_active and (not selected_area.is_empty() or not document.area_selection.is_empty()):
 		clear_selection()
@@ -2280,6 +2450,7 @@ func cancel(keep_picks := false) -> void:
 	refresh_transform_cache()
 	edit_started = false
 	end_preview()
+	symmetry_instances.clear()
 	current = {}
 	drawing = false
 	moving = false
@@ -2290,6 +2461,93 @@ func cancel(keep_picks := false) -> void:
 	node_index = -1
 	node_arc.clear()
 	refresh_selection()
+
+func cancel_drawing_actions() -> void:
+	cut_target = ""
+	cut_points.clear()
+	placing_symmetry_center = false
+	refresh_selection()
+
+func cut_selection() -> Dictionary:
+	var items := transformable_items()
+	return items[0] if items.size() == 1 else {}
+
+func radial_repeat_source() -> Dictionary:
+	var items := transformable_items()
+	if items.size() != 1: return {}
+	var item := items[0]
+	if item.layer.get("type", "vector") != "vector" or item.layer.get("alpha_locked", false): return {}
+	var object: Dictionary = item.object
+	if object.kind == "stroke" and object.points.size() >= 2: return item
+	if object.kind == "path" and object.vertices.size() >= 2: return item
+	return {}
+
+func arm_cut() -> void:
+	finish()
+	var target := cut_selection()
+	var reason: String = document.cut_target_reason(target)
+	if not reason.is_empty():
+		status.emit(reason)
+		return
+	cancel_drawing_actions()
+	cut_target = target.object.id
+	status.emit("Draw a loop around the area to remove.")
+
+func update_cut_trace(point: Vector2) -> void:
+	point = point.clamp(Vector2.ZERO, page_bounds().size)
+	if cut_points[-1].distance_to(point) < maxf(0.2, 2.5 / zoom): return
+	if cut_points.size() == 512:
+		var compact := PackedVector2Array()
+		for index in range(0, cut_points.size(), 2): compact.append(cut_points[index])
+		cut_points = compact
+	cut_points.append(point)
+	refresh_selection()
+
+func finish_cut_trace() -> void:
+	var trace := cut_points
+	cut_points = PackedVector2Array()
+	if trace.size() > 3 and trace[-1].distance_to(trace[0]) < maxf(0.2, 3.0 / zoom):
+		trace.resize(trace.size() - 1)
+	var target := cut_selection()
+	if target.is_empty() or target.object.id != cut_target:
+		cancel_drawing_actions()
+		status.emit("Select the shape again.")
+		return
+	var reason: String = document.cut_vector_shape(target, trace)
+	if reason.is_empty(): cut_target = ""
+	status.emit("Cut out shape." if reason.is_empty() else reason)
+
+func commit_symmetric_stroke() -> void:
+	var instances: Array[Dictionary] = []
+	var bounds := Rect2(Art.v(current.points[0]), Vector2.ZERO)
+	for sample in current.points: bounds = bounds.expand(Art.v(sample))
+	bounds = bounds.grow(float(current.size) * 1.5)
+	if Art.clipped_stroke_has_paint(current): instances.append(current)
+	for example in symmetry_instances:
+		var pose := Art.object_transform(example)
+		if not page_bounds().intersects(pose * bounds, true): continue
+		if current.points.all(func(sample):
+			var point := Art.v(sample)
+			return (pose * point).distance_squared_to(point) < 0.000001):
+			continue
+		example.erase("live_stroke")
+		if not Art.clipped_stroke_has_paint(example): continue
+		example.id = document.uid()
+		if not document.paints_pixels(): example.points = example.points.duplicate(true)
+		instances.append(example)
+	if instances.is_empty(): return
+	var erasing: bool = current.get("erasing", false)
+	if document.paints_pixels():
+		if document.commit_symmetric_paint(instances, erasing) != OK:
+			status.emit("The project has reached its embedded paint size limit.")
+			return
+	else:
+		var physical_zoom: float = zoom * get_screen_transform().get_scale().x
+		var gap := clampf(Document.VectorUnion.TIP_GAP / maxf(physical_zoom, 0.01), 0.25, 4.0)
+		if not document.append_symmetric_strokes(instances, gap):
+			status.emit("The project has reached its vector object limit.")
+			return
+	if not erasing: color_used.emit(stroke_pigment)
 
 func set_clip_from_selection() -> bool:
 	var contours: Array[PackedVector2Array] = []

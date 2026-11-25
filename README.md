@@ -2,7 +2,7 @@
 
 **A little illustration studio for Android tablets.**
 
-[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.74/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
+[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.75/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
 
 I wanted my wife to have somewhere of her own to draw. A little studio on her
 tablet, with brushes she could make her own, artwork she could scale into shop
@@ -44,6 +44,11 @@ I’d love for you to use it, share it, or make it your own.
   **Transform** for flips, quarter turns, and snapping to the canvas or 15°
   angles. **Align & arrange** aligns objects, spaces them evenly, and changes
   their drawing order within a vector layer.
+- **Drawing symmetry and cutouts.** Open **Transform → Drawing symmetry…** to
+  mirror your brush strokes or repeat them around a center. To turn a finished
+  vector stroke into a snowflake or rosette, select it and choose
+  **Transform → Radial repeat…**. For a cutout, select a filled vector shape,
+  choose **Transform → Cut out a shape…**, and draw a loop.
 - **Panels.** Drag a panel by its heading to move or dock it. Open **Panels** to
   bring it back, or change **UI scale** under **⋯ → Workspace settings** to make
   controls easier to reach.

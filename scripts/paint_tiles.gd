@@ -5,6 +5,7 @@ const Art = preload("res://scripts/artwork.gd")
 const Raster = preload("res://scripts/raster_asset.gd")
 const TILE_SIZE := 128
 const MAX_STAGED_TILES := 160
+const MAX_ANDROID_FOOTPRINT_BYTES := 8 * 1024 * 1024
 static var raster: Variant
 static var raster_checked := false
 
@@ -30,6 +31,40 @@ func apply(layer: Dictionary, page: Vector2i, stroke: Dictionary, erase: bool) -
 		paint_polygon(footprint.polygon, footprint.color)
 	return encode_result(layer)
 
+func apply_instances(layer: Dictionary, page: Vector2i, strokes: Array[Dictionary], erase: bool) -> Dictionary:
+	if strokes.is_empty(): return {}
+	prepare_layer(layer, page)
+	erasing = erase
+	if erasing and alpha_locked: return {}
+	var shared := []
+	if not strokes[0].has("clip") and not strokes[0].has("paint_mask"):
+		shared = Art.paint_footprints(strokes[0])
+	if not erasing and not alpha_locked and strokes[0].brush == "soft" and float(strokes[0].size) >= 48.0:
+		begin_android_stage()
+		if native_stroke > 0:
+			if rasterize_android_instances(strokes, shared): return encode_result(layer, true)
+			# An oversized stroke or unavailable worker must restart from the
+			# original tiles, including any tiles already submitted.
+			cancel_stage()
+			changed.clear()
+	for stroke in strokes:
+		var pose := Art.object_transform(stroke)
+		var footprints := shared if not shared.is_empty() else Art.paint_footprints(stroke)
+		for footprint in footprints:
+			var polygon: PackedVector2Array = footprint.polygon
+			paint_polygon(polygon if pose == Transform2D.IDENTITY else pose * polygon, footprint.color)
+	return encode_result(layer, true)
+
+func rasterize_android_instances(strokes: Array[Dictionary], shared: Array) -> bool:
+	var payload := PackedByteArray()
+	var touched := {}
+	for stroke in strokes:
+		var pose := Art.object_transform(stroke)
+		var footprints := shared if not shared.is_empty() else Art.paint_footprints(stroke)
+		if not pack_android_footprints(footprints, pose, payload, touched): return false
+		if touched.size() > MAX_STAGED_TILES: return false
+	return submit_android_tiles(payload, touched) and collect_android()
+
 func begin_android_stage() -> void:
 	if not raster_checked:
 		raster_checked = true
@@ -46,12 +81,23 @@ func submit_android(stroke: Dictionary, count: int) -> bool:
 	if count <= staged_samples: return true
 	var footprints := Art.paint_footprints(stroke, staged_samples, count)
 	if footprints.size() > 1024: return false
+	if not submit_android_footprints(footprints): return false
+	staged_samples = count
+	return true
+
+func submit_android_footprints(footprints: Array) -> bool:
 	var payload := PackedByteArray()
 	var touched := {}
+	if not pack_android_footprints(footprints, Transform2D.IDENTITY, payload, touched): return false
+	return submit_android_tiles(payload, touched)
+
+func pack_android_footprints(footprints: Array, pose: Transform2D, payload: PackedByteArray, touched: Dictionary) -> bool:
 	var page := Rect2i(Vector2i.ZERO, page_size)
 	for dab in footprints:
 		var points: PackedVector2Array = dab.polygon
+		if points.size() < 3: continue
 		if points.size() > 64: return false
+		if pose != Transform2D.IDENTITY: points = pose * points
 		var bounds := Art.polygon_bounds(points)
 		var start := Vector2i(bounds.position.floor())
 		var stop := Vector2i(bounds.end.ceil())
@@ -61,20 +107,20 @@ func submit_android(stroke: Dictionary, count: int) -> bool:
 		for y in range(origin.y, visible.end.y, TILE_SIZE):
 			for x in range(origin.x, visible.end.x, TILE_SIZE):
 				touched[Vector2i(x, y)] = true
-		scanline.fill(dab.color)
 		var offset := payload.size()
-		payload.resize(offset + 24 + points.size() * 8)
+		if offset + 24 + points.size() * 8 > MAX_ANDROID_FOOTPRINT_BYTES: return false
+		scanline.fill(dab.color)
+		payload.resize(offset + 24)
 		payload.encode_float(offset, bounds.position.x)
 		payload.encode_float(offset + 4, bounds.position.y)
 		payload.encode_float(offset + 8, bounds.end.x)
 		payload.encode_float(offset + 12, bounds.end.y)
 		payload.encode_u32(offset + 16, scanline.get_data().decode_u32(0))
 		payload.encode_s32(offset + 20, points.size())
-		offset += 24
-		for point in points:
-			payload.encode_float(offset, point.x)
-			payload.encode_float(offset + 4, point.y)
-			offset += 8
+		payload.append_array(points.to_byte_array())
+	return true
+
+func submit_android_tiles(payload: PackedByteArray, touched: Dictionary) -> bool:
 	var seeds := PackedByteArray()
 	for origin: Vector2i in touched:
 		var extent := (page_size - origin).min(Vector2i.ONE * TILE_SIZE)
@@ -94,9 +140,7 @@ func submit_android(stroke: Dictionary, count: int) -> bool:
 		seeds.encode_s32(offset + 16, data.size())
 		seeds.append_array(data)
 	# Godot exposes this Java boolean as an integer on Android.
-	if not seeds.is_empty() and not bool(raster.submit(native_stroke, payload, seeds)): return false
-	staged_samples = count
-	return true
+	return seeds.is_empty() or bool(raster.submit(native_stroke, payload, seeds))
 
 func collect_android() -> bool:
 	var output: Variant = raster.finish(native_stroke)
@@ -112,7 +156,7 @@ func collect_android() -> bool:
 		var length := extent.x * extent.y * 4
 		offset += 16
 		if offset + length > output.size(): return false
-		tile.set_data(extent.x, extent.y, false, Image.FORMAT_RGBA8, output.slice(offset, offset+length))
+		tile.set_data(extent.x, extent.y, false, Image.FORMAT_RGBA8, output.slice(offset, offset + length))
 		offset += length
 	return true
 
@@ -333,17 +377,34 @@ func append_span(spans: Array[Vector2i], start: int, stop: int) -> void:
 func tile_origin(point: Vector2i) -> Vector2i:
 	return (point / TILE_SIZE) * TILE_SIZE
 
-func encode_result(layer: Dictionary) -> Dictionary:
+func encode_result(layer: Dictionary, parallel := false) -> Dictionary:
 	var replacements := {}
 	var additions := []
+	var images: Array[Image] = []
+	var origins: Array[Vector2i] = []
 	for origin in changed:
 		var image: Image = changed[origin]
-		var old: Dictionary = tiles.get(origin, {})
 		if image.is_invisible():
+			var old: Dictionary = tiles.get(origin, {})
 			if not old.is_empty(): replacements[old.id] = {}
 			continue
-		var encoded := Raster.encode_png(image)
+		images.append(image)
+		origins.append(origin)
+	var results: Array[Dictionary] = []
+	if parallel and images.size() >= 8:
+		results.resize(images.size())
+		# Each task owns a distinct image and result slot. The shared raster
+		# cache is populated below on the main thread after all tasks finish.
+		var group := WorkerThreadPool.add_group_task(func(index: int):
+			results[index] = Raster.serialize_png(images[index]), images.size(), mini(images.size(), 4), true)
+		WorkerThreadPool.wait_for_group_task_completion(group)
+	for index in images.size():
+		var origin := origins[index]
+		var image := images[index]
+		var old: Dictionary = tiles.get(origin, {})
+		var encoded := Raster.encode_png(image) if results.is_empty() else results[index]
 		if not old.is_empty() and old.image_key == encoded.image_key: continue
+		if not results.is_empty(): Raster.remember(encoded.image_key, image)
 		encoded.merge({"kind": "image", "paint_tile": true, "pos": [origin.x, origin.y],
 			"scale": 1.0, "color": "#ffffff", "opacity": 1.0})
 		if old.is_empty():

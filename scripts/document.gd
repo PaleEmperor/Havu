@@ -89,6 +89,10 @@ func estimate_history_bytes(entry: Dictionary) -> int:
 			for object in layer.objects: bytes += estimate_object_bytes(object)
 	elif entry.has("append"):
 		bytes += estimate_object_bytes(entry.append)
+	elif entry.has("stroke_set"):
+		for stroke in entry.stroke_set: bytes += estimate_object_bytes(stroke)
+	elif entry.has("shape_cut"):
+		bytes += estimate_object_bytes(entry.before) + estimate_object_bytes(entry.after)
 	elif entry.has("transform"):
 		for objects in entry.transform.values(): bytes += 480 * objects.size()
 	elif entry.has("paint"):
@@ -142,6 +146,85 @@ func commit_paint(stroke: Dictionary, erasing: bool, staged: PaintTiles = null) 
 		return record_paint_result(layer, staged.encode_result(layer))
 	var result := PaintTiles.new().apply(layer, Vector2i(ceili(width), ceili(height)), stroke, erasing)
 	return record_paint_result(layer, result)
+
+func commit_symmetric_paint(strokes: Array[Dictionary], erasing: bool) -> Error:
+	if not editable() or not paints_pixels(): return ERR_UNAVAILABLE
+	var layer: Dictionary = layers[active]
+	var painter := PaintTiles.new()
+	var result := painter.apply_instances(layer, Vector2i(ceili(width), ceili(height)), strokes, erasing)
+	return record_paint_result(layer, result)
+
+func append_symmetric_strokes(strokes: Array[Dictionary], ink_gap: float) -> bool:
+	if not editable() or paints_pixels() or strokes.is_empty(): return false
+	var count := strokes.size()
+	for layer in layers: count += layer.objects.size()
+	if count > MAX_OBJECTS: return false
+	if strokes.size() == 1: return append_vector_object(strokes[0], ink_gap)
+	var layer: Dictionary = layers[active]
+	for stroke in strokes:
+		if not stroke.has("id"): stroke.id = uid()
+	if layer.get("merge_touching", false):
+		var working: Array = layer.objects.duplicate()
+		var first_change := working.size()
+		for stroke in strokes:
+			if VectorUnion.can_union(stroke):
+				stroke.merge_batch = layer.merge_batch
+				var joined := VectorUnion.find_union(working, stroke, ink_gap)
+				if not joined.is_empty():
+					for index in joined.indices:
+						first_change = mini(first_change, index)
+						working.remove_at(index)
+					working.append(joined.object)
+					continue
+			working.append(stroke)
+		if first_change < layer.objects.size():
+			replace_layer_span(active, first_change, layer.objects.size() - first_change,
+				working.slice(first_change), working.back().id)
+			return true
+		strokes.assign(working.slice(first_change))
+	append_vector_set(active, strokes, strokes[0].id)
+	return true
+
+func append_vector_set(layer_index: int, objects: Array[Dictionary], selected_id: String, repeat_source := "") -> void:
+	var layer: Dictionary = layers[layer_index]
+	layer.objects.append_array(objects)
+	active = layer_index
+	selection = selected_id
+	var entry := {"stroke_set": objects.duplicate(true), "layer": active}
+	if not repeat_source.is_empty(): entry.repeat_source = repeat_source
+	push_history(entry)
+	future.clear()
+	commit({}, [], {"layer": layer.id, "append_set": objects})
+
+func repeat_radially(item: Dictionary, arms: int) -> String:
+	var layer: Dictionary = item.get("layer", {})
+	var source: Dictionary = item.get("object", {})
+	if source.get("kind") not in ["stroke", "path"]: return "Select one vector stroke or open path."
+	var index := layer_index(layer.get("id", ""))
+	if (index < 0 or not layer.visible or layer.locked or layer.get("alpha_locked", false)
+			or layer.get("type", "vector") != "vector" or not layer.objects.has(source)):
+		return "Select a stroke on a visible, unlocked vector layer."
+	var samples: Array = source.points if source.kind == "stroke" else source.vertices
+	if samples.size() < 2: return "Select a stroke with at least two points."
+	var pivot := Art.object_transform(source) * Art.v(samples[0])
+	var local_bounds := Art.outline_bounds(source)
+	var siblings: Array[Dictionary] = []
+	arms = clampi(arms, 2, 12)
+	var count := arms - 1
+	for existing in layers: count += existing.objects.size()
+	if count > MAX_OBJECTS: return "The project has reached its vector object limit."
+	var page := Rect2(0, 0, width, height).grow(0.01)
+	for arm in range(1, arms):
+		var copy := source.duplicate(true)
+		copy.id = uid()
+		copy.erase("merge_batch")
+		copy.erase("artwork_group")
+		turn_object(capture_transform_item({"layer": layer, "object": copy}), pivot, TAU * arm / arms, 0)
+		if not page.encloses(Art.object_transform(copy) * local_bounds) and not page.encloses(Art.bounds(copy)):
+			return "Move the stroke inward so all the arms fit on the canvas."
+		siblings.append(copy)
+	append_vector_set(index, siblings, source.id, source.id)
+	return ""
 
 func fill_paint(point: Vector2i, ink: Color) -> Error:
 	if not editable() or not paints_pixels(): return ERR_UNAVAILABLE
@@ -462,6 +545,20 @@ func undo() -> void:
 		append_history_entry(future, change)
 		restore_layer_span(change, false)
 		return
+	if change.has("shape_cut"):
+		append_history_entry(future, change)
+		restore_shape_cut(change, false)
+		return
+	if change.has("stroke_set"):
+		active = change.layer
+		var objects: Array = layers[active].objects
+		var removed := {}
+		for stroke in change.stroke_set: removed[stroke.id] = true
+		objects.resize(objects.size() - removed.size())
+		selection = change.get("repeat_source", "")
+		append_history_entry(future, change)
+		commit({}, [], {"layer": layers[active].id, "remove": removed, "add": [], "undo_append": true})
+		return
 	if change.has("append"):
 		var objects: Array = layers[change.layer].objects
 		for index in range(objects.size() - 1, -1, -1):
@@ -513,6 +610,18 @@ func redo() -> void:
 	if change.has("span"):
 		push_history(change)
 		restore_layer_span(change, true)
+		return
+	if change.has("shape_cut"):
+		push_history(change)
+		restore_shape_cut(change, true)
+		return
+	if change.has("stroke_set"):
+		active = change.layer
+		var strokes: Array = change.stroke_set.duplicate(true)
+		layers[active].objects.append_array(strokes)
+		selection = change.get("repeat_source", "")
+		push_history(change)
+		commit({}, [], {"layer": layers[active].id, "append_set": strokes})
 		return
 	if change.has("append"):
 		active = change.layer
@@ -674,6 +783,49 @@ func recolor_shape(index: int, object: Dictionary, ink: String) -> void:
 	object.color = ink
 	object.fill_enabled = true
 	commit({}, [], {"layer": layers[index].id, "redraw": object})
+
+func cut_target_reason(item: Dictionary) -> String:
+	if item.is_empty() or item.object.kind not in ["rect", "ellipse", "polygon"] or not Art.has_fill(item.object):
+		return "Select one filled vector shape to cut."
+	if not item.layer.visible or item.layer.locked or item.layer.get("alpha_locked", false):
+		return "Unlock the shape’s layer before cutting."
+	return ""
+
+func cut_vector_shape(item: Dictionary, loop: PackedVector2Array) -> String:
+	var reason := cut_target_reason(item)
+	if not reason.is_empty(): return reason
+	var target: Dictionary = item.object
+	var layer: Dictionary = item.layer
+	var layer_at := layer_index(layer.id)
+	var object_at: int = layer.objects.find(target)
+	if layer_at < 0 or object_at < 0: return "Select the shape again."
+	var result := Art.subtract_from_shape(target, loop)
+	if result.has("error"): return result.error
+	var values: Array = result.get("objects", [])
+	if values.is_empty():
+		replace_layer_span(layer_at, object_at, 1, [], "")
+	else:
+		var change := {"shape_cut": target.id, "layer": layer.id, "slot": object_at,
+			"before": target.duplicate(true), "after": values[0].duplicate(true)}
+		push_history(change)
+		future.clear()
+		restore_shape_cut(change, true, true)
+	return ""
+
+func restore_shape_cut(change: Dictionary, forward: bool, keep_selected := false) -> void:
+	var index := layer_index(change.layer)
+	if index < 0: return
+	var objects: Array = layers[index].objects
+	if change.slot >= objects.size() or objects[change.slot].id != change.shape_cut: return
+	var target: Dictionary = objects[change.slot]
+	# Retained draw commands already hold this dictionary. Replace its
+	# geometry in place to leave every other mark and its cache intact.
+	target.clear()
+	var state: Dictionary = change.after if forward else change.before
+	target.merge(state.duplicate(true))
+	active = index
+	selection = change.shape_cut if keep_selected else ""
+	commit({}, [], {"layer": change.layer, "redraw": target, "geometry": true})
 
 func restore_recolor(change: Dictionary, forward: bool) -> void:
 	var index := layer_index(change.recolor)

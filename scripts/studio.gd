@@ -2250,7 +2250,9 @@ func refresh_tool_buttons() -> void:
 		control.self_modulate.a = 1.0 if canvas.tool_unavailable_reason(key).is_empty() else 0.38
 
 func activate_tool(next: String) -> void:
-	if next != canvas.tool: canvas.clear_path()
+	if next != canvas.tool:
+		canvas.clear_path()
+		canvas.cancel_drawing_actions()
 	canvas.tool = next
 	if next != "nodes": canvas.set_add_node_mode(false)
 	refresh_tool_buttons()
@@ -2527,10 +2529,10 @@ func build_selection_tray() -> void:
 	selection_actions.add_child(union_button)
 	build_transform_menus()
 	transform_button = icon_button("M3 10V4H9M17 4H23V10M23 18V24H17M9 24H3V18M9 14L13 10L17 14L13 18Z",
-		show_transform_menu, "Transform · Rotate, mirror, position and size")
+		show_transform_menu, "Transform · Drawing symmetry, cut out and selection transforms")
 	transform_button.custom_minimum_size.y = 44
 	header_tools.add_child(transform_button)
-	PopupTouch.watch_launcher(transform_button)
+	PopupTouch.watch_launcher(transform_button, transform_menu)
 	selected_shape_style = button("Style", open_shape_style, "Edit the selected shape’s fill, outline, and opacity")
 	selection_actions.add_child(selected_shape_style)
 	paint_inside_button = button("Paint inside", func(): set_paint_limit(true), "Limit brushwork to this selection")
@@ -2631,6 +2633,10 @@ func change_artwork_group(ungroup: bool) -> void:
 func build_transform_menus() -> void:
 	transform_menu = PopupMenu.new()
 	transform_menu.name = "TransformMenu"
+	transform_menu.add_item("Drawing symmetry…", 11)
+	transform_menu.add_item("Radial repeat…", 13)
+	transform_menu.add_item("Cut out a shape…", 12)
+	transform_menu.add_separator()
 	for entry in [["Rotate 90° clockwise", 0], ["Rotate 90° counterclockwise", 1],
 		["Rotate 180°", 7], ["Flip horizontally", 2], ["Flip vertically", 3],
 		["Center on canvas", 8], ["Fit to canvas", 9], ["Precise transform…", 10]]:
@@ -2659,7 +2665,18 @@ func build_transform_menus() -> void:
 	add_child(arrange_menu)
 
 func show_transform_menu() -> void:
-	if canvas.transformable_items().is_empty(): return
+	var selection: bool = not canvas.transformable_items().is_empty()
+	for id in [0, 1, 2, 3, 5, 7, 8, 9, 10]:
+		transform_menu.set_item_disabled(transform_menu.get_item_index(id), not selection)
+	var cut := transform_menu.get_item_index(12)
+	var reason: String = document.cut_target_reason(canvas.cut_selection())
+	transform_menu.set_item_disabled(cut, not reason.is_empty())
+	transform_menu.set_item_tooltip(cut, reason)
+	var repeat_index := transform_menu.get_item_index(13)
+	transform_menu.set_item_disabled(repeat_index, canvas.radial_repeat_source().is_empty())
+	transform_menu.set_item_tooltip(repeat_index, "Select one vector stroke or open path.")
+	transform_menu.set_item_text(transform_menu.get_item_index(11),
+		"Drawing symmetry · On…" if canvas.symmetry_mode != Canvas.Symmetry.Mode.OFF else "Drawing symmetry…")
 	transform_menu.set_item_checked(transform_menu.get_item_index(4), canvas.snap_rotation)
 	transform_menu.set_item_checked(transform_menu.get_item_index(6), canvas.snap_to_canvas)
 	show_edit_popup(transform_menu)
@@ -2690,6 +2707,117 @@ func transform_action(id: int) -> void:
 		8: canvas.place_selection(false)
 		9: canvas.place_selection(true)
 		10: show_precise_transform.call_deferred()
+		11: show_symmetry_options.call_deferred()
+		12: canvas.arm_cut()
+		13: show_radial_repeat.call_deferred()
+
+func show_radial_repeat() -> void:
+	if canvas.radial_repeat_source().is_empty(): return
+	var dialog := ConfirmationDialog.new()
+	dialog.name = "RadialRepeat"
+	dialog.title = "Radial repeat"
+	dialog.ok_button_text = "Repeat"
+	add_child(dialog)
+	var content := margin(dialog, 16)
+	content.custom_minimum_size.x = 260
+	content.add_child(label("Rotate copies around the stroke’s first point.", 14))
+	var caption := label("6 arms", 16)
+	content.add_child(caption)
+	var arms := HSlider.new()
+	arms.name = "RepeatArms"
+	arms.min_value = 2
+	arms.max_value = 12
+	arms.step = 1
+	arms.value = 6
+	arms.custom_minimum_size.y = 44
+	arms.accessibility_name = "Number of radial arms"
+	content.add_child(arms)
+	arms.value_changed.connect(func(value: float): caption.text = "%d arms" % int(value))
+	dialog.confirmed.connect(func():
+		var source: Dictionary = canvas.radial_repeat_source()
+		if not source.is_empty():
+			var reason: String = document.repeat_radially(source, int(arms.value))
+			notify("Created %d radial arms." % int(arms.value) if reason.is_empty() else reason)
+		dialog.queue_free())
+	dialog.canceled.connect(dialog.queue_free)
+	dialog.popup_centered()
+
+func show_symmetry_options() -> void:
+	canvas.cancel_drawing_actions()
+	var dialog := ConfirmationDialog.new()
+	dialog.name = "DrawingSymmetry"
+	dialog.title = "Drawing symmetry"
+	dialog.ok_button_text = "Apply"
+	add_child(dialog)
+	var options := margin(dialog, 16)
+	options.custom_minimum_size.x = 270
+	var chosen := {"mode": canvas.symmetry_mode, "arms": canvas.symmetry_arms}
+	var modes := GridContainer.new()
+	modes.columns = 2
+	var exclusive := ButtonGroup.new()
+	options.add_child(modes)
+	var radial_row := HBoxContainer.new()
+	options.add_child(radial_row)
+	var arms_label := label("Arms", 16)
+	arms_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	radial_row.add_child(arms_label)
+	var arms := label(str(chosen.arms), 17)
+	arms.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	arms.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	arms.custom_minimum_size.x = 30
+	var decrease := button("−", func():
+		chosen.arms = maxi(2, chosen.arms - 1)
+		arms.text = str(chosen.arms))
+	var increase := button("+", func():
+		chosen.arms = mini(12, chosen.arms + 1)
+		arms.text = str(chosen.arms))
+	decrease.accessibility_name = "Fewer radial arms"
+	increase.accessibility_name = "More radial arms"
+	for control in [decrease, arms, increase]:
+		if control is Button: control.custom_minimum_size = Vector2(44, 44)
+		radial_row.add_child(control)
+	var guides := CheckButton.new()
+	guides.text = "Show guides"
+	guides.button_pressed = canvas.symmetry_guides
+	guides.custom_minimum_size.y = 44
+	options.add_child(guides)
+	var center_actions := HFlowContainer.new()
+	options.add_child(center_actions)
+	var apply := func():
+		if chosen.mode != Canvas.Symmetry.Mode.OFF and canvas.tool not in ["brush", "erase"]:
+			set_tool("brush")
+		canvas.configure_symmetry(chosen.mode, chosen.arms, guides.button_pressed)
+		transform_button.self_modulate = Color.WHITE if chosen.mode == Canvas.Symmetry.Mode.OFF else ACCENT
+		dialog.hide()
+		dialog.queue_free()
+	center_actions.add_child(button("Place center", func():
+		apply.call()
+		canvas.placing_symmetry_center = true
+		canvas.refresh_selection()
+		notify("Tap the canvas to place the symmetry center.")))
+	center_actions.add_child(button("Center on page", func():
+		canvas.symmetry_anchor = Vector2(0.5, 0.5)
+		apply.call()))
+	var update_options := func(value: int):
+		chosen.mode = value
+		radial_row.visible = value == Canvas.Symmetry.Mode.RADIAL
+		guides.visible = value != Canvas.Symmetry.Mode.OFF
+		center_actions.visible = guides.visible
+		dialog.reset_size()
+	for specification in [["Vertical", Canvas.Symmetry.Mode.VERTICAL], ["Horizontal", Canvas.Symmetry.Mode.HORIZONTAL],
+			["Four-way", Canvas.Symmetry.Mode.FOUR_WAY], ["Radial", Canvas.Symmetry.Mode.RADIAL], ["Off", Canvas.Symmetry.Mode.OFF]]:
+		var value: int = specification[1]
+		var option := button(specification[0], update_options.bind(value))
+		if value == Canvas.Symmetry.Mode.RADIAL: option.name = "RadialSymmetry"
+		option.toggle_mode = true
+		option.button_group = exclusive
+		option.button_pressed = value == chosen.mode
+		option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		modes.add_child(option)
+	update_options.call(chosen.mode)
+	dialog.confirmed.connect(apply)
+	dialog.canceled.connect(dialog.queue_free)
+	dialog.popup_centered()
 
 func show_precise_transform() -> void:
 	if canvas.transformable_items().is_empty(): return
@@ -2804,7 +2932,7 @@ func update_selection_actions() -> void:
 	selection_actions.get_child(0).disabled = not can_act
 	selection_actions.get_child(1).disabled = not can_act
 	selection_move_button.disabled = not can_act
-	transform_button.visible = can_act
+	transform_button.visible = can_act or canvas.tool in ["brush", "erase"]
 	var pen_path: bool = canvas.tool == "path"
 	finish_path_button.visible = pen_path
 	close_path_button.visible = pen_path
@@ -3407,7 +3535,7 @@ func preserve_recovery(encoded := PackedByteArray()) -> bool:
 
 func autosave() -> void:
 	if not session_active or project_home.visible or project_loading_overlay.visible: return
-	if canvas.drawing or canvas.moving or canvas.resizing or canvas.node_index >= 0: return
+	if canvas.drawing or canvas.moving or canvas.resizing or canvas.node_index >= 0 or not canvas.cut_points.is_empty(): return
 	if Time.get_ticks_msec() - canvas.last_brush_activity < 1000: return
 	if recovered_revision == document.revision:
 		if history_preferences_dirty and settings.save("user://preferences.cfg") == OK: history_preferences_dirty = false
@@ -3932,6 +4060,9 @@ func enter_project(recovery_source := PackedByteArray()) -> void:
 	session_active = true
 	canvas.set_add_node_mode(false)
 	canvas.set_solo_layer("")
+	canvas.symmetry_mode = Canvas.Symmetry.Mode.OFF
+	canvas.symmetry_anchor = Vector2(0.5, 0.5)
+	transform_button.self_modulate = Color.WHITE
 	project_home.hide()
 	canvas.cancel()
 	clip_check.set_pressed_no_signal(false)

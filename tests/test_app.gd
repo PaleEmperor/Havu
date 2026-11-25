@@ -27,6 +27,17 @@ func stroke(color = "#226451") -> Dictionary:
 	return {"kind": "stroke", "brush": "ink", "size": 20.0, "color": color, "opacity": 1.0, "points": [[10.0, 10.0, 0.1, color], [100.0, 20.0, 1.0, color], [150.0, 100.0, 0.5, color]]}
 
 func run() -> void:
+	if "--symmetry" in OS.get_cmdline_user_args():
+		var app = load("res://main.tscn").instantiate()
+		root.add_child(app)
+		await process_frame
+		await symmetry_and_cut_regressions(app)
+		app.autosave_timer.stop()
+		app.queue_free()
+		await process_frame
+		print("RESULT: %d checks, %d failures" % [checks, failures])
+		quit(1 if failures else 0)
+		return
 	if "--overhaul" in OS.get_cmdline_user_args():
 		var app = load("res://main.tscn").instantiate()
 		root.add_child(app)
@@ -3167,9 +3178,11 @@ func run() -> void:
 	check(not fill_region.is_empty() and Geometry2D.is_point_in_polygon(heart_center, fill_region.vertices),
 		"Vector Fill can color the center separately after Merge touching")
 	var reopened_heart := Document.new()
+	var heart_svg := Art.svg(heart_doc, false)
 	check(heart_doc.save_to("user://merged-heart.havu") == OK and reopened_heart.load_from("user://merged-heart.havu").is_empty()
 		and Art.polygon(reopened_heart.layers[0].objects[0]) == heart_vertices
-		and Art.svg(reopened_heart, false).contains(Art.points_string(heart_vertices)),
+		and Art.svg(reopened_heart, false) == heart_svg and Art.Compound.boundary_loops(heart_vertices).all(func(outline):
+			return heart_svg.contains(Art.points_string(outline))),
 		"the joined outline and its hole survive project save and SVG export")
 	reopened_heart.append_vector_object(heart_ink.call([[44, 90], [156, 90]]))
 	var divided_heart: Dictionary = reopened_heart.layers[0].objects[0]
@@ -3422,12 +3435,170 @@ func run() -> void:
 	editing_scale_regressions()
 	await page_clipping_regressions(app)
 	await working_folder_regressions(app)
+	await symmetry_and_cut_regressions(app)
 
 	print("RESULT: %d checks, %d failures" % [checks, failures])
 	app.autosave_timer.stop()
 	app.queue_free()
 	await process_frame
 	quit(1 if failures else 0)
+
+func symmetry_and_cut_regressions(app) -> void:
+	var doc: Document = app.document
+	var canvas: Canvas = app.canvas
+	app.project_home.hide()
+	doc.blank(320, 320, false)
+	app.set_tool("brush")
+	canvas.fit()
+	canvas.brush = "ink"
+	canvas.brush_profile = {}
+	canvas.brush_size = 12.0
+	canvas.opacity = 1.0
+	canvas.smoothing = 0.0
+	var screen := func(point: Vector2): return canvas.origin + point * canvas.zoom
+	app.transform_button.pressed.emit()
+	var menu: PopupMenu = app.transform_menu
+	check(menu.visible and not menu.is_item_disabled(menu.get_item_index(11))
+		and menu.is_item_disabled(menu.get_item_index(12)), "Transform offers symmetry without a selection")
+	menu.hide()
+	app.transform_action(11)
+	await process_frame
+	var options := app.get_node("DrawingSymmetry") as ConfirmationDialog
+	var radial := options.find_child("RadialSymmetry", true, false) as Button
+	radial.pressed.emit()
+	options.confirmed.emit()
+	check(canvas.symmetry_mode == Canvas.Symmetry.Mode.RADIAL and canvas.symmetry_arms == 6,
+		"the symmetry dialog enables radial drawing with six arms by default")
+	canvas.placing_symmetry_center = true
+	canvas.begin_contact(0, screen.call(Vector2(150, 160)))
+	canvas.end_contact(0, screen.call(Vector2(150, 160)), false)
+	check(canvas.symmetry_center().is_equal_approx(Vector2(150, 160)) and doc.layers[0].objects.is_empty(),
+		"placing the center responds to a finger tap without leaving a mark")
+	var first := Vector2(187, 160)
+	var last := Vector2(229, 160)
+	canvas.begin(screen.call(first), 0.78)
+	canvas.update_stroke(screen.call(last), 0.78)
+	check(canvas.preview_root.get_child_count() >= 6 and doc.layers[0].objects.is_empty(),
+		"all six arms preview during the stroke")
+	canvas.finish_at(screen.call(last))
+	var strokes: Array = doc.layers[0].objects
+	var correct_rays := strokes.size() == 6
+	for index in strokes.size():
+		var mark: Dictionary = strokes[index]
+		var expected := canvas.symmetry_center() + (first - canvas.symmetry_center()).rotated(TAU * index / 6)
+		correct_rays = correct_rays and (Art.object_transform(mark) * Art.v(mark.points[0])).distance_to(expected) < 0.01
+	var snowflake := doc.snapshot()
+	check(correct_rays and doc.history.size() == 1 and canvas.retained_marks.size() == 6,
+		"one radial stroke becomes six editable vectors in one history action")
+	doc.undo()
+	check(doc.layers[0].objects.is_empty() and canvas.retained_marks.is_empty(), "undo removes the complete radial stroke")
+	doc.redo()
+	var reopened := Document.new()
+	check(doc.snapshot() == snowflake and doc.save_to("user://snowflake.havu") == OK
+		and reopened.load_from("user://snowflake.havu").is_empty()
+		and reopened.layers[0].objects.size() == 6 and Art.svg(reopened, false).count("matrix(") == 5
+		and Art.object_transform(reopened.layers[0].objects[4]).is_equal_approx(Art.object_transform(strokes[4])),
+		"radial geometry survives redo, save, reload and SVG export")
+	if DisplayServer.get_name() != "headless":
+		await app.export_png("user://snowflake.png")
+		var image := Image.load_from_file("user://snowflake.png")
+		var arms_visible := image != null
+		for arm in 6:
+			var local := canvas.symmetry_center() + (Vector2(209, 160) - canvas.symmetry_center()).rotated(TAU * arm / 6)
+			arms_visible = arms_visible and image.get_pixelv(Vector2i(local * 2.0)).a > 0.75
+		check(arms_visible and image.get_pixel(300, 320).a < 0.05, "PNG exports all six arms and omits the drawing guides")
+	canvas.begin(screen.call(canvas.symmetry_center()), 0.8)
+	canvas.finish_at(screen.call(canvas.symmetry_center()))
+	check(doc.layers[0].objects.size() == 7, "a tap precisely at the center makes a single dab")
+	var quadrants := Canvas.Symmetry.poses(Canvas.Symmetry.Mode.FOUR_WAY, 6, Vector2(160, 160))
+	var reflected := quadrants.map(func(pose): return (pose * Vector2(111, 84)).round())
+	check(reflected == [Vector2(209, 84), Vector2(111, 236), Vector2(209, 236)],
+		"four-way symmetry reflects the stroke left, down, and diagonally")
+	canvas.configure_symmetry(Canvas.Symmetry.Mode.VERTICAL, 6, false)
+	canvas.symmetry_anchor = Vector2(0.5, 0.5)
+	canvas.clip_enabled = true
+	canvas.clip_regions = [[[0, 0], [150, 0], [150, 320], [0, 320]]]
+	doc.blank(320, 320, false)
+	canvas.begin(screen.call(Vector2(65, 74)), 0.8)
+	canvas.finish_at(screen.call(Vector2(81, 74)))
+	check(doc.layers[0].objects.size() == 1, "mirrored instances respect the active paint limit in document coordinates")
+	canvas.clear_paint_limit()
+
+	doc.blank(320, 320, false, "paint")
+	canvas.begin(screen.call(Vector2(68, 64)), 0.8)
+	canvas.finish_at(screen.call(Vector2(91, 64)))
+	var left: Dictionary = {}
+	var right: Dictionary = {}
+	for tile in doc.layers[0].objects:
+		if tile.pos[0] == 0.0: left = tile
+		if tile.pos[0] == 128.0: right = tile
+	check(not left.is_empty() and not right.is_empty() and Raster.pixel_at(left, Vector2(76, 64)).a > 0.9
+		and Raster.pixel_at(right, Vector2(116, 64)).a > 0.9 and doc.history.size() == 1,
+		"mirrored paint reaches both tile regions in one action")
+	var painted := doc.snapshot()
+	doc.undo()
+	check(doc.layers[0].objects.is_empty(), "paint symmetry undoes both sides")
+	doc.redo()
+	check(doc.snapshot() == painted, "paint symmetry restores both sides on redo")
+	app.set_tool("erase")
+	canvas.brush_size = 24.0
+	canvas.begin(screen.call(Vector2(76, 64)), 0.8)
+	canvas.finish_at(screen.call(Vector2(76, 64)))
+	var erased: Array = doc.layers[0].objects
+	var erased_alpha := [0.0, 0.0]
+	for tile in erased:
+		if tile.pos[0] == 0.0: erased_alpha[0] = Raster.pixel_at(tile, Vector2(76, 64)).a
+		if tile.pos[0] == 128.0: erased_alpha[1] = Raster.pixel_at(tile, Vector2(116, 64)).a
+	check(erased_alpha[0] < 0.1 and erased_alpha[1] < 0.1,
+		"the paint eraser clears both mirrored pixels (%s)" % [erased_alpha])
+	doc.undo()
+	check(doc.snapshot() == painted, "undo restores pixels from both symmetric eraser marks")
+
+	canvas.configure_symmetry(Canvas.Symmetry.Mode.OFF, 6, true)
+	doc.blank(320, 320, false)
+	app.set_tool("select")
+	var shape := {"kind": "rect", "pos": [48, 48], "extent": [224, 224], "color": "#226451", "opacity": 0.8}
+	doc.append_with_history(shape)
+	var id: String = shape.id
+	app.transform_button.pressed.emit()
+	check(not menu.is_item_disabled(menu.get_item_index(12)), "Transform enables Cut out for a selected filled vector")
+	var shape_mark: Node2D = canvas.retained_marks[id].mark
+	menu.hide()
+	app.transform_action(12)
+	var loop := PackedVector2Array()
+	for index in 32:
+		loop.append(Vector2(160, 160) + Vector2.from_angle(TAU * index / 32.0) * 42)
+	canvas.begin_contact(0, screen.call(loop[0]))
+	for point in loop:
+		canvas.move_contact(0, screen.call(point), 0.75)
+	canvas.end_contact(0, screen.call(loop[0]), false)
+	var cut := doc.find_object(id)
+	check(not cut.is_empty() and cut.get("compound", false) and cut.opacity == 0.8
+		and not Art.contains(cut, Vector2(160, 160)) and Art.contains(cut, Vector2(66, 66))
+		and doc.history.size() == 2, "drawing a circle in a square makes a real hole and preserves its style")
+	check(is_same(shape_mark, canvas.retained_marks[id].mark), "cut out reuses the retained canvas mark")
+	var with_hole := doc.snapshot()
+	doc.undo()
+	check(doc.find_object(id).kind == "rect", "cut out undoes as one action")
+	doc.redo()
+	check(is_same(shape_mark, canvas.retained_marks[id].mark), "cut undo and redo leave the retained mark in place")
+	check(doc.snapshot() == with_hole and doc.save_to("user://cut-out.havu") == OK
+		and reopened.load_from("user://cut-out.havu").is_empty()
+		and Art.polygon(reopened.find_object(id)) == Art.polygon(cut)
+		and Art.svg(reopened, false).contains('fill-rule="evenodd"'),
+		"the cut survives redo, a project round trip and SVG export")
+	if DisplayServer.get_name() != "headless":
+		await app.export_png("user://cut-out.png")
+		var image := Image.load_from_file("user://cut-out.png")
+		check(image != null and image.get_pixel(320, 320).a < 0.05 and image.get_pixel(132, 132).a > 0.7,
+			"PNG export preserves the cut as transparent pixels")
+	var split := Art.subtract_from_shape(doc.find_object(id),
+		PackedVector2Array([Vector2(149, 30), Vector2(171, 30), Vector2(171, 290), Vector2(149, 290)]))
+	check(not split.has("error") and split.get("objects", [{}])[0].get("compound_disjoint", false),
+		"a cut through both edges produces disconnected parts in one editable object")
+	var crossed := PackedVector2Array([Vector2(70, 70), Vector2(130, 130), Vector2(70, 130), Vector2(130, 70)])
+	check(Art.subtract_from_shape(doc.find_object(id), crossed).has("error") and doc.snapshot() == with_hole,
+		"a self-crossed cutting loop leaves the document unchanged")
 
 func working_folder_regressions(app) -> void:
 	var folder := "user://Polar Fun projects"
