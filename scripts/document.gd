@@ -889,19 +889,21 @@ func restore_recolor(change: Dictionary, forward: bool) -> void:
 		commit({}, [], {"layer": layers[index].id, "redraw": object})
 		return
 
-func replace_layer_span(index: int, start: int, count: int, values: Array, selected_id: String) -> void:
+func replace_layer_span(index: int, start: int, count: int, values: Array, selected_id: String,
+		inserted_fill := false) -> void:
 	var layer: Dictionary = layers[index]
 	var previous: Array = layer.objects.slice(start, start + count)
 	# Artwork data is copied only for the replaced span. Keep history independent
 	# of subsequent edits to the same objects.
 	var change := {"span": layer.id, "start": start, "before": previous.duplicate(true),
 		"after": values.duplicate(true)}
+	if inserted_fill: change.inserted_fill = true
 	push_history(change)
 	future.clear()
 	swap_layer_span(layer, start, count, values)
 	active = index
 	selection = selected_id
-	commit({}, [], {"layers": [layer.id], "resync": [layer.id]})
+	commit_layer_span(change, values, true)
 
 func swap_layer_span(layer: Dictionary, start: int, count: int, values: Array) -> void:
 	var objects: Array = layer.objects
@@ -911,10 +913,23 @@ func restore_layer_span(change: Dictionary, forward: bool) -> void:
 	var index := layer_index(change.span)
 	if index == -1: return
 	var previous: Array = change.before if forward else change.after
-	var values: Array = change.after if forward else change.before
-	swap_layer_span(layers[index], change.start, previous.size(), values.duplicate(true))
+	var values: Array = (change.after if forward else change.before).duplicate(true)
+	swap_layer_span(layers[index], change.start, previous.size(), values)
 	active = index
 	selection = ""
+	commit_layer_span(change, values, forward)
+
+func commit_layer_span(change: Dictionary, values: Array, forward: bool) -> void:
+	if change.get("inserted_fill", false):
+		var objects: Array = layers[active].objects
+		if forward and change.start + 1 < objects.size():
+			commit({}, [], {"layer": change.span, "insert_fill": values[0], "before": objects[change.start + 1].id,
+				"fill_slot": change.start})
+			return
+		if not forward:
+			commit({}, [], {"layer": change.span, "remove": {change.after[0].id: true}, "add": [],
+				"undo_fill": change.after[0], "fill_slot": change.start})
+			return
 	commit({}, [], {"layers": [change.span], "resync": [change.span]})
 
 func selected_items() -> Array[Dictionary]:

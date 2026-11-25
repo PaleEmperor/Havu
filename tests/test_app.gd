@@ -3720,6 +3720,9 @@ func vector_shape_fill_regressions() -> void:
 	doc.redo()
 	check(doc.layers[0].objects.size() == 3 and Document.validate(doc.snapshot()).is_empty()
 		and Art.svg(doc, false).contains("#ed7e44"), "redo and SVG preserve the vector region")
+	var ordered_layer: Dictionary = doc.layers[0]
+	check(canvas.pick_candidate_indices(ordered_layer, Vector2(214, 110), 0.0).has(2),
+		"the pick grid keeps neighboring object indices current after a fill redo")
 
 	doc.blank(1000, 1000, false)
 	doc.add(left.call())
@@ -3788,6 +3791,35 @@ func vector_shape_fill_regressions() -> void:
 	fill = doc.find_object(doc.selection)
 	check(doc.layers[0].objects.size() == 5 and fill.get("kind") == "polygon" and Art.contains(fill, seed),
 		"edges that meet exactly can close a compartment without overlapping")
+	if DisplayServer.get_name() != "headless":
+		canvas.cache_completed_paint = true
+		doc.blank(1000, 1000, false)
+		doc.layers[0].opacity = 0.6
+		for index in 95:
+			doc.add({"kind": "ellipse", "pos": [600 + (index % 20) * 12, 600 + (index / 20) * 15],
+				"extent": [10, 10], "color": "#408065", "opacity": 1.0})
+		wall = left.call()
+		doc.add(wall)
+		doc.add(right.call())
+		doc.changed.emit()
+		await RenderingServer.frame_post_draw
+		var layer: Dictionary = doc.layers[0]
+		var holder = canvas.layer_renderers[layer.id]
+		var wall_mark: Node2D = canvas.retained_marks[wall.id].mark
+		canvas.fill_at(seed)
+		var fill_id := doc.selection
+		var mark: Node2D = canvas.retained_marks[fill_id].mark
+		check(holder.is_below_cached_artwork(mark) and holder.display.get_parent() == mark.get_parent().get_parent()
+			and holder.below_cache.get_index() < holder.display.get_index() and not holder.rebuild_pending,
+			"a separate fill stays beneath cached artwork inside the layer opacity group")
+		doc.undo()
+		doc.redo()
+		check(is_same(canvas.retained_marks[wall.id].mark, wall_mark) and not holder.rebuild_pending,
+			"fill undo and redo reuse the wall mark and the cached layer")
+		holder.show_live_marks()
+		check(holder.live_move.get_child(0) == canvas.retained_marks[fill_id].mark,
+			"the fill keeps its draw order when cached artwork switches to live editing")
+		holder.resume_cache()
 	canvas.queue_free()
 	await process_frame
 

@@ -858,6 +858,9 @@ func layer_is_visible(layer: Dictionary) -> bool:
 func update_content_marks(change: Dictionary) -> bool:
 	if not change.has("layer"): return false
 	var holder: Node2D = layer_renderers.get(change.layer)
+	if change.has("insert_fill"):
+		if not insert_fill_mark(change, holder): sync_artwork(change.layer)
+		return true
 	if change.has("redraw"):
 		var object: Dictionary = change.redraw
 		var entry: Dictionary = retained_marks.get(object.id, {})
@@ -880,7 +883,7 @@ func update_content_marks(change: Dictionary) -> bool:
 			redraw_base = true
 		elif cached and holder.is_recent_mark(mark):
 			redraw_recent = true
-		else:
+		elif not cached or not holder.is_below_cached_artwork(mark):
 			return false
 		if layer_cache_costs.has(change.layer):
 			layer_cache_costs[change.layer] -= cache_sample_cost(entry.object)
@@ -892,6 +895,26 @@ func update_content_marks(change: Dictionary) -> bool:
 	if cached:
 		if redraw_base or not change.add.is_empty(): holder.invalidate_cache()
 		if redraw_recent: holder.invalidate_recent()
+	return true
+
+func insert_fill_mark(change: Dictionary, holder: Node2D) -> bool:
+	if not holder or (holder is IsolatedOpacity and not is_artwork_cache(holder)): return false
+	var anchor: Dictionary = retained_marks.get(change.before, {})
+	if anchor.is_empty() or change.insert_fill.has("opacity_groups"): return false
+	var anchor_parent: Node2D = anchor.mark.get_parent()
+	var parent := anchor_parent
+	var cached := is_artwork_cache(holder)
+	if cached:
+		var below: Node2D = holder.parent_below_cached_artwork(anchor.mark)
+		if below: parent = below
+		elif parent != holder_artwork(holder) and not holder.is_recent_mark(anchor.mark): return false
+	elif parent != holder_artwork(holder): return false
+	var entry := mount_mark(parent, change.insert_fill, change.layer)
+	if parent == anchor_parent: parent.move_child(entry.mark, anchor.mark.get_index())
+	retained_marks[change.insert_fill.id] = entry
+	if layer_cache_costs.has(change.layer):
+		layer_cache_costs[change.layer] += cache_sample_cost(change.insert_fill)
+	if cached: holder.invalidate_mark(entry.mark)
 	return true
 
 func on_artwork_changed() -> void:
@@ -949,12 +972,16 @@ func on_artwork_changed() -> void:
 	if content.has("append_set") and append_vector_marks(content.layer, content.append_set):
 		return
 	if not content.is_empty() and update_content_marks(content):
-		pick_grids.erase(content.layer)
+		if content.has("fill_slot"): update_fill_pick_grid(content)
+		else: pick_grids.erase(content.layer)
 		if not pigment_dirty and content.has("remove") and content.get("add", []).is_empty():
 			for id in content.remove: pigment.erase_entry(id)
 		else:
 			pigment_dirty = true
 		refresh_selection()
+		return
+	if content.has("undo_fill"):
+		sync_artwork(content.layer)
 		return
 	var object: Dictionary = document.appended_on_commit
 	var layer: Dictionary = document.layers[document.active] if not document.layers.is_empty() else {}
@@ -1730,25 +1757,47 @@ func pick_cell(point: Vector2) -> Vector2i:
 	return Vector2i((point / PICK_CELL_SIZE).floor())
 
 func build_pick_grid(layer: Dictionary) -> Dictionary:
-	var grid := {"cells": {}, "broad": []}
+	var grid := {"cells": {}, "broad": {}, "order": {}}
 	for index in layer.objects.size():
 		var object: Dictionary = layer.objects[index]
 		index_pick_bounds(grid, index, object)
 	return grid
 
-func index_pick_bounds(grid: Dictionary, index: int, object: Dictionary) -> void:
+func index_pick_bounds(grid: Dictionary, index: int, object: Dictionary, removing := false) -> void:
 	if object.get("paint_tile", false): return
+	if removing: grid.order.erase(object.id)
+	else: grid.order[object.id] = index
 	var bounds := pick_bounds(object)
+	if object.kind == "stroke" and not Art.uses_ink_outline(object):
+		bounds = bounds.grow(float(object.size) * float(object.scale))
 	var first := pick_cell(bounds.position)
 	var last := pick_cell(bounds.end)
 	if (last.x - first.x + 1) * (last.y - first.y + 1) > MAX_PICK_CELLS:
-		grid.broad.append(index)
+		if removing: grid.broad.erase(object.id)
+		else: grid.broad[object.id] = true
 		return
 	for x in range(first.x, last.x + 1):
 		for y in range(first.y, last.y + 1):
 			var cell := Vector2i(x, y)
-			if not grid.cells.has(cell): grid.cells[cell] = []
-			grid.cells[cell].append(index)
+			if removing:
+				if not grid.cells.has(cell): continue
+				grid.cells[cell].erase(object.id)
+				if grid.cells[cell].is_empty(): grid.cells.erase(cell)
+			else:
+				if not grid.cells.has(cell): grid.cells[cell] = {}
+				grid.cells[cell][object.id] = true
+
+func update_fill_pick_grid(change: Dictionary) -> void:
+	if not pick_grids.has(change.layer): return
+	var grid: Dictionary = pick_grids[change.layer]
+	var layer: Dictionary = document.layers[document.active]
+	if change.has("insert_fill"):
+		index_pick_bounds(grid, change.fill_slot, change.insert_fill)
+	else:
+		index_pick_bounds(grid, change.fill_slot, change.undo_fill, true)
+	var order: Dictionary = grid.order
+	var objects: Array = layer.objects
+	for index in range(change.fill_slot, objects.size()): order[objects[index].id] = index
 
 func pick_candidate_indices(layer: Dictionary, point: Vector2, tolerance: float) -> Array:
 	if not pick_grids.has(layer.id): pick_grids[layer.id] = build_pick_grid(layer)
@@ -1756,10 +1805,10 @@ func pick_candidate_indices(layer: Dictionary, point: Vector2, tolerance: float)
 	var first := pick_cell(point - Vector2.ONE * tolerance)
 	var last := pick_cell(point + Vector2.ONE * tolerance)
 	var candidates := {}
-	for index in grid.broad: candidates[index] = true
+	for id in grid.broad: candidates[grid.order[id]] = true
 	for x in range(first.x, last.x + 1):
 		for y in range(first.y, last.y + 1):
-			for index in grid.cells.get(Vector2i(x, y), []): candidates[index] = true
+			for id in grid.cells.get(Vector2i(x, y), {}): candidates[grid.order[id]] = true
 	var ordered := candidates.keys()
 	ordered.sort()
 	ordered.reverse()
@@ -1820,7 +1869,7 @@ func fill_at(point: Vector2) -> void:
 	var layer: Dictionary = document.layers[layer_index]
 	if not layer_is_visible(layer) or layer.get("opacity", 1.0) <= 0.0: return
 	var hollow_index := -1
-	for index in range(layer.objects.size() - 1, -1, -1):
+	for index in pick_candidate_indices(layer, point, 2.0 / zoom):
 		var object: Dictionary = layer.objects[index]
 		if object.opacity <= 0.0: continue
 		if object.kind not in ["rect", "ellipse", "polygon", "stroke"]: continue
@@ -1846,7 +1895,8 @@ func fill_at(point: Vector2) -> void:
 		var target := object if outline.is_empty() else outline_fill(layer, index, outline)
 		apply_vector_fill(layer_index, index, target)
 		return
-	var region := VectorFill.find_region(layer.objects, point, page, pick_bounds)
+	var nearby := func(radius: float) -> Array: return pick_candidate_indices(layer, point, radius)
+	var region := VectorFill.find_region(layer.objects, point, page, pick_bounds, nearby)
 	if hollow_index >= 0 and (region.is_empty() or region.get("single_boundary", -1) == hollow_index):
 		apply_vector_fill(layer_index, hollow_index, layer.objects[hollow_index])
 		return
@@ -1854,7 +1904,17 @@ func fill_at(point: Vector2) -> void:
 		var target := {"kind": "polygon", "vertices": Art.pack_contours([region.vertices])[0],
 			"opacity": 1.0, "pos": [0.0, 0.0], "scale": 1.0}
 		if region.get("compound", false): target.compound = true
-		apply_vector_fill(layer_index, region.index, target)
+		var index: int = region.index
+		if index > 0 and is_artwork_cache(layer_renderers.get(layer.id)):
+			# Under unrelated marks, the same fill can reuse the cached layer.
+			var fill_bounds := Art.polygon_bounds(region.vertices)
+			var can_place_below := true
+			for prior in index:
+				if pick_bounds(layer.objects[prior]).intersects(fill_bounds, true):
+					can_place_below = false
+					break
+			if can_place_below: index = 0
+		apply_vector_fill(layer_index, index, target)
 		return
 	status.emit("Tap inside an area enclosed by shapes, lines, or the canvas edge.")
 
@@ -1871,7 +1931,7 @@ func apply_vector_fill(layer_index: int, index: int, target: Dictionary) -> void
 			target.id = document.uid()
 			target.color = hex
 			target.fill_enabled = true
-			document.replace_layer_span(layer_index, index, 0, [target], target.id)
+			document.replace_layer_span(layer_index, index, 0, [target], target.id, true)
 		else:
 			document.recolor_shape(layer_index, target, hex)
 		color_used.emit(color)

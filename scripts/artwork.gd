@@ -206,6 +206,14 @@ static func bounds(object: Dictionary) -> Rect2:
 	return box.grow(outline_width(object) * float(object.scale) * 0.5) if object.kind in SHAPES else box
 
 static func coverage_bounds(object: Dictionary) -> Rect2:
+	if object.kind == "ellipse":
+		# Its analytic bounds also enclose every vertex of the drawn outline.
+		var radius := v(object.extent) * 0.5
+		var pose := object_transform(object)
+		var x := pose.x * radius.x
+		var y := pose.y * radius.y
+		var extent := Vector2(Vector2(x.x, y.x).length(), Vector2(x.y, y.y).length())
+		return Rect2(pose * radius - extent, extent * 2.0).grow(outline_width(object) * float(object.scale) * 0.5 + 0.01)
 	if object.kind != "stroke": return bounds(object).grow(0.01)
 	# The sampler uses distance to the centerline, including round caps.
 	var points: Array = object.points

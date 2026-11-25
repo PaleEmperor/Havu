@@ -19,6 +19,7 @@ var rebuild_pending := false
 var pending_marks: Array[Node2D] = []
 var live_move: Node2D
 var preview_group: CanvasGroup
+var below_cache: Node2D
 var keep_recent_marks := false
 var allow_overview := true
 var document_bounds := Rect2()
@@ -69,6 +70,7 @@ func preview_parent() -> Node2D:
 func release_preview() -> void:
 	if not preview_group: return
 	if recent and recent.visible: return
+	if below_cache and below_cache.get_child_count() > 0: return
 	var position_in_layer := preview_group.get_index()
 	display.reparent(self, false)
 	move_child(display, position_in_layer)
@@ -141,6 +143,12 @@ static func use_overview(view_size: Vector2, zoom: float, density: float, previo
 func show_live_marks() -> void:
 	if live_move: return
 	flush_recent()
+	if below_cache:
+		var index := 0
+		for mark in below_cache.get_children():
+			mark.reparent(artwork, false)
+			artwork.move_child(mark, index)
+			index += 1
 	if RenderingServer.frame_post_draw.is_connected(finish_cache_frame):
 		RenderingServer.frame_post_draw.disconnect(finish_cache_frame)
 	pending_marks.clear()
@@ -198,6 +206,22 @@ func enqueue_base_mark(mark: Node2D) -> void:
 
 func is_recent_mark(mark: Node2D) -> bool:
 	return recent != null and mark != null and mark.get_parent() == recent.artwork
+
+func parent_below_cached_artwork(anchor: Node2D) -> Node2D:
+	if is_below_cached_artwork(anchor): return below_cache
+	if anchor.get_parent() != artwork or anchor.get_index() != 0: return null
+	if not below_cache:
+		below_cache = Node2D.new()
+	var parent := preview_parent()
+	if below_cache.get_parent() != parent:
+		if below_cache.get_parent(): below_cache.reparent(parent, false)
+		else: parent.add_child(below_cache)
+	if below_cache.get_index() > display.get_index():
+		parent.move_child(below_cache, display.get_index())
+	return below_cache
+
+func is_below_cached_artwork(mark: Node2D) -> bool:
+	return below_cache != null and mark.get_parent() == below_cache
 
 func invalidate_recent() -> void:
 	if recent and recent.visible: recent.invalidate_cache()

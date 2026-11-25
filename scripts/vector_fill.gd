@@ -4,23 +4,27 @@ const Art = preload("res://scripts/artwork.gd")
 const MAX_SAMPLES := 12000
 const MAX_FOOTPRINTS := 2400
 
-static func find_region(objects: Array, seed: Vector2, page := Rect2(), cached_bounds := Callable()) -> Dictionary:
+static func find_region(objects: Array, seed: Vector2, page := Rect2(), cached_bounds := Callable(),
+		nearby := Callable()) -> Dictionary:
 	# Most compartments use nearby geometry. Keep a large layer from
 	# exhausting the geometry budget before we reach the tapped region.
 	if objects.size() >= 100:
 		for radius in [192.0, 768.0]:
 			var search := Rect2(seed - Vector2.ONE * radius, Vector2.ONE * radius * 2.0)
-			var local := find_bounded_region(objects, seed, Rect2(), search, cached_bounds)
+			var candidates: Variant = nearby.call(radius) if nearby.is_valid() else null
+			var local := find_bounded_region(objects, seed, Rect2(), search, cached_bounds, candidates)
 			if not local.is_empty() and search.encloses(Art.polygon_bounds(local.vertices)):
 				return local
 	return find_bounded_region(objects, seed, page, Rect2(), cached_bounds)
 
 static func find_bounded_region(objects: Array, seed: Vector2, page: Rect2, search: Rect2,
-		cached_bounds: Callable) -> Dictionary:
+		cached_bounds: Callable, candidates: Variant = null) -> Dictionary:
 	var footprints: Array[Dictionary] = []
 	var enclosed: Array[Dictionary] = []
 	var samples := 0
-	for index in range(objects.size() - 1, -1, -1):
+	var count: int = objects.size() if candidates == null else candidates.size()
+	for position in count:
+		var index: int = count - position - 1 if candidates == null else candidates[position]
 		var object: Dictionary = objects[index]
 		if object.opacity <= 0.0: continue
 		if object.kind not in Art.SHAPES and object.kind != "stroke": continue
@@ -69,8 +73,14 @@ static func find_bounded_region(objects: Array, seed: Vector2, page: Rect2, sear
 			if changes.is_empty(): result.single_boundary = candidate.index
 			return result
 
+	# Form the tapped boundary before spending time joining distant marks.
+	var ordered := footprints.duplicate()
+	for footprint in ordered:
+		var box: Rect2 = footprint.bounds
+		footprint.seed_distance = seed.distance_squared_to(seed.clamp(box.position, box.end))
+	ordered.sort_custom(func(a: Dictionary, b: Dictionary): return a.seed_distance < b.seed_distance)
 	var shells: Array[Dictionary] = []
-	for footprint in footprints:
+	for footprint in ordered:
 		var merged := footprint.outline as PackedVector2Array
 		var bounds := footprint.bounds as Rect2
 		var insertion := int(footprint.index)

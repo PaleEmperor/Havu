@@ -2,7 +2,7 @@
 
 **Open-source illustration app for Android tablets.** Draw with pressure-sensitive brushes, edit scalable vectors, and lay out illustrations, posters, and menus.
 
-[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.78/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
+[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.79/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
 
 ## Features
 
