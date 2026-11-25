@@ -3621,6 +3621,32 @@ func outside_cut_and_symmetry_copies(app) -> void:
 		and Art.contains(shape, Vector2(67, 86)), "cutout can start outside the shape and outside the page")
 	doc.undo()
 	check(shape.kind == "rect" and Art.contains(shape, Vector2(32, 82)), "an outside-start cut undoes exactly")
+	doc.redo()
+	check(canvas.cut_target == shape.id and not Art.contains(shape, Vector2(32, 82)),
+		"undo and redo leave cutting active on the same shape")
+	var second_loop := [Vector2(60, 79), Vector2(75, 79), Vector2(75, 99), Vector2(60, 99)]
+	canvas.begin_contact(0, screen.call(second_loop[0]))
+	for point in second_loop: canvas.move_contact(0, screen.call(point), 0.75)
+	canvas.end_contact(0, screen.call(second_loop[0]), false)
+	check(canvas.cut_target == shape.id and not Art.contains(shape, Vector2(67, 86)),
+		"a second cut can be made without reopening Transform")
+	doc.undo()
+	check(Art.contains(shape, Vector2(67, 86)) and not Art.contains(shape, Vector2(32, 82)),
+		"each cut has its own undo step")
+	var history_size_before_pinch := doc.history.size()
+	canvas.begin_contact(0, screen.call(Vector2(60, 79)))
+	canvas.begin_contact(1, screen.call(Vector2(90, 79)))
+	canvas.end_contact(1, screen.call(Vector2(90, 79)), false)
+	canvas.end_contact(0, screen.call(Vector2(60, 79)), false)
+	check(canvas.cut_target == shape.id and canvas.cut_points.is_empty() and doc.history.size() == history_size_before_pinch,
+		"starting a two-finger gesture cancels only the current cut trace")
+	app.show_transform_menu()
+	var cut_menu: PopupMenu = app.transform_menu
+	check(cut_menu.get_item_text(cut_menu.get_item_index(12)) == "Finish cutting", "Transform offers a way to leave cutting")
+	cut_menu.hide()
+	app.transform_action(12)
+	check(canvas.cut_target.is_empty() and doc.selection == shape.id, "Finish cutting leaves the shape selected")
+	doc.undo()
 
 	canvas.symmetry_anchor = Vector2(0.5, 0.5)
 	doc.selection = shape.id
@@ -3650,6 +3676,14 @@ func outside_cut_and_symmetry_copies(app) -> void:
 		and doc.history.size() == history_size, "copies that would cross the page edge leave the document unchanged")
 	check(canvas.copy_selection_with_symmetry(Canvas.Symmetry.Mode.RADIAL, 4, true).is_empty()
 		and layer.objects.size() == 5, "a finished shape can repeat radially around the selection center")
+	doc.selection = shape.id
+	app.transform_action(12)
+	var full_loop := [Vector2(4, 44), Vector2(102, 44), Vector2(102, 133), Vector2(4, 133)]
+	canvas.begin_contact(0, screen.call(full_loop[0]))
+	for point in full_loop: canvas.move_contact(0, screen.call(point), 0.75)
+	canvas.end_contact(0, screen.call(full_loop[0]), false)
+	check(canvas.cut_target.is_empty() and doc.find_object(shape.id).is_empty() and layer.objects.size() == 4,
+		"cutting the whole shape ends the mode and leaves the other artwork alone")
 
 func working_folder_regressions(app) -> void:
 	var folder := "user://Polar Fun projects"

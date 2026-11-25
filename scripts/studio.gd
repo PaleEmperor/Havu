@@ -2670,7 +2670,9 @@ func show_transform_menu() -> void:
 	for id in [0, 1, 2, 3, 5, 7, 8, 9, 10]:
 		transform_menu.set_item_disabled(transform_menu.get_item_index(id), not selection)
 	var cut := transform_menu.get_item_index(12)
-	var reason: String = document.cut_target_reason(canvas.cut_selection())
+	var cutting: bool = not canvas.cut_target.is_empty()
+	var reason: String = "" if cutting else document.cut_target_reason(canvas.cut_selection())
+	transform_menu.set_item_text(cut, "Finish cutting" if cutting else "Cut out a shape…")
 	transform_menu.set_item_disabled(cut, not reason.is_empty())
 	transform_menu.set_item_tooltip(cut, reason)
 	var repeat_index := transform_menu.get_item_index(13)
@@ -2696,6 +2698,7 @@ func show_edit_popup(menu: PopupMenu) -> void:
 
 func transform_action(id: int) -> void:
 	canvas.finish()
+	if id != 12 and not canvas.cut_target.is_empty(): canvas.stop_cutting()
 	match id:
 		0: canvas.turn_selection(PI / 2.0)
 		1: canvas.turn_selection(-PI / 2.0)
@@ -2713,7 +2716,11 @@ func transform_action(id: int) -> void:
 		9: canvas.place_selection(true)
 		10: show_precise_transform.call_deferred()
 		11: show_symmetry_options.call_deferred()
-		12: canvas.arm_cut()
+		12:
+			if canvas.cut_target.is_empty(): canvas.arm_cut()
+			else:
+				canvas.stop_cutting()
+				notify("Finished cutting.")
 		13: show_radial_repeat.call_deferred()
 		14: show_symmetry_copies.call_deferred()
 
@@ -3366,6 +3373,7 @@ func select_layer(layer_id: String) -> void:
 	canvas.finish()
 	var index := find_layer_index(layer_id)
 	if index < 0: return
+	if not canvas.cut_target.is_empty(): canvas.stop_cutting()
 	document.active = index
 	document.selection = ""
 	canvas.selected_area.clear()

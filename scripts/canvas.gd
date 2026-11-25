@@ -896,6 +896,9 @@ func update_content_marks(change: Dictionary) -> bool:
 
 func on_artwork_changed() -> void:
 	finish_cache_navigation()
+	if not cut_target.is_empty() and (document.selection != cut_target
+			or not document.cut_target_reason(cut_selection()).is_empty()):
+		stop_cutting()
 	var resync: Array = document.content_on_commit.get("resync", [])
 	if not resync.is_empty() and resync.size() <= 3:
 		for id in resync: sync_artwork(id)
@@ -1984,7 +1987,11 @@ func begin_contact(index: int, point: Vector2) -> void:
 				begin(point, 0.55)
 	elif not touch_navigating:
 		clear_pointer_metrics()
-		cancel(keep_selecting and (tool == "select" or tool in AREA_TOOLS))
+		if cut_target.is_empty():
+			cancel(keep_selecting and (tool == "select" or tool in AREA_TOOLS))
+		else:
+			cut_points.clear()
+			refresh_selection()
 		touch_tap_tool = ""
 		touch_navigating = true
 
@@ -2035,7 +2042,10 @@ func end_contact(index: int, point: Vector2, canceled: bool) -> void:
 	set_process_input(false)
 	if not touch_navigating:
 		if canceled:
-			cancel()
+			if cut_target.is_empty(): cancel()
+			else:
+				cut_points.clear()
+				refresh_selection()
 		elif touch_tap_tool.is_empty():
 			finish_at(point)
 		elif not touch_tap_moved and touch_start.distance_to(point) <= 8.0:
@@ -2462,9 +2472,12 @@ func cancel(keep_picks := false) -> void:
 	refresh_selection()
 
 func cancel_drawing_actions() -> void:
+	placing_symmetry_center = false
+	stop_cutting()
+
+func stop_cutting() -> void:
 	cut_target = ""
 	cut_points.clear()
-	placing_symmetry_center = false
 	refresh_selection()
 
 func cut_selection() -> Dictionary:
@@ -2500,7 +2513,7 @@ func arm_cut() -> void:
 		return
 	cancel_drawing_actions()
 	cut_target = target.object.id
-	status.emit("Draw a loop around the area to remove. You can start outside the shape.")
+	status.emit("Draw a loop to cut. Choose Transform → Finish cutting when done.")
 
 func update_cut_trace(point: Vector2) -> void:
 	if cut_points[-1].distance_to(point) < maxf(0.2, 2.5 / zoom): return
@@ -2522,8 +2535,9 @@ func finish_cut_trace() -> void:
 		status.emit("Select the shape again.")
 		return
 	var reason: String = document.cut_vector_shape(target, trace)
-	if reason.is_empty(): cut_target = ""
-	status.emit("Cut out shape." if reason.is_empty() else reason)
+	if not reason.is_empty(): status.emit(reason)
+	elif cut_target.is_empty(): status.emit("The whole shape was removed.")
+	else: status.emit("Cut added. Draw another loop or choose Transform → Finish cutting.")
 
 func commit_symmetric_stroke() -> void:
 	var instances: Array[Dictionary] = []

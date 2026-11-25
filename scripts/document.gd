@@ -872,7 +872,7 @@ func restore_shape_cut(change: Dictionary, forward: bool, keep_selected := false
 	var state: Dictionary = change.after if forward else change.before
 	target.merge(state.duplicate(true))
 	active = index
-	selection = change.shape_cut if keep_selected else ""
+	selection = change.shape_cut if keep_selected or selection == change.shape_cut else ""
 	commit({}, [], {"layer": change.layer, "redraw": target, "geometry": true})
 
 func restore_recolor(change: Dictionary, forward: bool) -> void:

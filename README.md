@@ -2,7 +2,7 @@
 
 **A little illustration studio for Android tablets.**
 
-[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.76/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
+[**Download the Android APK**](https://github.com/PaleEmperor/Havu/releases/download/v0.1.0-beta.77/havu-beta.apk) · [All releases](https://github.com/PaleEmperor/Havu/releases)
 
 I wanted my wife to have somewhere of her own to draw. A little studio on her
 tablet, with brushes she could make her own, artwork she could scale into shop
@@ -49,7 +49,8 @@ I’d love for you to use it, share it, or make it your own.
   **Transform → Symmetry copies…** to mirror or repeat existing vector artwork.
   **Radial repeat…** uses the first point of a finished stroke as the center.
   For a cutout, select a filled vector shape, choose **Transform → Cut out a shape…**,
-  and draw a loop. You can begin outside the shape and cross the canvas edge.
+  and draw as many loops as you need. You can begin outside the shape or cross
+  the canvas edge. Choose **Transform → Finish cutting** when you’re done.
 - **Panels.** Drag a panel by its heading to move or dock it. Open **Panels** to
   bring it back, or change **UI scale** under **⋯ → Workspace settings** to make
   controls easier to reach.
