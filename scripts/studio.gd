@@ -2634,6 +2634,7 @@ func build_transform_menus() -> void:
 	transform_menu = PopupMenu.new()
 	transform_menu.name = "TransformMenu"
 	transform_menu.add_item("Drawing symmetry…", 11)
+	transform_menu.add_item("Symmetry copies…", 14)
 	transform_menu.add_item("Radial repeat…", 13)
 	transform_menu.add_item("Cut out a shape…", 12)
 	transform_menu.add_separator()
@@ -2675,6 +2676,10 @@ func show_transform_menu() -> void:
 	var repeat_index := transform_menu.get_item_index(13)
 	transform_menu.set_item_disabled(repeat_index, canvas.radial_repeat_source().is_empty())
 	transform_menu.set_item_tooltip(repeat_index, "Select one vector stroke or open path.")
+	var symmetry_index := transform_menu.get_item_index(14)
+	var symmetry_reason: String = canvas.symmetry_copy_reason()
+	transform_menu.set_item_disabled(symmetry_index, not symmetry_reason.is_empty())
+	transform_menu.set_item_tooltip(symmetry_index, symmetry_reason)
 	transform_menu.set_item_text(transform_menu.get_item_index(11),
 		"Drawing symmetry · On…" if canvas.symmetry_mode != Canvas.Symmetry.Mode.OFF else "Drawing symmetry…")
 	transform_menu.set_item_checked(transform_menu.get_item_index(4), canvas.snap_rotation)
@@ -2710,6 +2715,56 @@ func transform_action(id: int) -> void:
 		11: show_symmetry_options.call_deferred()
 		12: canvas.arm_cut()
 		13: show_radial_repeat.call_deferred()
+		14: show_symmetry_copies.call_deferred()
+
+func show_symmetry_copies() -> void:
+	if not canvas.symmetry_copy_reason().is_empty(): return
+	canvas.cancel_drawing_actions()
+	var dialog := ConfirmationDialog.new()
+	dialog.name = "SymmetryCopies"
+	dialog.title = "Symmetry copies"
+	dialog.ok_button_text = "Create copies"
+	add_child(dialog)
+	var content := margin(dialog, 16)
+	content.custom_minimum_size.x = 260
+	var modes := OptionButton.new()
+	modes.name = "CopySymmetryMode"
+	modes.custom_minimum_size.y = 44
+	modes.accessibility_name = "Symmetry mode"
+	modes.add_item("Mirror left and right", Canvas.Symmetry.Mode.VERTICAL)
+	modes.add_item("Mirror top and bottom", Canvas.Symmetry.Mode.HORIZONTAL)
+	modes.add_item("Mirror both ways", Canvas.Symmetry.Mode.FOUR_WAY)
+	modes.add_item("Radial", Canvas.Symmetry.Mode.RADIAL)
+	content.add_child(modes)
+	var center := OptionButton.new()
+	center.custom_minimum_size.y = 44
+	center.accessibility_name = "Symmetry center"
+	center.add_item("Drawing symmetry center")
+	center.add_item("Selection center")
+	content.add_child(center)
+	var radial := VBoxContainer.new()
+	content.add_child(radial)
+	var caption := label("6 positions", 16)
+	radial.add_child(caption)
+	var arms := HSlider.new()
+	arms.min_value = 2
+	arms.max_value = 12
+	arms.step = 1
+	arms.value = 6
+	arms.custom_minimum_size.y = 44
+	arms.accessibility_name = "Number of radial positions"
+	radial.add_child(arms)
+	radial.hide()
+	arms.value_changed.connect(func(value: float): caption.text = "%d positions" % int(value))
+	modes.item_selected.connect(func(_index: int):
+		radial.visible = modes.get_selected_id() == Canvas.Symmetry.Mode.RADIAL
+		dialog.reset_size())
+	dialog.confirmed.connect(func():
+		var reason: String = canvas.copy_selection_with_symmetry(modes.get_selected_id(), int(arms.value), center.selected == 1)
+		notify("Symmetry copies created." if reason.is_empty() else reason)
+		dialog.queue_free())
+	dialog.canceled.connect(dialog.queue_free)
+	dialog.popup_centered()
 
 func show_radial_repeat() -> void:
 	if canvas.radial_repeat_source().is_empty(): return

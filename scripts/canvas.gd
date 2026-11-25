@@ -943,7 +943,7 @@ func on_artwork_changed() -> void:
 			refresh_selection()
 		return
 	var content: Dictionary = document.content_on_commit
-	if content.has("append_set") and append_symmetry_marks(content.layer, content.append_set):
+	if content.has("append_set") and append_vector_marks(content.layer, content.append_set):
 		return
 	if not content.is_empty() and update_content_marks(content):
 		pick_grids.erase(content.layer)
@@ -971,7 +971,7 @@ func on_artwork_changed() -> void:
 		return
 	sync_artwork()
 
-func append_symmetry_marks(layer_id: String, strokes: Array) -> bool:
+func append_vector_marks(layer_id: String, strokes: Array) -> bool:
 	var holder: Node2D = layer_renderers.get(layer_id)
 	if not holder: return false
 	if strokes.any(func(stroke): return stroke.has("opacity_groups")): return false
@@ -983,7 +983,7 @@ func append_symmetry_marks(layer_id: String, strokes: Array) -> bool:
 	var first: int = layer.objects.size() - strokes.size()
 	var shared_mesh: ArrayMesh
 	var shared_style := {}
-	if (not strokes.is_empty() and not strokes[0].has("clip") and not strokes[0].has("paint_mask")
+	if (not strokes.is_empty() and strokes[0].kind == "stroke" and not strokes[0].has("clip") and not strokes[0].has("paint_mask")
 			and Art.uses_stroke_mesh(strokes[0])):
 		shared_style = Art.local_stroke_style(strokes[0])
 	for index in strokes.size():
@@ -2072,9 +2072,8 @@ func begin(screen: Vector2, pressure: float, shortcut: String = "") -> void:
 		status.emit("Symmetry center placed.")
 		return
 	if not cut_target.is_empty():
-		if page_bounds().has_point(point):
-			cut_points = PackedVector2Array([point])
-			refresh_selection()
+		cut_points = PackedVector2Array([point])
+		refresh_selection()
 		return
 	if action == "select" or action in AREA_TOOLS:
 		if not keep_selecting and begin_selection_transform(point): return
@@ -2472,6 +2471,16 @@ func cut_selection() -> Dictionary:
 	var items := transformable_items()
 	return items[0] if items.size() == 1 else {}
 
+func symmetry_copy_reason() -> String:
+	return document.symmetry_copy_reason(transformable_items())
+
+func copy_selection_with_symmetry(mode: int, arms: int, use_selection_center: bool) -> String:
+	var items := transformable_items()
+	var reason: String = document.symmetry_copy_reason(items)
+	if not reason.is_empty(): return reason
+	var center := exact_selection_bounds(items).get_center() if use_selection_center else symmetry_center()
+	return document.copy_with_symmetry(items, Symmetry.poses(mode, arms, center))
+
 func radial_repeat_source() -> Dictionary:
 	var items := transformable_items()
 	if items.size() != 1: return {}
@@ -2491,10 +2500,9 @@ func arm_cut() -> void:
 		return
 	cancel_drawing_actions()
 	cut_target = target.object.id
-	status.emit("Draw a loop around the area to remove.")
+	status.emit("Draw a loop around the area to remove. You can start outside the shape.")
 
 func update_cut_trace(point: Vector2) -> void:
-	point = point.clamp(Vector2.ZERO, page_bounds().size)
 	if cut_points[-1].distance_to(point) < maxf(0.2, 2.5 / zoom): return
 	if cut_points.size() == 512:
 		var compact := PackedVector2Array()

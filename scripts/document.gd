@@ -226,6 +226,54 @@ func repeat_radially(item: Dictionary, arms: int) -> String:
 	append_vector_set(index, siblings, source.id, source.id)
 	return ""
 
+func symmetry_copy_reason(items: Array[Dictionary]) -> String:
+	if items.is_empty(): return "Select artwork on a vector layer."
+	var layer: Dictionary = items[0].layer
+	if (layer.get("type", "vector") != "vector" or not layer.visible or layer.locked
+			or layer.get("alpha_locked", false)):
+		return "Choose a visible, unlocked vector layer."
+	for item in items:
+		if item.layer.id != layer.id: return "Choose artwork on a single vector layer."
+		if item.object.kind == "image": return "Choose vector shapes, text, or strokes."
+	return ""
+
+func copy_with_symmetry(items: Array[Dictionary], poses: Array[Transform2D]) -> String:
+	var reason := symmetry_copy_reason(items)
+	if not reason.is_empty(): return reason
+	if poses.is_empty(): return "Choose a symmetry mode."
+	var index := layer_index(items[0].layer.id)
+	if index < 0: return "Select the artwork again."
+	var count := items.size() * poses.size()
+	for layer in layers: count += layer.objects.size()
+	if count > MAX_OBJECTS: return "The project has reached its vector object limit."
+	var page := Rect2(0, 0, width, height).grow(0.01)
+	var copies: Array[Dictionary] = []
+	var outlines: Array[Rect2] = []
+	for item in items: outlines.append(Art.outline_bounds(item.object))
+	for pose in poses:
+		var groups := {}
+		var opacity_groups := {}
+		for slot in items.size():
+			var source: Dictionary = items[slot].object
+			var copy := source.duplicate(true)
+			var transform := pose * Art.object_transform(source)
+			var mirrored := transform.determinant() < 0.0
+			var angle := (-transform.x if mirrored else transform.x).angle()
+			copy.pos = [transform.origin.x, transform.origin.y]
+			set_orientation(copy, null if is_zero_approx(angle) else angle, true if mirrored else null)
+			if not page.encloses(transform * outlines[slot]) and not page.encloses(Art.bounds(copy)):
+				return "Move the artwork or symmetry center so every copy fits on the canvas."
+			copy.id = uid()
+			copy.erase("merge_batch")
+			remap_artwork_group(copy, groups)
+			for group in copy.get("opacity_groups", []):
+				if not opacity_groups.has(group.id): opacity_groups[group.id] = uid()
+				group.id = opacity_groups[group.id]
+			copies.append(copy)
+	var selected_id: String = items[0].object.id if items.size() == 1 else ""
+	append_vector_set(index, copies, selected_id, selected_id)
+	return ""
+
 func fill_paint(point: Vector2i, ink: Color) -> Error:
 	if not editable() or not paints_pixels(): return ERR_UNAVAILABLE
 	var layer: Dictionary = layers[active]

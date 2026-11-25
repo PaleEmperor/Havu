@@ -32,6 +32,7 @@ func run() -> void:
 		root.add_child(app)
 		await process_frame
 		await symmetry_and_cut_regressions(app)
+		await outside_cut_and_symmetry_copies(app)
 		app.autosave_timer.stop()
 		app.queue_free()
 		await process_frame
@@ -3436,6 +3437,7 @@ func run() -> void:
 	await page_clipping_regressions(app)
 	await working_folder_regressions(app)
 	await symmetry_and_cut_regressions(app)
+	await outside_cut_and_symmetry_copies(app)
 
 	print("RESULT: %d checks, %d failures" % [checks, failures])
 	app.autosave_timer.stop()
@@ -3599,6 +3601,55 @@ func symmetry_and_cut_regressions(app) -> void:
 	var crossed := PackedVector2Array([Vector2(70, 70), Vector2(130, 130), Vector2(70, 130), Vector2(130, 70)])
 	check(Art.subtract_from_shape(doc.find_object(id), crossed).has("error") and doc.snapshot() == with_hole,
 		"a self-crossed cutting loop leaves the document unchanged")
+
+func outside_cut_and_symmetry_copies(app) -> void:
+	var doc: Document = app.document
+	var canvas: Canvas = app.canvas
+	doc.blank(320, 320, false)
+	app.set_tool("select")
+	canvas.fit()
+	var shape := {"kind": "rect", "pos": [15, 55], "extent": [76, 52], "angle": 0.2,
+		"color": "#226451", "opacity": 0.8}
+	doc.append_with_history(shape)
+	app.transform_action(12)
+	var loop := [Vector2(-20, 45), Vector2(46, 45), Vector2(46, 95), Vector2(-20, 95)]
+	var screen := func(point: Vector2): return canvas.origin + point * canvas.zoom
+	canvas.begin_contact(0, screen.call(loop[0]))
+	for point in loop: canvas.move_contact(0, screen.call(point), 0.75)
+	canvas.end_contact(0, screen.call(loop[0]), false)
+	check(shape.kind == "polygon" and not Art.contains(shape, Vector2(32, 82))
+		and Art.contains(shape, Vector2(67, 86)), "cutout can start outside the shape and outside the page")
+	doc.undo()
+	check(shape.kind == "rect" and Art.contains(shape, Vector2(32, 82)), "an outside-start cut undoes exactly")
+
+	canvas.symmetry_anchor = Vector2(0.5, 0.5)
+	doc.selection = shape.id
+	app.show_transform_menu()
+	var menu: PopupMenu = app.transform_menu
+	check(not menu.is_item_disabled(menu.get_item_index(14)), "Transform offers symmetry copies for existing shapes")
+	menu.hide()
+	app.transform_action(14)
+	await process_frame
+	var dialog := app.get_node("SymmetryCopies") as ConfirmationDialog
+	dialog.confirmed.emit()
+	var layer: Dictionary = doc.layers[0]
+	var copy: Dictionary = layer.objects.back()
+	var expected := Canvas.Symmetry.poses(Canvas.Symmetry.Mode.VERTICAL, 6, Vector2(160, 160))[0] * Art.object_transform(shape)
+	check(layer.objects.size() == 2 and copy.id != shape.id and copy.kind == "rect" and copy.opacity == shape.opacity
+		and Art.object_transform(copy).is_equal_approx(expected), "the dialog mirrors an existing rotated shape around the drawing center")
+	var mirrored := doc.snapshot()
+	doc.undo()
+	check(layer.objects.size() == 1 and is_same(layer.objects[0], shape), "undo removes symmetry copies while keeping the original shape")
+	doc.redo()
+	check(doc.snapshot() == mirrored, "redo restores the mirrored shape and its style exactly")
+
+	doc.selection = shape.id
+	var history_size := doc.history.size()
+	canvas.symmetry_anchor = Vector2(0, 0)
+	check(not canvas.copy_selection_with_symmetry(Canvas.Symmetry.Mode.VERTICAL, 6, false).is_empty()
+		and doc.history.size() == history_size, "copies that would cross the page edge leave the document unchanged")
+	check(canvas.copy_selection_with_symmetry(Canvas.Symmetry.Mode.RADIAL, 4, true).is_empty()
+		and layer.objects.size() == 5, "a finished shape can repeat radially around the selection center")
 
 func working_folder_regressions(app) -> void:
 	var folder := "user://Polar Fun projects"
